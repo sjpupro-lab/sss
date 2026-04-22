@@ -1,0 +1,60 @@
+========================================
+  SPATIAL-PATTERN-AI  Word Prediction
+  (A x R_sim x G_sim x B_sim — SPEC §4 §5 §9)
+========================================
+  File:         data/wiki5k.txt
+  Max clauses:  5000
+  Train ratio:  70%
+----------------------------------------
+
+[1/5] Loading clauses...
+  Loaded: 5000 clauses (0.01 sec)
+
+[2/5] Training on 3500 clauses...
+  Processed: 100 / 3500  (canvases=5, slots=100 vocab=782)  Processed: 200 / 3500  (canvases=8, slots=200 vocab=1438)  Processed: 300 / 3500  (canvases=10, slots=300 vocab=2025)  Processed: 400 / 3500  (canvases=14, slots=400 vocab=2531)  Processed: 500 / 3500  (canvases=18, slots=500 vocab=3050)  Processed: 600 / 3500  (canvases=20, slots=600 vocab=3524)  Processed: 700 / 3500  (canvases=23, slots=700 vocab=4078)  Processed: 800 / 3500  (canvases=26, slots=800 vocab=4538)  Processed: 900 / 3500  (canvases=30, slots=900 vocab=5039)  Processed: 1000 / 3500  (canvases=34, slots=1000 vocab=5513)  Processed: 1100 / 3500  (canvases=37, slots=1100 vocab=6005)  Processed: 1200 / 3500  (canvases=40, slots=1200 vocab=6406)  Processed: 1300 / 3500  (canvases=43, slots=1300 vocab=6738)  Processed: 1400 / 3500  (canvases=46, slots=1400 vocab=7127)  Processed: 1500 / 3500  (canvases=49, slots=1500 vocab=7536)  Processed: 1600 / 3500  (canvases=52, slots=1600 vocab=7933)  Processed: 1700 / 3500  (canvases=55, slots=1700 vocab=8000)  Processed: 1800 / 3500  (canvases=59, slots=1800 vocab=8000)  Processed: 1900 / 3500  (canvases=62, slots=1900 vocab=8000)  Processed: 2000 / 3500  (canvases=65, slots=2000 vocab=8000)  Processed: 2100 / 3500  (canvases=68, slots=2100 vocab=8000)  Processed: 2200 / 3500  (canvases=71, slots=2200 vocab=8000)  Processed: 2300 / 3500  (canvases=74, slots=2300 vocab=8000)  Processed: 2400 / 3500  (canvases=78, slots=2400 vocab=8000)  Processed: 2500 / 3500  (canvases=80, slots=2500 vocab=8000)  Processed: 2600 / 3500  (canvases=84, slots=2600 vocab=8000)  Processed: 2700 / 3500  (canvases=87, slots=2700 vocab=8000)  Processed: 2800 / 3500  (canvases=90, slots=2800 vocab=8000)  Processed: 2900 / 3500  (canvases=93, slots=2900 vocab=8000)  Processed: 3000 / 3500  (canvases=96, slots=3000 vocab=8000)  Processed: 3100 / 3500  (canvases=99, slots=3100 vocab=8000)  Processed: 3200 / 3500  (canvases=102, slots=3200 vocab=8000)  Processed: 3300 / 3500  (canvases=106, slots=3300 vocab=8000)  Processed: 3400 / 3500  (canvases=109, slots=3400 vocab=8000)  Processed: 3500 / 3500  (canvases=112, slots=3500 vocab=8000)
+  Done in 1.99 sec
+  [save] full → 'build/models/bwp_wiki5k.spai' : OK  (0 KF, 0 Delta)
+
+[3/5] Building aggregated A/R/G/B tables from 3500 pool slots...
+  Active (y,v) cells:  17164 / 65536  (26.2%)
+  Vocab size:          8000
+  Built in 0.25 sec
+
+[4/5] Predicting every in-vocab word in 1500 held-out clauses...
+  Progress: 20 / 1500 clauses, 211 preds  Progress: 40 / 1500 clauses, 395 preds  Progress: 60 / 1500 clauses, 573 preds  Progress: 80 / 1500 clauses, 662 preds  Progress: 100 / 1500 clauses, 820 preds  Progress: 120 / 1500 clauses, 990 preds  Progress: 140 / 1500 clauses, 1199 preds  Progress: 160 / 1500 clauses, 1395 preds  Progress: 180 / 1500 clauses, 1606 preds  Progress: 200 / 1500 clauses, 1848 preds  Progress: 220 / 1500 clauses, 2034 preds  Progress: 240 / 1500 clauses, 2196 preds  Progress: 260 / 1500 clauses, 2476 preds  Progress: 280 / 1500 clauses, 2609 preds  Progress: 300 / 1500 clauses, 2769 preds  Progress: 320 / 1500 clauses, 2964 preds  Progress: 340 / 1500 clauses, 3217 preds  Progress: 360 / 1500 clauses, 3409 preds  Progress: 380 / 1500 clauses, 3639 preds  Progress: 400 / 1500 clauses, 3822 preds  Progress: 420 / 1500 clauses, 4003 preds  Progress: 440 / 1500 clauses, 4243 preds  Progress: 460 / 1500 clauses, 4440 preds  Progress: 480 / 1500 clauses, 4630 preds  Progress: 500 / 1500 clauses, 4826 preds  Progress: 520 / 1500 clauses, 5066 preds  Progress: 540 / 1500 clauses, 5266 preds  Progress: 560 / 1500 clauses, 5460 preds  Progress: 580 / 1500 clauses, 5666 preds  Progress: 600 / 1500 clauses, 5887 preds  Progress: 620 / 1500 clauses, 6113 preds  Progress: 640 / 1500 clauses, 6283 preds  Progress: 660 / 1500 clauses, 6497 preds  Progress: 680 / 1500 clauses, 6661 preds  Progress: 700 / 1500 clauses, 6862 preds  Progress: 720 / 1500 clauses, 7100 preds  Progress: 740 / 1500 clauses, 7295 preds  Progress: 760 / 1500 clauses, 7456 preds  Progress: 780 / 1500 clauses, 7656 preds  Progress: 800 / 1500 clauses, 7831 preds  Progress: 820 / 1500 clauses, 8022 preds  Progress: 840 / 1500 clauses, 8224 preds  Progress: 860 / 1500 clauses, 8380 preds  Progress: 880 / 1500 clauses, 8564 preds  Progress: 900 / 1500 clauses, 8755 preds  Progress: 920 / 1500 clauses, 8944 preds  Progress: 940 / 1500 clauses, 9159 preds  Progress: 960 / 1500 clauses, 9307 preds  Progress: 980 / 1500 clauses, 9499 preds  Progress: 1000 / 1500 clauses, 9727 preds  Progress: 1020 / 1500 clauses, 9943 preds  Progress: 1040 / 1500 clauses, 10106 preds  Progress: 1060 / 1500 clauses, 10292 preds  Progress: 1080 / 1500 clauses, 10472 preds  Progress: 1100 / 1500 clauses, 10674 preds  Progress: 1120 / 1500 clauses, 10887 preds  Progress: 1140 / 1500 clauses, 11104 preds  Progress: 1160 / 1500 clauses, 11358 preds  Progress: 1180 / 1500 clauses, 11574 preds  Progress: 1200 / 1500 clauses, 11796 preds  Progress: 1220 / 1500 clauses, 12066 preds  Progress: 1240 / 1500 clauses, 12181 preds  Progress: 1260 / 1500 clauses, 12385 preds  Progress: 1280 / 1500 clauses, 12545 preds  Progress: 1300 / 1500 clauses, 12773 preds  Progress: 1320 / 1500 clauses, 12963 preds  Progress: 1340 / 1500 clauses, 13132 preds  Progress: 1360 / 1500 clauses, 13347 preds  Progress: 1380 / 1500 clauses, 13577 preds  Progress: 1400 / 1500 clauses, 13758 preds  Progress: 1420 / 1500 clauses, 13953 preds  Progress: 1440 / 1500 clauses, 14140 preds  Progress: 1460 / 1500 clauses, 14357 preds  Progress: 1480 / 1500 clauses, 14520 preds  Progress: 1500 / 1500 clauses, 14699 preds
+  Done in 4.42 sec  (3323 preds/sec)
+
+[5/5] Results
+========================================
+
+  SETUP
+  ─────────────────────────────────────
+  Train clauses:         3500
+  Test clauses:          1500  (with predictions: 1459)
+  Keyframes (I):         0
+  Deltas (P):            0
+  Vocab size:            8000
+  In-vocab preds:        14699
+  OOV skipped:           6592
+  Empty-candidate:       0
+
+  ACCURACY
+  ─────────────────────────────────────
+  Top-1:                 2.79%  (410 / 14699)
+  Top-5:                 4.29%  (630 / 14699)
+  Random baseline:       0.30%  (avg same-length cands = 333)
+  Lift over random:      9.3x
+
+  WORD-LEVEL PERPLEXITY
+  ─────────────────────────────────────
+  Avg -log P(true):      7.706 nats
+  Perplexity:            2222.06
+
+  INTERPRETATION
+  ─────────────────────────────────────
+  Clear signal (>3x random baseline).
+
+========================================
+  PASS
+========================================
+WALL=14.13 s  MAXRSS=5680 KB

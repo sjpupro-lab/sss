@@ -1,0 +1,55 @@
+========================================
+  SPATIAL-PATTERN-AI  Perplexity Bench
+========================================
+  File:        data/wiki5k.txt
+  Max clauses: 5000
+  Test split:  10%
+  Smoothing:   Laplace (eps=0.5)
+----------------------------------------
+
+[1/4] Loading clauses...
+  Loaded: 5000 clauses (0.01 sec)
+
+[2/4] Training on 4500 clauses...
+  Processed: 500 / 4500  Processed: 1000 / 4500  Processed: 1500 / 4500  Processed: 2000 / 4500  Processed: 2500 / 4500  Processed: 3000 / 4500  Processed: 3500 / 4500  Processed: 4000 / 4500  Processed: 4500 / 4500
+  Done in 0.49 sec
+
+[3/4] Evaluating on 500 held-out clauses...
+  Done in 0.00 sec (108870912 bytes/sec)
+
+[4/4] Results
+========================================
+
+  TEST SET
+  ─────────────────────────────────────
+  Test clauses:       500
+  Total bytes:        55340
+  Unseen byte events: 611  (1.10%)
+
+  PERPLEXITY  (byte-level)
+  ─────────────────────────────────────
+  Avg NLL:            3.5119 nats/byte
+  Entropy:            5.0666 bits/byte
+  Perplexity:         33.51
+  (uniform 256-byte baseline = 256.00)
+
+  PER-BYTE-RANGE PERPLEXITY
+  ─────────────────────────────────────
+  ASCII   (< 0x80)  n=54572  PPL=31.16
+  CJK UTF-8 leaders n=74  PPL=3677.71
+  Other UTF-8 bytes n=694  PPL=6223.51
+
+  TRAINING DISTRIBUTION
+  ─────────────────────────────────────
+  Total mass:         3867552
+  Active cells:       18522 / 65536  (28.3%)
+  Train clauses:      4500  (0.5 sec)
+
+  INTERPRETATION
+  ─────────────────────────────────────
+  Useful byte model (PPL < 60).
+
+========================================
+  PASS
+========================================
+WALL=0.52 s  MAXRSS=5744 KB

@@ -1,0 +1,26 @@
+[stream] reading: data/wiki5k.txt
+[stream] max=5000  checkpoint=2500  threshold=0.300  save=build/models/wiki5k.spai
+[checkpoint] saved: build/models/wiki5k.ckpt_002500.spai (778.57 MB)
+[stream] 5000 clauses, KF=4649, Delta=351, elapsed=63.7s (78 c/s)
+[checkpoint] saved: build/models/wiki5k.ckpt_005000.spai (1525.00 MB)
+[stream] ingest done: clauses=5000 skipped=1 KF=4649 Delta=351 elapsed=75.83s
+[done] saved: build/models/wiki5k.spai (1525.00 MB)
+
+[stats] engine summary
+  KF count:        4649
+  Delta count:     351
+  Active cells:    530658 (across all KFs)
+  Avg A (active):  7.73
+  R range:         0..210
+  G range:         0..120
+  B range:         0..200
+
+[verify] unseen-query pass on last 500 clauses
+  scanned:         500
+  matched (>0):    500
+  avg similarity:  0.1222
+  min / max:       0.0351 / 1.0000
+  hits >= 0.90:    1
+  hits >= 0.50:    1
+  hits >= 0.10:    344
+WALL=93.35 s  MAXRSS=5964 KB  USER=0.03 s  SYS=0.01 s

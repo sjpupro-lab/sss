@@ -1,0 +1,93 @@
+================================================================
+  SPATIAL-PATTERN-AI  Comprehensive Benchmark v2
+================================================================
+
+Input:          data/kaggle_train.txt
+Total clauses:  6803 (train 4762 / test 2041)
+
+[MODE] Loading pre-trained model: build/models/wiki20k.spai
+  KF: 4076  Delta: 2727
+
+----------------------------------------------------------------
+  1. Matching & Retrieval
+----------------------------------------------------------------
+  Unseen queries:    500
+  Avg similarity:    65.3%
+  Min / Max:         6.6% / 100.0%
+  Hits >= 90%:       295 (59.0%)
+  Hits >= 50%:       295 (59.0%)
+  Hits >= 10%:       491 (98.2%)
+  ms/query:          10.91
+  >>> GRADE: GOOD
+
+  Self-Recall@1:     123/200 (61.5%)
+  >>> GRADE: FAIL
+
+----------------------------------------------------------------
+  2. Word Prediction (A-channel Top-1)
+     Baseline: random = 0.4% (1/256)
+----------------------------------------------------------------
+  Words tested:      500
+  Top-1 (all bytes): 0 (0.0%)
+  Top-3 (any byte):  0 (0.0%)
+  ms/word:           0.00
+  >>> GRADE: BELOW BASELINE
+
+----------------------------------------------------------------
+  3. Text Generation
+----------------------------------------------------------------
+  Prompts:           100
+  Non-empty:         100 (100.0%)
+  Valid UTF-8:       88 (88.0%)
+  Unique outputs:    84 (84.0%)
+  Avg length:        236.3 bytes
+  ms/gen:            10.62
+  >>> GRADE: MINIMAL
+
+  Samples:
+    [0] "Quality, efficiency, and access"
+    [1] "Chinaphascoenolied iterlaedrbooderinwihe 12souandfS14theCghbarSeascosnchias,thav"
+    [2] "CehLdidonThMeeareaiIePaicValNeflYcrilCeahaaBu(c.rhA3r00aBCEaaghac.MTd1300EBCE)ad"
+    [3] "Serefalsneologerasoesior teahnicaelythiIhlercapablersseNetifenh(aInier"citidegio"
+    [4] "Theekethessrepicstandsthe pheapenegianio(see ocean#Tcidefacare)n is the way the "
+
+----------------------------------------------------------------
+  4. Spatial & RGB Channel Analysis
+----------------------------------------------------------------
+  Active cells:      1335075
+  A max / mean:      36 / 7.95
+  R mean/std:        175.4 / 77.6
+  G mean/std:        19.0 / 15.5
+  B mean/std:        168.1 / 72.0
+  EMA active:        24489 (max count 2501)
+  Weights:           A=3.371 R=0.033 G=0.597 B=0.000
+  >>> RGB GRADE: GOOD
+
+----------------------------------------------------------------
+  5. Speed
+----------------------------------------------------------------
+  Encoding:          0.26 ms/clause (3866 c/s) VERY FAST
+  Matching:          10.91 ms/query
+  Generation:        10.62 ms/gen
+
+----------------------------------------------------------------
+  6. Resource Usage
+----------------------------------------------------------------
+  Memory:            1316.5 MB
+  Model file:        1298 MB
+  KF count:          4076
+  Delta count:       2727
+  Delta ratio:       40.1%
+  KB/clause:         195.5
+  >>> GRADE: NORMAL
+
+================================================================
+  SCORECARD
+================================================================
+  Matching:       65.3% avg sim      GOOD
+  Self-Recall:    61.5%              FAIL
+  Word Top-1:     0.0%              BELOW BASELINE
+  Generation:     UTF8=88% Uniq=84%  MINIMAL
+  RGB Channels:                      GOOD
+  Efficiency:     196 KB/cl Delta=40%  NORMAL
+================================================================
