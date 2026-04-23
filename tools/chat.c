@@ -45,6 +45,7 @@
 #define MIN_INPUT   1
 
 enum Mode { MODE_GEN = 0, MODE_RETR = 1, MODE_BOTH = 2 };
+enum GenPath { GEN_NEXT = 0, GEN_REFINE = 1 };
 
 static double now_sec(void) {
     struct timespec ts;
@@ -128,11 +129,20 @@ static void print_topk(SpatialAI* ai, const char* text, uint32_t k) {
     }
 }
 
-static void do_generate(SpatialAI* ai, const char* text) {
+static void do_generate(SpatialAI* ai, const char* text,
+                        int gen_path, const RefineConfig* refine_cfg) {
     char out[OUT_BUF];
-    float sim = 0.0f;
     double t0 = now_sec();
-    uint32_t n = ai_generate_next(ai, text, out, sizeof out - 1, &sim);
+    uint32_t n = 0;
+    float sim = 0.0f;
+    uint32_t iters = 0;
+
+    if (gen_path == GEN_REFINE) {
+        n = ai_generate_refine(ai, text, out, sizeof out - 1,
+                               refine_cfg, &sim, &iters);
+    } else {
+        n = ai_generate_next(ai, text, out, sizeof out - 1, &sim);
+    }
     out[n < sizeof out ? n : sizeof out - 1] = 0;
     double dt = now_sec() - t0;
     if (n == 0) {
@@ -140,7 +150,26 @@ static void do_generate(SpatialAI* ai, const char* text) {
     } else {
         printf("  bot: %s\n", out);
     }
-    printf("  (sim=%.4f, %u bytes, %.1f ms)\n", sim, n, dt * 1000.0);
+    if (gen_path == GEN_REFINE) {
+        printf("  (refine: conf=%.4f, iters=%u, %u bytes, %.1f ms)\n",
+               sim, iters, n, dt * 1000.0);
+    } else {
+        printf("  (sim=%.4f, %u bytes, %.1f ms)\n", sim, n, dt * 1000.0);
+    }
+}
+
+static void print_refine_cfg(const RefineConfig* c) {
+    printf("  [refine cfg]\n");
+    for (int L = 0; L < 3; L++) {
+        printf("    L%d  wRGB=(%.2f,%.2f,%.2f)  topk=%u  thr=%.2f  "
+               "max_iter=%u  conv=%.2f  radius=%u\n",
+               L,
+               c->ch_weights[L][0], c->ch_weights[L][1], c->ch_weights[L][2],
+               c->topk[L], c->promote_threshold[L], c->max_iter[L],
+               c->converge_rate[L], c->neighbor_radius[L]);
+    }
+    printf("    temperature=%.2f  use_context_pool=%d  allow_prior_anchors=%d\n",
+           c->temperature, c->use_context_pool, c->allow_prior_anchors);
 }
 
 static void do_retrieve(SpatialAI* ai, const char* text) {
@@ -165,6 +194,8 @@ static void print_help(void) {
         "  :q            quit\n"
         "  :help         this message\n"
         "  :gen          switch to generate-only mode (default)\n"
+        "  :gen next     use ai_generate_next (baseline path, default)\n"
+        "  :gen refine   use ai_generate_refine (v4 Task D experimental)\n"
         "  :retr         switch to retrieve-only mode\n"
         "  :both         show both retrieval and generation\n"
         "  :topk [N]     print top-N matches for the NEXT input (default 5)\n"
@@ -172,6 +203,7 @@ static void print_help(void) {
         "  :ctx off      stop accumulating (pool contents preserved)\n"
         "  :ctx clear    empty the context pool (keeps it live)\n"
         "  :ctx status   print current context pool state\n"
+        "  :refine cfg   print the active RefineConfig\n"
         "\n"
         "  Otherwise, type any text to query the model.\n");
 }
@@ -212,8 +244,13 @@ int main(int argc, char** argv) {
      * first :ctx on or :ctx clear. Baseline retrieval/generation paths
      * (ai_predict / ai_generate_next) are intentionally NOT biased by
      * this pool — per v4 principle 2, the baseline is preserved. The
-     * pool becomes load-bearing once Task D (ai_generate_refine) lands. */
+     * pool becomes load-bearing in the :gen refine path (Task D). */
     int ctx_enabled = 0;
+
+    /* v4 Task E — generation path toggle. Defaults to baseline so the
+     * unchanged-behavior invariant holds for users who don't opt in. */
+    int gen_path = GEN_NEXT;
+    RefineConfig refine_cfg = refine_config_default_text();
 
     printf("\nCANVAS chat — KF=%u Delta=%u. Type :help for commands, :q to quit.\n\n",
            ai->kf_count, ai->df_count);
@@ -231,9 +268,18 @@ int main(int argc, char** argv) {
         if (line[0] == ':') {
             if (!strcmp(line, ":q") || !strcmp(line, ":quit")) break;
             else if (!strcmp(line, ":help")) print_help();
+            else if (!strcmp(line, ":gen next")) {
+                gen_path = GEN_NEXT;
+                printf("  [gen path: next (baseline)]\n");
+            }
+            else if (!strcmp(line, ":gen refine")) {
+                gen_path = GEN_REFINE;
+                printf("  [gen path: refine (v4 Task D)]\n");
+            }
             else if (!strcmp(line, ":gen"))  { mode = MODE_GEN;  printf("  [mode: gen]\n"); }
             else if (!strcmp(line, ":retr")) { mode = MODE_RETR; printf("  [mode: retr]\n"); }
             else if (!strcmp(line, ":both")) { mode = MODE_BOTH; printf("  [mode: both]\n"); }
+            else if (!strcmp(line, ":refine cfg")) print_refine_cfg(&refine_cfg);
             else if (!strncmp(line, ":topk", 5)) {
                 int n = 5;
                 if (line[5] == ' ') n = atoi(line + 6);
@@ -280,9 +326,9 @@ int main(int argc, char** argv) {
             if (cp) (void)pool_add_clause(cp, line);
         }
 
-        if (mode == MODE_GEN)      do_generate(ai, line);
+        if (mode == MODE_GEN)      do_generate(ai, line, gen_path, &refine_cfg);
         else if (mode == MODE_RETR) do_retrieve(ai, line);
-        else /* BOTH */            { do_retrieve(ai, line); do_generate(ai, line); }
+        else /* BOTH */            { do_retrieve(ai, line); do_generate(ai, line, gen_path, &refine_cfg); }
     }
 
     spatial_ai_destroy(ai);
