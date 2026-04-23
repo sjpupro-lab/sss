@@ -470,6 +470,92 @@ RefineConfig refine_config_default_text(void) {
     return c;
 }
 
+/* Spec §D.5 — anchor/candidate initialization.
+ *
+ * Refine operates on the 2D grid surface: a cell at (y, x) represents
+ * "byte value x appearing at clause position y". The input-encoded
+ * grid is sparse — at most one (y, x) pair per input byte carries
+ * positive A, so every anchor cell in a row shares the same byte
+ * value (the row's argmax-x). Candidate cells are everywhere a
+ * long-term prior exists without direct input coverage. */
+void draft_field_init(DraftField* df,
+                      const SpatialGrid* input_grid,
+                      const AggTables* agg,
+                      const RefineConfig* cfg) {
+    if (!df) return;
+    memset(df, 0, sizeof *df);
+
+    /* Row-level argmax from the input grid. A row either has any
+     * activity (anchor row) or none. */
+    uint8_t row_byte[GRID_SIZE];
+    int     row_has[GRID_SIZE];
+    memset(row_has, 0, sizeof row_has);
+
+    if (input_grid) {
+        for (uint32_t y = 0; y < GRID_SIZE; y++) {
+            uint16_t best_a = 0;
+            uint32_t best_x = 0;
+            for (uint32_t x = 0; x < GRID_SIZE; x++) {
+                uint16_t a = input_grid->A[y * GRID_SIZE + x];
+                if (a > best_a) { best_a = a; best_x = x; }
+            }
+            if (best_a > 0) {
+                row_has[y]  = 1;
+                row_byte[y] = (uint8_t)best_x;
+            }
+        }
+
+        /* Every input-positive cell becomes an anchor. The cell's value
+         * is the row's argmax byte — consistent across all anchor cells
+         * in a row, which keeps the neighborhood-signature computation
+         * (D.6) seeing a stable target byte when it averages over
+         * anchors in a row's vicinity. */
+        for (uint32_t y = 0; y < GRID_SIZE; y++) {
+            if (!row_has[y]) continue;
+            for (uint32_t x = 0; x < GRID_SIZE; x++) {
+                uint32_t i = y * GRID_SIZE + x;
+                if (input_grid->A[i] > 0) {
+                    df->cells[i].status     = CELL_ANCHOR;
+                    df->cells[i].value      = row_byte[y];
+                    df->cells[i].confidence = 1.0f;
+                    df->n_anchor++;
+                }
+            }
+        }
+    }
+
+    if (!agg) return;
+
+    /* Candidates cover the prior-support mask, minus anchor cells.
+     * We deliberately do NOT populate cand_values here — per spec
+     * §D.5, copying a row's argmax byte into every high-A cell as the
+     * initial value would collapse learned diversity. D3's per-level
+     * scoring loop is responsible for the actual Top-K build. */
+    const int allow_prior = cfg && cfg->allow_prior_anchors;
+
+    for (uint32_t y = 0; y < GRID_SIZE; y++) {
+        double row_total = agg->row_total_A[y];
+        double row_avg   = row_total / (double)GRID_SIZE;  /* per-cell mean */
+        for (uint32_t x = 0; x < GRID_SIZE; x++) {
+            uint32_t i = y * GRID_SIZE + x;
+            if (df->cells[i].status == CELL_ANCHOR) continue;
+            double a = agg->A_sum[i];
+            if (a <= 0.0) continue;
+
+            if (allow_prior && row_avg > 0.0 && a > row_avg * 4.0) {
+                /* High-A_sum seed, RESOLVED only — never ANCHOR. */
+                df->cells[i].status     = CELL_RESOLVED;
+                df->cells[i].value      = (uint8_t)x;
+                df->cells[i].confidence = 0.5f;
+                df->n_resolved++;
+            } else {
+                df->cells[i].status = CELL_CANDIDATE;
+                df->n_candidate++;
+            }
+        }
+    }
+}
+
 RefineConfig refine_config_default_image(void) {
     /* v4 feasibility prototype — image presets are tuned larger than
      * text since image grids carry denser local structure. These are

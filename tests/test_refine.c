@@ -148,6 +148,172 @@ static void test_refine_stub_matches_baseline(void) {
     PASS();
 }
 
+/* ── D2 ── draft_field_init NULL safety ── */
+static void test_draft_init_null_safety(void) {
+    TEST("draft_field_init is safe on NULL df / inputs");
+    /* NULL df — no crash, nothing to assert beyond that */
+    draft_field_init(NULL, NULL, NULL, NULL);
+
+    DraftField df;
+    memset(&df, 0xFF, sizeof df);  /* junk */
+    draft_field_init(&df, NULL, NULL, NULL);
+    assert(df.n_anchor == 0);
+    assert(df.n_candidate == 0);
+    assert(df.n_resolved == 0);
+    PASS();
+}
+
+/* ── D2 ── anchor rows get CELL_ANCHOR, non-input rows don't ── */
+static void test_draft_init_anchors_from_input(void) {
+    TEST("draft_field_init marks input-positive cells as CELL_ANCHOR");
+    morpheme_init();
+
+    SpatialGrid* input = grid_create();
+    layers_encode_clause("the quick brown fox", NULL, input);
+
+    DraftField df;
+    draft_field_init(&df, input, NULL, NULL);
+
+    /* Every anchor cell's value equals its row's argmax-x. */
+    uint32_t verified = 0;
+    for (uint32_t y = 0; y < GRID_SIZE; y++) {
+        uint16_t best_a = 0;
+        uint32_t best_x = 0;
+        for (uint32_t x = 0; x < GRID_SIZE; x++) {
+            uint16_t a = input->A[y * GRID_SIZE + x];
+            if (a > best_a) { best_a = a; best_x = x; }
+        }
+        if (best_a == 0) continue;
+        for (uint32_t x = 0; x < GRID_SIZE; x++) {
+            uint32_t i = y * GRID_SIZE + x;
+            if (input->A[i] > 0) {
+                assert(df.cells[i].status == CELL_ANCHOR);
+                assert(df.cells[i].value == (uint8_t)best_x);
+                assert(df.cells[i].confidence == 1.0f);
+                verified++;
+            }
+        }
+    }
+    assert(verified > 0);
+    assert(df.n_anchor == verified);
+    assert(df.n_candidate == 0);  /* agg == NULL */
+    assert(df.n_resolved == 0);
+
+    grid_destroy(input);
+    PASS();
+}
+
+/* ── D2 ── with an agg present, non-anchor prior cells become
+ *         CELL_CANDIDATE, and anchor/candidate sets are disjoint. ── */
+static void test_draft_init_candidates_from_agg(void) {
+    TEST("draft_field_init: agg produces candidates, disjoint from anchors");
+    morpheme_init();
+
+    SpatialAI* ai = spatial_ai_create();
+    ai_force_keyframe(ai, "the quick brown fox jumps over the lazy dog", "anim");
+    ai_force_keyframe(ai, "pack my box with five dozen liquor jugs",     "anim");
+
+    AggTables* agg = agg_build(ai);
+    assert(agg != NULL);
+
+    SpatialGrid* input = grid_create();
+    layers_encode_clause("the quick brown fox", NULL, input);
+
+    RefineConfig cfg = refine_config_default_text();
+    /* allow_prior_anchors off → no RESOLVED cells from A_sum */
+    assert(cfg.allow_prior_anchors == 0);
+
+    DraftField df;
+    draft_field_init(&df, input, agg, &cfg);
+
+    assert(df.n_anchor > 0);
+    assert(df.n_candidate > 0);
+    assert(df.n_resolved == 0);
+
+    /* No cell is both anchor and candidate. */
+    for (uint32_t i = 0; i < GRID_SIZE * GRID_SIZE; i++) {
+        uint8_t s = df.cells[i].status;
+        if (s == CELL_ANCHOR)    continue;
+        if (s == CELL_CANDIDATE) continue;
+        if (s == CELL_EMPTY)     continue;
+        assert(!"unexpected status");
+    }
+
+    /* Anchors carry their row's byte; candidates carry value 0 (unset). */
+    uint32_t checked_candidate = 0;
+    for (uint32_t i = 0; i < GRID_SIZE * GRID_SIZE && checked_candidate < 16; i++) {
+        if (df.cells[i].status == CELL_CANDIDATE) {
+            assert(df.cells[i].value == 0);
+            assert(df.cells[i].n_cand == 0);
+            checked_candidate++;
+        }
+    }
+    assert(checked_candidate > 0);
+
+    grid_destroy(input);
+    agg_destroy(agg);
+    spatial_ai_destroy(ai);
+    PASS();
+}
+
+/* ── D2 ── allow_prior_anchors promotes high-A_sum cells to RESOLVED
+ * (never to ANCHOR). ── */
+static void test_draft_init_prior_anchors_guard(void) {
+    TEST("allow_prior_anchors seeds CELL_RESOLVED, never CELL_ANCHOR-from-prior");
+    morpheme_init();
+
+    SpatialAI* ai = spatial_ai_create();
+    /* Diverse keyframes spread A_sum across many cells so only the
+     * strongest cells clear the 4× row-avg promotion threshold and
+     * the rest survive as CANDIDATE. */
+    const char* kfs[] = {
+        "the quick brown fox jumps over the lazy dog today clearly",
+        "pack my box with five dozen liquor jugs by the porch",
+        "data teams iterate on the morning backlog carefully always",
+        "systems retire at midnight after the weekly cleanup pass",
+        "the kitchen smelled of cinnamon and warm bread each afternoon",
+        "visitors paused at the iron gate and admired every bloom",
+        "oak trees shed their leaves along the quiet garden path",
+        "int fib(int n){return n<2?n:fib(n-1)+fib(n-2);}",
+    };
+    for (uint32_t i = 0; i < sizeof kfs / sizeof kfs[0]; i++) {
+        ai_force_keyframe(ai, kfs[i], "mix");
+    }
+    AggTables* agg = agg_build(ai);
+    SpatialGrid* input = grid_create();
+    /* Empty input so no anchor cells steal the prior candidates. */
+
+    RefineConfig cfg = refine_config_default_text();
+    cfg.allow_prior_anchors = 1;
+
+    DraftField df;
+    draft_field_init(&df, input, agg, &cfg);
+
+    assert(df.n_anchor == 0);        /* no input → no anchors */
+    assert(df.n_resolved > 0);       /* high-A_sum cells seeded */
+    assert(df.n_candidate > 0);      /* rest are still candidates */
+
+    /* Any RESOLVED cell's value equals its column x (byte value), and
+     * confidence is the 0.5f seed, not an anchor-equivalent 1.0f. */
+    uint32_t checked = 0;
+    for (uint32_t y = 0; y < GRID_SIZE && checked < 8; y++) {
+        for (uint32_t x = 0; x < GRID_SIZE && checked < 8; x++) {
+            uint32_t i = y * GRID_SIZE + x;
+            if (df.cells[i].status == CELL_RESOLVED) {
+                assert(df.cells[i].value == (uint8_t)x);
+                assert(df.cells[i].confidence == 0.5f);
+                checked++;
+            }
+        }
+    }
+    assert(checked > 0);
+
+    grid_destroy(input);
+    agg_destroy(agg);
+    spatial_ai_destroy(ai);
+    PASS();
+}
+
 int main(void) {
     printf("=== test_refine ===\n");
 
@@ -156,6 +322,10 @@ int main(void) {
     test_cell_state_zero_init();
     test_refine_null_safety();
     test_refine_stub_matches_baseline();
+    test_draft_init_null_safety();
+    test_draft_init_anchors_from_input();
+    test_draft_init_candidates_from_agg();
+    test_draft_init_prior_anchors_guard();
 
     printf("  %d/%d passed\n\n", tests_passed, tests_total);
     return (tests_passed == tests_total) ? 0 : 1;

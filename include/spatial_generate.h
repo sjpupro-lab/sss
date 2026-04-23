@@ -195,6 +195,24 @@ typedef struct {
 RefineConfig refine_config_default_text(void);
 RefineConfig refine_config_default_image(void);
 
+/* Populate `df` from the encoded input grid plus the long-term prior.
+ *
+ *   - Cells with input_grid->A > 0  → CELL_ANCHOR (prompt-derived).
+ *     value is set to the row's argmax-x (same for every anchor cell
+ *     in a row), confidence = 1.0.
+ *   - Remaining cells with agg->A_sum > 0 → CELL_CANDIDATE.
+ *   - When cfg->allow_prior_anchors = 1, candidate cells whose A_sum
+ *     far exceeds the row's per-cell average are promoted to
+ *     CELL_RESOLVED seeds (NOT anchors — "AggTables hard-anchor" is
+ *     explicitly forbidden as a default per v4 §D).
+ *
+ * `input_grid`, `agg`, `cfg` may each be NULL; a NULL df is a no-op.
+ * Safe to call repeatedly — contents are fully overwritten. */
+void draft_field_init(DraftField* df,
+                      const SpatialGrid* input_grid,
+                      const AggTables* agg,
+                      const RefineConfig* cfg);
+
 /* Generation via the refine path. Guaranteed to be independent of
  * ai_generate_next: it does not mutate ai->keyframes / ai->deltas /
  * ai->ema_*. Writes up to max_out bytes to `out` (NUL-terminated if
