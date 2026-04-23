@@ -140,4 +140,74 @@ uint32_t ai_generate_next(SpatialAI* ai, const char* input_text,
                           char* out, uint32_t max_out,
                           float* out_match_similarity);
 
+/* ── v4 Task D — hierarchical draft refinement (experimental) ─────
+ *
+ * Parallel generation path. ai_generate_refine() does NOT replace
+ * ai_generate_next(); it runs an independent coarse-to-fine loop
+ * over a DraftField of per-cell candidate lists. See
+ * 06_TASK_D_DRAFT_REFINEMENT.md.
+ *
+ * Hard invariants:
+ *   - CELL_ANCHOR cells are never overwritten by any path.
+ *   - High-A_sum seeding to CELL_ANCHOR requires
+ *     RefineConfig.allow_prior_anchors == 1; default is 0.
+ *   - Levels differ only in scoring policy (channel weights +
+ *     neighborhood radius), not in the candidate set itself. */
+
+#define REFINE_TOPK_MAX 16
+
+typedef enum {
+    CELL_EMPTY     = 0,  /* untouched; A_sum ~ 0 */
+    CELL_CANDIDATE = 1,  /* on the Top-K scoring list */
+    CELL_RESOLVED  = 2,  /* promoted above threshold this run */
+    CELL_ANCHOR    = 3   /* prompt-derived; must never be overwritten */
+} CellStatus;
+
+typedef struct {
+    uint8_t  status;                      /* CellStatus */
+    uint8_t  value;                       /* valid for RESOLVED / ANCHOR */
+    uint8_t  n_cand;
+    uint8_t  cand_values[REFINE_TOPK_MAX];
+    float    cand_scores[REFINE_TOPK_MAX];
+    float    confidence;                  /* score[0] / sum(scores) */
+} CellState;
+
+typedef struct {
+    CellState cells[GRID_SIZE * GRID_SIZE];
+    uint32_t  n_anchor;
+    uint32_t  n_candidate;
+    uint32_t  n_resolved;
+    uint32_t  n_promoted_this_iter;
+} DraftField;
+
+typedef struct {
+    float    ch_weights[3][3];      /* [level][R,G,B] */
+    uint32_t topk[3];
+    float    promote_threshold[3];
+    uint32_t max_iter[3];
+    float    converge_rate[3];      /* promotion rate below which we advance level */
+    uint32_t neighbor_radius[3];    /* large / medium / small */
+    float    temperature;           /* 0 = argmax */
+    int      use_context_pool;      /* blend short-term prior when available */
+    int      allow_prior_anchors;   /* off by default — A_sum is a seed, not an anchor */
+} RefineConfig;
+
+RefineConfig refine_config_default_text(void);
+RefineConfig refine_config_default_image(void);
+
+/* Generation via the refine path. Guaranteed to be independent of
+ * ai_generate_next: it does not mutate ai->keyframes / ai->deltas /
+ * ai->ema_*. Writes up to max_out bytes to `out` (NUL-terminated if
+ * space permits). On low-anchor-density inputs the implementation is
+ * allowed to internally fall back to ai_generate_next and report
+ * `"refine_fallback"` via stderr; out_confidence / out_iterations
+ * still receive meaningful values (0 iterations when falling back).
+ * cfg == NULL applies refine_config_default_text(). */
+uint32_t ai_generate_refine(SpatialAI* ai,
+                            const char* input_text,
+                            char* out, uint32_t max_out,
+                            const RefineConfig* cfg,
+                            float* out_confidence,
+                            uint32_t* out_iterations);
+
 #endif /* SPATIAL_GENERATE_H */

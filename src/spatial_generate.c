@@ -431,3 +431,90 @@ uint32_t ai_generate_next(SpatialAI* ai, const char* input_text,
     /* 4. Decode target frame's grid → text (UTF-8 aware). */
     return grid_decode_text_utf8(&ai->keyframes[target_id].grid, out, max_out);
 }
+
+/* ══════════════════════════════════════════════════════════════════
+ * v4 Task D — hierarchical draft refinement (experimental)
+ * ══════════════════════════════════════════════════════════════════
+ *
+ * D1 scaffolding lands here: RefineConfig presets and an ai_generate_
+ * refine stub that transparently routes to ai_generate_next. The real
+ * DraftField init + per-level scoring loop arrives in D2/D3, guarded
+ * by the same assertions that lock anchor immutability.
+ *
+ * Baseline invariance: nothing in this block touches ai->keyframes /
+ * ai->deltas / ai->ema_* / the RGB layer encoder. All state is
+ * thread-local to the single ai_generate_refine call. */
+
+RefineConfig refine_config_default_text(void) {
+    RefineConfig c;
+    memset(&c, 0, sizeof c);
+    /* Spec §D.4 — coarse → fine. B-dominant at L0 (broad co-occurrence),
+     * G-dominant at L1 (mid), R-dominant at L2 (tight). */
+    c.ch_weights[0][0] = 0.1f; c.ch_weights[0][1] = 0.3f; c.ch_weights[0][2] = 1.0f;
+    c.ch_weights[1][0] = 0.3f; c.ch_weights[1][1] = 1.0f; c.ch_weights[1][2] = 0.3f;
+    c.ch_weights[2][0] = 1.0f; c.ch_weights[2][1] = 0.3f; c.ch_weights[2][2] = 0.1f;
+    c.topk[0] = 4;  c.topk[1] = 8;  c.topk[2] = 16;
+    c.promote_threshold[0] = 0.55f;
+    c.promote_threshold[1] = 0.65f;
+    c.promote_threshold[2] = 0.75f;
+    c.max_iter[0]      = 12; c.max_iter[1]      = 20; c.max_iter[2]      = 30;
+    c.converge_rate[0] = 0.02f;
+    c.converge_rate[1] = 0.02f;
+    c.converge_rate[2] = 0.01f;
+    c.neighbor_radius[0] = 16;
+    c.neighbor_radius[1] = 8;
+    c.neighbor_radius[2] = 2;
+    c.temperature = 0.0f;
+    c.use_context_pool   = 1;
+    c.allow_prior_anchors = 0;
+    return c;
+}
+
+RefineConfig refine_config_default_image(void) {
+    /* v4 feasibility prototype — image presets are tuned larger than
+     * text since image grids carry denser local structure. These are
+     * placeholders the Task F prototype will refine. */
+    RefineConfig c = refine_config_default_text();
+    c.neighbor_radius[0] = 32;
+    c.neighbor_radius[1] = 16;
+    c.neighbor_radius[2] = 4;
+    c.promote_threshold[0] = 0.50f;
+    c.promote_threshold[1] = 0.60f;
+    c.promote_threshold[2] = 0.70f;
+    c.use_context_pool     = 0;  /* image task isn't session-driven by default */
+    return c;
+}
+
+/* D1 stub — delegates to ai_generate_next so the parallel path is
+ * callable end-to-end while the DraftField implementation is in
+ * progress. D2 replaces this body with real draft_field_init, and D3
+ * with the per-level refine loop. out_confidence / out_iterations
+ * carry sentinel values so callers can still distinguish "stub
+ * returned via baseline" from an eventual real refine run.
+ *
+ * Non-obvious: we intentionally do not compute draft statistics in
+ * the stub. Confidence = baseline match similarity; iterations = 0.
+ * Callers that rely on these signals will start seeing non-zero
+ * values as soon as D3 lands. */
+uint32_t ai_generate_refine(SpatialAI* ai,
+                            const char* input_text,
+                            char* out, uint32_t max_out,
+                            const RefineConfig* cfg,
+                            float* out_confidence,
+                            uint32_t* out_iterations) {
+    if (out_confidence) *out_confidence = 0.0f;
+    if (out_iterations) *out_iterations = 0;
+    if (!ai || !input_text || !out || max_out == 0) {
+        if (out && max_out > 0) out[0] = '\0';
+        return 0;
+    }
+    RefineConfig local = cfg ? *cfg : refine_config_default_text();
+    (void)local;  /* consumed by D2/D3 — acknowledged here to silence -Wunused */
+
+    float sim = 0.0f;
+    uint32_t n = ai_generate_next(ai, input_text, out, max_out, &sim);
+    if (out_confidence) *out_confidence = sim;
+    /* iterations stays 0: stub did not run the refine loop. */
+    fprintf(stderr, "refine_fallback: D1 stub delegated to ai_generate_next\n");
+    return n;
+}
