@@ -254,6 +254,68 @@ static void test_recluster_preserves_sequence_order(void) {
     PASS();
 }
 
+/* ── C3 ── impossibly high gain threshold: candidate is good but
+ * doesn't clear the bar → pool must stay byte-identical. ── */
+static void test_recluster_rollback_on_low_gain(void) {
+    TEST("recluster rolls back when compression_gain < min_gain_ratio");
+    morpheme_init();
+
+    SpatialCanvasPool* p = pool_create();
+    const char* topicA = "the quick brown fox jumps over the lazy dog today indeed truly.";
+    const char* topicB = "data science teams iterate on the morning backlog carefully always warmly.";
+    for (uint32_t round = 0; round < 2; round++) {
+        fill_canvas_with(p, topicA, 32);
+        fill_canvas_with(p, topicB, 32);
+    }
+    assert(p->count == 4);
+
+    /* Snapshot the full canvas pointer array + every subtitle entry's
+     * (canvas_id, slot_id) tuple. */
+    SpatialCanvas* pre_ptrs[8];
+    for (uint32_t i = 0; i < p->count; i++) pre_ptrs[i] = p->canvases[i];
+    uint32_t pre_cids[256], pre_sids[256];
+    assert(p->track.count <= 256);
+    for (uint32_t e = 0; e < p->track.count; e++) {
+        pre_cids[e] = p->track.entries[e].canvas_id;
+        pre_sids[e] = p->track.entries[e].slot_id;
+    }
+
+    /* 200% gain is impossible — every canvas would have to collapse
+     * to zero bytes. Report should describe the candidate but commit
+     * nothing. */
+    ReclusterReport r = pool_recluster_by_topic(p, 2.0f);
+    assert(r.committed == 0);
+    assert(r.canvases_reordered == 0);
+    assert(r.groups_examined == 2);  /* two topics, two canvases each */
+
+    /* Pool layout is untouched. */
+    for (uint32_t i = 0; i < p->count; i++) assert(p->canvases[i] == pre_ptrs[i]);
+    for (uint32_t e = 0; e < p->track.count; e++) {
+        assert(p->track.entries[e].canvas_id == pre_cids[e]);
+        assert(p->track.entries[e].slot_id   == pre_sids[e]);
+    }
+    pool_destroy(p);
+    PASS();
+}
+
+/* ── C3 ── empty / NULL inputs: report committed = 0, no crash ── */
+static void test_recluster_empty_and_null(void) {
+    TEST("recluster handles empty pool and NULL safely");
+
+    ReclusterReport r0 = pool_recluster_by_topic(NULL, 0.10f);
+    assert(r0.committed == 0);
+    assert(r0.canvases_reordered == 0);
+
+    SpatialCanvasPool* p = pool_create();
+    assert(p->count == 0);
+    ReclusterReport r1 = pool_recluster_by_topic(p, 0.10f);
+    assert(r1.committed == 0);
+    assert(r1.canvases_reordered == 0);
+    assert(r1.groups_examined == 0);
+    pool_destroy(p);
+    PASS();
+}
+
 int main(void) {
     printf("=== test_recluster ===\n");
 
@@ -262,6 +324,8 @@ int main(void) {
     test_recluster_small_pool();
     test_recluster_regroups_topics();
     test_recluster_preserves_sequence_order();
+    test_recluster_rollback_on_low_gain();
+    test_recluster_empty_and_null();
 
     printf("  %d/%d passed\n\n", tests_passed, tests_total);
     return (tests_passed == tests_total) ? 0 : 1;
