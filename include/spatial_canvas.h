@@ -87,13 +87,24 @@ const char* data_type_name(DataType t);
  *   PROSE  0.5  DIALOG 0.3  CODE 0.1  SHORT 0.02 */
 float       data_type_boundary_weight(DataType t);
 
-/* Per-slot metadata. Populated by canvas_add_clause. */
+/* Per-slot metadata. Populated by canvas_add_clause.
+ *
+ * v4 Task B additions: sequence_id + timestamp_us restore logical
+ * order after Task C re-clustering shuffles canvas indices. When the
+ * slot is filled via canvas_add_clause directly, sequence_id defaults
+ * to the per-canvas slot index; pool_add_clause then overwrites it
+ * with a pool-wide monotonic counter so the ordering survives across
+ * canvases. Fields are not part of the canvas's on-disk payload —
+ * they travel in the separate optional SPAI_TAG_SEQMETA trailing
+ * record so the existing canvas layout is byte-for-byte unchanged. */
 typedef struct {
     DataType type;
     float    boundary_weight;
     uint32_t byte_length;     /* original clause byte count */
     uint32_t topic_hash;      /* djb2 over the clause text */
     int      occupied;        /* 1 after first placement, 0 otherwise */
+    uint32_t sequence_id;     /* v4 Task B — monotonic placement order */
+    uint64_t timestamp_us;    /* v4 Task B — CLOCK_MONOTONIC at placement, microseconds */
 } SlotMeta;
 
 typedef struct {

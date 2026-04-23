@@ -369,6 +369,59 @@ static SpaiStatus read_subtitle_body(FILE* fp, SubtitleTrack* t) {
     return SPAI_OK;
 }
 
+/* ── v4 Task B: SPAI_TAG_SEQMETA trailing record ─────────────
+ *   tag(u8)
+ *   uint32 canvas_count
+ *   uint32 next_sequence_id
+ *   for each canvas: sequence_id[CV_SLOTS](u32) timestamp_us[CV_SLOTS](u64)
+ *
+ * Written only when ai->canvas_pool exists and has at least one
+ * canvas. Absent on older files → loader leaves sequence_id / time-
+ * stamp_us at their canvas_create defaults (0). */
+static SpaiStatus write_seqmeta_record(FILE* fp, const SpatialCanvasPool* pool) {
+    uint8_t tag = SPAI_TAG_SEQMETA;
+    if (fwrite(&tag, 1, 1, fp) != 1) return SPAI_ERR_WRITE;
+    uint32_t cc = pool->count;
+    if (fwrite(&cc, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(&pool->next_sequence_id, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+    for (uint32_t i = 0; i < pool->count; i++) {
+        const SpatialCanvas* c = pool->canvases[i];
+        if (!c) return SPAI_ERR_WRITE;
+        for (uint32_t s = 0; s < CV_SLOTS; s++) {
+            if (fwrite(&c->meta[s].sequence_id,  sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+        }
+        for (uint32_t s = 0; s < CV_SLOTS; s++) {
+            if (fwrite(&c->meta[s].timestamp_us, sizeof(uint64_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+        }
+    }
+    return SPAI_OK;
+}
+
+static SpaiStatus read_seqmeta_body(FILE* fp, SpatialCanvasPool* pool) {
+    uint32_t cc = 0, next_id = 0;
+    if (fread(&cc,      sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+    if (fread(&next_id, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+    /* If the file claims more canvases than we actually loaded, treat
+     * it as corrupt — existing canvas records must precede this tag. */
+    if (cc > pool->count) return SPAI_ERR_CORRUPT;
+    for (uint32_t i = 0; i < cc; i++) {
+        SpatialCanvas* c = pool->canvases[i];
+        if (!c) return SPAI_ERR_CORRUPT;
+        for (uint32_t s = 0; s < CV_SLOTS; s++) {
+            uint32_t sid = 0;
+            if (fread(&sid, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+            c->meta[s].sequence_id = sid;
+        }
+        for (uint32_t s = 0; s < CV_SLOTS; s++) {
+            uint64_t ts = 0;
+            if (fread(&ts, sizeof(uint64_t), 1, fp) != 1) return SPAI_ERR_READ;
+            c->meta[s].timestamp_us = ts;
+        }
+    }
+    pool->next_sequence_id = next_id;
+    return SPAI_OK;
+}
+
 SpaiStatus ai_save(const SpatialAI* ai, const char* path) {
     if (!ai || !path) return SPAI_ERR_OPEN;
 
@@ -408,6 +461,16 @@ SpaiStatus ai_save(const SpatialAI* ai, const char* path) {
         }
         s = write_subtitle_record(fp, &ai->canvas_pool->track);
         if (s != SPAI_OK) { fclose(fp); return s; }
+
+        /* v4 Task B — sequence metadata as a separate trailing tag so
+         * the canvas record's byte layout is unchanged. Old loaders
+         * that don't know SPAI_TAG_SEQMETA will stop cleanly at this
+         * tag (unknown-tag = end-of-stream); newer loaders populate
+         * the per-slot sequence_id / timestamp_us fields. */
+        if (ai->canvas_pool->count > 0) {
+            s = write_seqmeta_record(fp, ai->canvas_pool);
+            if (s != SPAI_OK) { fclose(fp); return s; }
+        }
     }
 
     if (fclose(fp) != 0) return SPAI_ERR_WRITE;
@@ -551,6 +614,22 @@ SpatialAI* ai_load(const char* path, SpaiStatus* out_status) {
             subtitle_track_destroy(&pool->track);
             subtitle_track_init(&pool->track);
             s = read_subtitle_body(fp, &pool->track);
+            if (s != SPAI_OK) {
+                fclose(fp); spatial_ai_destroy(ai);
+                if (out_status) *out_status = s;
+                return NULL;
+            }
+        } else if (tag == SPAI_TAG_SEQMETA) {
+            /* v4 Task B — optional per-slot sequence/timestamp overlay.
+             * Canvas records must have already been loaded; if not,
+             * pool->count == 0 and read_seqmeta_body reports CORRUPT. */
+            SpatialCanvasPool* pool = ai_get_canvas_pool(ai);
+            if (!pool) {
+                fclose(fp); spatial_ai_destroy(ai);
+                if (out_status) *out_status = SPAI_ERR_ALLOC;
+                return NULL;
+            }
+            s = read_seqmeta_body(fp, pool);
             if (s != SPAI_OK) {
                 fclose(fp); spatial_ai_destroy(ai);
                 if (out_status) *out_status = s;

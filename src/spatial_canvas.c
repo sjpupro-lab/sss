@@ -5,6 +5,7 @@
 #include "spatial_canvas.h"
 #include "spatial_layers.h"
 #include "spatial_match.h"
+#include <time.h>    /* v4 Task B — clock_gettime(CLOCK_MONOTONIC, ...) */
 #include "spatial_morpheme.h"
 
 #include <stdio.h>
@@ -105,6 +106,8 @@ SpatialCanvas* canvas_create(void) {
         c->meta[s].byte_length = 0;
         c->meta[s].topic_hash = 0;
         c->meta[s].occupied = 0;
+        c->meta[s].sequence_id = 0;
+        c->meta[s].timestamp_us = 0;
     }
     /* I/P defaults — unclassified canvas treated as IFRAME with no parent */
     c->frame_type = CANVAS_IFRAME;
@@ -136,6 +139,8 @@ void canvas_clear(SpatialCanvas* c) {
         c->meta[s].byte_length = 0;
         c->meta[s].topic_hash = 0;
         c->meta[s].occupied = 0;
+        c->meta[s].sequence_id = 0;
+        c->meta[s].timestamp_us = 0;
     }
     c->frame_type = CANVAS_IFRAME;
     c->parent_canvas_id = UINT32_MAX;
@@ -196,6 +201,21 @@ int canvas_add_clause(SpatialCanvas* c, const char* text) {
     c->meta[slot].byte_length     = text_len;
     c->meta[slot].topic_hash      = topic_hash_djb2(text);
     c->meta[slot].occupied        = 1;
+
+    /* v4 Task B — sequence_id default = per-canvas slot index (monotonic
+     * for direct canvas_add_clause callers). pool_add_clause overwrites
+     * with its own pool-wide monotonic counter after we return. */
+    c->meta[slot].sequence_id     = slot;
+    {
+        struct timespec ts;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+            c->meta[slot].timestamp_us =
+                (uint64_t)ts.tv_sec * 1000000ull +
+                (uint64_t)ts.tv_nsec / 1000ull;
+        } else {
+            c->meta[slot].timestamp_us = 0;
+        }
+    }
 
     /* First placement sets the canvas's overall type */
     if (c->slot_count == 0) c->canvas_type = t;

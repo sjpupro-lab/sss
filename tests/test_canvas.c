@@ -3,6 +3,7 @@
 #include "spatial_morpheme.h"
 #include "spatial_match.h"
 #include "spatial_canvas.h"
+#include "spatial_subtitle.h"  /* pool_* for v4 Task B sequence metadata test */
 
 #include <assert.h>
 #include <stdio.h>
@@ -248,6 +249,77 @@ static void test_canvas_vs_independent(void) {
     PASS();
 }
 
+/* ── v4 Task B: sequence_id + timestamp_us metadata ── */
+static void test_sequence_metadata(void) {
+    TEST("canvas_add_clause: per-canvas sequence_id is monotonic, timestamp_us > 0");
+    morpheme_init();
+
+    SpatialCanvas* c = canvas_create();
+    char buf[128];
+    uint64_t prev_ts = 0;
+    for (uint32_t i = 0; i < 5; i++) {
+        make_clause(buf, sizeof(buf), i);
+        int slot = canvas_add_clause(c, buf);
+        assert(slot == (int)i);
+        assert(c->meta[slot].sequence_id == i);        /* per-canvas default */
+        assert(c->meta[slot].timestamp_us > 0);
+        assert(c->meta[slot].timestamp_us >= prev_ts); /* CLOCK_MONOTONIC */
+        prev_ts = c->meta[slot].timestamp_us;
+    }
+    /* Unfilled slots keep the default zero */
+    assert(c->meta[5].occupied == 0);
+    assert(c->meta[5].sequence_id == 0);
+    assert(c->meta[5].timestamp_us == 0);
+    canvas_destroy(c);
+    PASS();
+
+    TEST("pool_add_clause: sequence_id is pool-wide monotonic across canvases");
+    SpatialCanvasPool* p = pool_create();
+    assert(p != NULL);
+    assert(p->next_sequence_id == 0);
+
+    /* Mix two data types so the pool routes placements into different
+     * canvases. After CV_SLOTS prose clauses the pool opens a second
+     * prose canvas; the sequence_id must keep climbing without reset. */
+    uint32_t expected_seq = 0;
+    for (uint32_t i = 0; i < 40; i++) {
+        if (i % 3 == 0) {
+            int r = pool_add_clause(p, "int fn(){return 1;}");   /* CODE */
+            assert(r >= 0);
+        } else {
+            char pbuf[128];
+            snprintf(pbuf, sizeof pbuf,
+                     "the quick brown fox jumps over lazy dog at line %u today.", i);
+            int r = pool_add_clause(p, pbuf);
+            assert(r >= 0);
+        }
+        expected_seq++;
+    }
+    assert(p->next_sequence_id == expected_seq);
+
+    /* Walk every occupied slot and collect its sequence_id. The set
+     * must be exactly {0 .. expected_seq-1}. */
+    uint32_t seen = 0;
+    int      hits[64] = {0};
+    for (uint32_t ci = 0; ci < p->count; ci++) {
+        SpatialCanvas* cv = p->canvases[ci];
+        for (uint32_t s = 0; s < CV_SLOTS; s++) {
+            if (!cv->meta[s].occupied) continue;
+            uint32_t sid = cv->meta[s].sequence_id;
+            assert(sid < 64);
+            assert(hits[sid] == 0 && "pool-wide sequence_id must be unique");
+            hits[sid] = 1;
+            assert(cv->meta[s].timestamp_us > 0);
+            seen++;
+        }
+    }
+    assert(seen == expected_seq);
+    for (uint32_t i = 0; i < expected_seq; i++) assert(hits[i] == 1);
+
+    pool_destroy(p);
+    PASS();
+}
+
 int main(void) {
     printf("=== test_canvas ===\n");
 
@@ -257,6 +329,7 @@ int main(void) {
     test_slot_matching();
     test_delta_rle_benefit();
     test_canvas_vs_independent();
+    test_sequence_metadata();
 
     printf("  %d/%d passed\n\n", tests_passed, tests_total);
     return (tests_passed == tests_total) ? 0 : 1;

@@ -254,6 +254,7 @@ SpatialCanvasPool* pool_create(void) {
     p->capacity = 0;
     subtitle_track_init(&p->track);
     scene_change_init(&p->scene);
+    p->next_sequence_id = 0;   /* v4 Task B — pool-wide monotonic counter */
     return p;
 }
 
@@ -311,6 +312,12 @@ int pool_add_clause(SpatialCanvasPool* p, const char* text) {
     SpatialCanvas* c = p->canvases[cvi];
     int slot = canvas_add_clause(c, text);
     if (slot < 0) return -1;
+
+    /* v4 Task B — replace the canvas-local default with a pool-wide
+     * monotonic id so the ordering survives across canvases and across
+     * Task C re-clustering. timestamp_us stamped by canvas_add_clause
+     * is already pool-scoped (single monotonic clock). */
+    c->meta[slot].sequence_id = p->next_sequence_id++;
 
     /* Append to subtitle track */
     uint32_t th = c->meta[slot].topic_hash;

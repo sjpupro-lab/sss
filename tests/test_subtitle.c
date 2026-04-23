@@ -303,6 +303,22 @@ static void test_save_load_roundtrip(void) {
     subtitle_track_ids_of_type(&p->track, DATA_PROSE, &pre_prose_n);
     subtitle_track_ids_of_type(&p->track, DATA_CODE,  &pre_code_n);
 
+    /* v4 Task B — snapshot every occupied slot's sequence_id + timestamp
+     * so we can verify the SPAI_TAG_SEQMETA record roundtrips them. */
+    uint32_t pre_next_seq = p->next_sequence_id;
+    uint32_t pre_sid[16] = {0};
+    uint64_t pre_ts [16] = {0};
+    uint32_t snap_n = 0;
+    for (uint32_t ci = 0; ci < p->count && snap_n < 16; ci++) {
+        SpatialCanvas* c = p->canvases[ci];
+        for (uint32_t s = 0; s < CV_SLOTS && snap_n < 16; s++) {
+            if (!c->meta[s].occupied) continue;
+            pre_sid[snap_n] = c->meta[s].sequence_id;
+            pre_ts [snap_n] = c->meta[s].timestamp_us;
+            snap_n++;
+        }
+    }
+
     #ifdef _WIN32
     system("if not exist build mkdir build");
     #else
@@ -334,6 +350,21 @@ static void test_save_load_roundtrip(void) {
     assert(post_slots == pre_slots);
     assert(post_prose_n == pre_prose_n);
     assert(post_code_n  == pre_code_n);
+
+    /* v4 Task B — same per-slot sequence_id + timestamp_us + pool-wide
+     * counter must come back intact after a full save/load cycle. */
+    assert(ai2->canvas_pool->next_sequence_id == pre_next_seq);
+    uint32_t check_n = 0;
+    for (uint32_t ci = 0; ci < ai2->canvas_pool->count && check_n < 16; ci++) {
+        SpatialCanvas* c = ai2->canvas_pool->canvases[ci];
+        for (uint32_t s = 0; s < CV_SLOTS && check_n < 16; s++) {
+            if (!c->meta[s].occupied) continue;
+            assert(c->meta[s].sequence_id  == pre_sid[check_n]);
+            assert(c->meta[s].timestamp_us == pre_ts [check_n]);
+            check_n++;
+        }
+    }
+    assert(check_n == snap_n);
 
     /* Query after reload still works */
     SpatialGrid* q = grid_create();

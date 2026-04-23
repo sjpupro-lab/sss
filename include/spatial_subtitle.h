@@ -98,6 +98,11 @@ typedef struct SpatialCanvasPool_ {
     /* Scene change detector state per-pool (shared across canvases of
      * all types; threshold adapts to data statistics). */
     SceneChangeState scene;
+    /* v4 Task B — pool-wide monotonic sequence counter. Incremented by
+     * pool_add_clause after a successful placement so the slot's
+     * sequence_id is unique across all canvases of this pool. Survives
+     * a save/load round-trip via the optional SPAI_TAG_SEQMETA record. */
+    uint32_t        next_sequence_id;
 } SpatialCanvasPool;
 
 SpatialCanvasPool* pool_create(void);
