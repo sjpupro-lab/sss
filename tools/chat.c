@@ -29,6 +29,7 @@
 #include "spatial_generate.h"
 #include "spatial_io.h"
 #include "spatial_subtitle.h"  /* pool_add_clause, pool_total_slots (v4 Task E) */
+#include "spatial_recluster.h" /* pool_recluster_by_topic (v4 Task C / E3) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -244,6 +245,7 @@ static void print_help(void) {
         "  :ctx status   print current context pool state\n"
         "  :refine cfg   print the active RefineConfig\n"
         "  :refine trace arm trace capture; next input prints the convergence graph\n"
+        "  :recluster    run pool_recluster_by_topic on ai->canvas_pool (offline)\n"
         "\n"
         "  Otherwise, type any text to query the model.\n");
 }
@@ -320,6 +322,21 @@ int main(int argc, char** argv) {
             else if (!strcmp(line, ":gen"))  { mode = MODE_GEN;  printf("  [mode: gen]\n"); }
             else if (!strcmp(line, ":retr")) { mode = MODE_RETR; printf("  [mode: retr]\n"); }
             else if (!strcmp(line, ":both")) { mode = MODE_BOTH; printf("  [mode: both]\n"); }
+            else if (!strcmp(line, ":recluster")) {
+                SpatialCanvasPool* pool = ai->canvas_pool;
+                if (!pool || pool->count < 2) {
+                    printf("  [recluster: pool has %u canvas(es), nothing to reorder]\n",
+                           pool ? pool->count : 0u);
+                } else {
+                    ReclusterReport r = pool_recluster_by_topic(pool, 0.10f);
+                    printf("  [recluster: groups=%u reordered=%u "
+                           "bytes %u→%u gain=%.3f committed=%s]\n",
+                           r.groups_examined, r.canvases_reordered,
+                           r.bytes_before, r.bytes_after,
+                           r.compression_gain,
+                           r.committed ? "yes" : "no");
+                }
+            }
             else if (!strcmp(line, ":refine cfg")) print_refine_cfg(&refine_cfg);
             else if (!strcmp(line, ":refine trace")) {
                 if (gen_path != GEN_REFINE) {

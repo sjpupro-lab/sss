@@ -23,7 +23,7 @@ OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
 TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_recluster test_refine
 
-.PHONY: all clean test gpu_train_help probe_task_a
+.PHONY: all clean test gpu_train_help probe_task_a bench_context bench_refine
 
 all: $(BUILD_DIR) $(OBJS)
 	@echo "Build complete."
@@ -85,6 +85,18 @@ $(BUILD_DIR)/test_recluster: $(TEST_DIR)/test_recluster.c $(OBJS) | $(BUILD_DIR)
 
 $(BUILD_DIR)/test_refine: $(TEST_DIR)/test_refine.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/bench_context: $(TEST_DIR)/bench_context.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/bench_refine: $(TEST_DIR)/bench_refine.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+bench_context: $(BUILD_DIR)/bench_context
+	@./$(BUILD_DIR)/bench_context
+
+bench_refine: $(BUILD_DIR)/bench_refine
+	@./$(BUILD_DIR)/bench_refine
 
 # ─── v4 Task A probe (manual run, not part of `make test`) ────
 $(BUILD_DIR)/probe_task_a: $(TEST_DIR)/probe_task_a.c $(OBJS) | $(BUILD_DIR)
