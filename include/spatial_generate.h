@@ -88,6 +88,30 @@ void input_signature_get(const InputSignature* sig, uint32_t y,
 double agg_score_byte(const AggTables* t, uint32_t y, uint8_t v,
                       double in_R, double in_G, double in_B);
 
+/* v4 Task A — weighted long/short-term scoring.
+ *
+ *   score(y, v) = w_long  * agg_score_byte(agg_long,  ...)
+ *               + w_short * agg_score_byte(agg_short, ...)
+ *
+ * agg_long is typically agg_build(ai) — long-term prior from
+ * keyframes. agg_short is typically agg_build_from_pool(ctx) over
+ * SpatialAI.context_pool (NULL → long-term-only scoring).
+ *
+ * Callers: the refinement / REPL biasing paths (Task D / Task E).
+ * Not wired into ai_generate_next; the existing baseline generation
+ * path is preserved unchanged per v4 Principle 2. Defined here so
+ * both tasks can pick up the same helper and same default weights.
+ *
+ * Recommended defaults: w_long = 0.6, w_short = 0.4. */
+#define SPAI_W_LONG_DEFAULT   0.6
+#define SPAI_W_SHORT_DEFAULT  0.4
+
+double agg_score_byte_combined(const AggTables* agg_long,
+                               const AggTables* agg_short,
+                               double w_long, double w_short,
+                               uint32_t y, uint8_t v,
+                               double in_R, double in_G, double in_B);
+
 /* ── Grid → text decoding ────────────────────────────────
  * For each row y in sequence, take the byte x with the highest A
  * value (argmax across the row) as that position's byte.

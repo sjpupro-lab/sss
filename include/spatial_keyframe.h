@@ -93,6 +93,14 @@ typedef struct SpatialAI_ {
     float ema_G    [GRID_SIZE * GRID_SIZE];
     float ema_B    [GRID_SIZE * GRID_SIZE];
     float ema_count[GRID_SIZE * GRID_SIZE];
+
+    /* v4 Task A — ContextPool (working-memory layer, separate from
+     * long-term keyframes/deltas/EMA). NULL until ai_get_context_pool
+     * is called. Unlike canvas_pool (SPEC §6 corpus pool), this one is
+     * a short-term session buffer that biases retrieval / refinement
+     * without mutating the long-term store. Not serialized to .spai
+     * by default — see ai_save_with_context for the opt-in path. */
+    struct SpatialCanvasPool_* context_pool;
 } SpatialAI;
 
 /* Blend EMA into a newly-encoded grid. Called right after
@@ -121,6 +129,14 @@ uint32_t ai_resolve_topic(const char* clause_text, const char* label);
  * every translation unit that needs SpatialAI. */
 struct SpatialCanvasPool_* ai_get_canvas_pool(SpatialAI* ai);  /* lazy create */
 void                       ai_release_canvas_pool(SpatialAI* ai); /* destroy+NULL */
+
+/* v4 Task A — ContextPool accessors. Parallel to canvas_pool but
+ * holds short-term session context used only as retrieval /
+ * refinement bias; long-term keyframes/deltas/EMA are never mutated
+ * through this path. */
+struct SpatialCanvasPool_* ai_get_context_pool(SpatialAI* ai);     /* lazy create */
+void                       ai_clear_context_pool(SpatialAI* ai);   /* empty contents, keep pool */
+void                       ai_release_context_pool(SpatialAI* ai); /* destroy + NULL */
 
 /* Create/destroy engine */
 SpatialAI* spatial_ai_create(void);

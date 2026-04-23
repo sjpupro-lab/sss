@@ -196,6 +196,30 @@ double agg_score_byte(const AggTables* t, uint32_t y, uint8_t v,
     return A * R_sim * G_sim * B_sim;
 }
 
+/* v4 Task A — combined long + short prior scoring.
+ * If either table is NULL, that side contributes 0 (collapses to the
+ * other side alone). Negative weights are clamped to 0 so a caller
+ * that accidentally passes a signed leftover doesn't produce an
+ * "anti-prior" bias — the combined score is strictly non-negative,
+ * matching agg_score_byte's own contract. */
+double agg_score_byte_combined(const AggTables* agg_long,
+                               const AggTables* agg_short,
+                               double w_long, double w_short,
+                               uint32_t y, uint8_t v,
+                               double in_R, double in_G, double in_B) {
+    if (w_long  < 0.0) w_long  = 0.0;
+    if (w_short < 0.0) w_short = 0.0;
+
+    double s_long  = (agg_long  && w_long  > 0.0)
+                   ? agg_score_byte(agg_long,  y, v, in_R, in_G, in_B)
+                   : 0.0;
+    double s_short = (agg_short && w_short > 0.0)
+                   ? agg_score_byte(agg_short, y, v, in_R, in_G, in_B)
+                   : 0.0;
+
+    return w_long * s_long + w_short * s_short;
+}
+
 /* ── Grid → text decoding ───────────────────────────────
  *
  * Two variants live side by side:

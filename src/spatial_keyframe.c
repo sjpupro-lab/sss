@@ -150,9 +150,12 @@ void apply_ema_to_grid(const SpatialAI* ai, SpatialGrid* grid) {
             float r = 0.5f * (float)grid->R[i] + 0.5f * er;
             float g = 0.5f * (float)grid->G[i] + 0.5f * eg;
             float b = 0.5f * (float)grid->B[i] + 0.5f * eb;
-            if (r > 255.0f) r = 255.0f; if (r < 0.0f) r = 0.0f;
-            if (g > 255.0f) g = 255.0f; if (g < 0.0f) g = 0.0f;
-            if (b > 255.0f) b = 255.0f; if (b < 0.0f) b = 0.0f;
+            if (r > 255.0f) r = 255.0f;
+            if (r < 0.0f)   r = 0.0f;
+            if (g > 255.0f) g = 255.0f;
+            if (g < 0.0f)   g = 0.0f;
+            if (b > 255.0f) b = 255.0f;
+            if (b < 0.0f)   b = 0.0f;
             grid->R[i] = (uint8_t)r;
             grid->G[i] = (uint8_t)g;
             grid->B[i] = (uint8_t)b;
@@ -198,6 +201,9 @@ SpatialAI* spatial_ai_create(void) {
 
     /* Canvas pool is lazily created on first ai_get_canvas_pool() call */
     ai->canvas_pool = NULL;
+
+    /* v4 Task A — separate working-memory pool, lazily created */
+    ai->context_pool = NULL;
 
     /* Hash bucket index for large-corpus retrieval; populated as
      * keyframes are added. Rebuilt in ai_load after reading KFs. */
@@ -253,6 +259,11 @@ void spatial_ai_destroy(SpatialAI* ai) {
         ai->canvas_pool = NULL;
     }
 
+    if (ai->context_pool) {
+        pool_destroy(ai->context_pool);
+        ai->context_pool = NULL;
+    }
+
     bucket_index_destroy(&ai->bucket_idx);
 
     free(ai);
@@ -270,6 +281,52 @@ void ai_release_canvas_pool(SpatialAI* ai) {
     if (!ai || !ai->canvas_pool) return;
     pool_destroy(ai->canvas_pool);
     ai->canvas_pool = NULL;
+}
+
+/* ── v4 Task A: ContextPool accessors ──
+ *
+ * Working-memory pool separate from both the long-term keyframes and
+ * the (corpus-oriented) canvas_pool. Intended to be populated with
+ * session-scoped clauses — conversation history, recently-browsed
+ * prompts, scratch notes — and read back through
+ * agg_build_from_pool() during retrieval/refinement so the generator
+ * can bias toward the current context without mutating anything in
+ * ai->keyframes / ai->deltas / ai->ema_*.
+ *
+ * Lifecycle:
+ *   ai_get_context_pool      lazy-create. Idempotent. Never NULL on
+ *                            a live SpatialAI* unless allocation fails.
+ *   ai_clear_context_pool    drop contents but keep a fresh empty pool.
+ *                            SpatialCanvasPool has no public clear
+ *                            primitive, so we destroy-and-recreate.
+ *                            Safe to call on a NULL-pool ai (no-op
+ *                            beyond lazy create).
+ *   ai_release_context_pool  destroy pool and NULL the pointer. After
+ *                            this a subsequent ai_get_context_pool
+ *                            call lazy-creates again.
+ *
+ * .spai serialization: by default the context_pool is NOT written.
+ * See the roadmap item ai_save_with_context(ai, path) which would add
+ * a new SPAI_TAG_* tag without reordering existing ones. */
+SpatialCanvasPool* ai_get_context_pool(SpatialAI* ai) {
+    if (!ai) return NULL;
+    if (!ai->context_pool) ai->context_pool = pool_create();
+    return ai->context_pool;
+}
+
+void ai_clear_context_pool(SpatialAI* ai) {
+    if (!ai) return;
+    if (ai->context_pool) {
+        pool_destroy(ai->context_pool);
+        ai->context_pool = NULL;
+    }
+    ai->context_pool = pool_create();
+}
+
+void ai_release_context_pool(SpatialAI* ai) {
+    if (!ai || !ai->context_pool) return;
+    pool_destroy(ai->context_pool);
+    ai->context_pool = NULL;
 }
 
 /* Grow keyframe array if needed */

@@ -1,4 +1,9 @@
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200112L  /* expose posix_memalign from <stdlib.h> */
+#endif
+
 #include "spatial_grid.h"
+#include <stdlib.h>
 
 #ifdef _WIN32
 #include <malloc.h>
@@ -11,7 +16,7 @@ static void aligned_free_portable(void* ptr) {
 #else
 static void* aligned_alloc_portable(size_t alignment, size_t size) {
     void* ptr = NULL;
-    posix_memalign(&ptr, alignment, size);
+    if (posix_memalign(&ptr, alignment, size) != 0) return NULL;
     return ptr;
 }
 static void aligned_free_portable(void* ptr) {

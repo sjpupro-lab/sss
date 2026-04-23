@@ -17,6 +17,7 @@
  *   :gen          generate next-frame response (default mode)
  *   :both         show retrieval + generation
  *   :retr         show retrieval only
+ *   :ctx on|off|clear|status   control v4 Task A context pool
  *   :help         show commands
  */
 
@@ -27,6 +28,7 @@
 #include "spatial_keyframe.h"
 #include "spatial_generate.h"
 #include "spatial_io.h"
+#include "spatial_subtitle.h"  /* pool_add_clause, pool_total_slots (v4 Task E) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,6 +168,10 @@ static void print_help(void) {
         "  :retr         switch to retrieve-only mode\n"
         "  :both         show both retrieval and generation\n"
         "  :topk [N]     print top-N matches for the NEXT input (default 5)\n"
+        "  :ctx on       accumulate user inputs into the context pool\n"
+        "  :ctx off      stop accumulating (pool contents preserved)\n"
+        "  :ctx clear    empty the context pool (keeps it live)\n"
+        "  :ctx status   print current context pool state\n"
         "\n"
         "  Otherwise, type any text to query the model.\n");
 }
@@ -200,6 +206,15 @@ int main(int argc, char** argv) {
     int pending_topk = 0;
     int topk_n = 5;
 
+    /* v4 Task E partial — :ctx on/off/clear controls whether non-command
+     * lines typed by the user are accumulated into ai->context_pool.
+     * The pool itself is created lazily by ai_get_context_pool on the
+     * first :ctx on or :ctx clear. Baseline retrieval/generation paths
+     * (ai_predict / ai_generate_next) are intentionally NOT biased by
+     * this pool — per v4 principle 2, the baseline is preserved. The
+     * pool becomes load-bearing once Task D (ai_generate_refine) lands. */
+    int ctx_enabled = 0;
+
     printf("\nCANVAS chat — KF=%u Delta=%u. Type :help for commands, :q to quit.\n\n",
            ai->kf_count, ai->df_count);
     fflush(stdout);
@@ -222,9 +237,31 @@ int main(int argc, char** argv) {
             else if (!strncmp(line, ":topk", 5)) {
                 int n = 5;
                 if (line[5] == ' ') n = atoi(line + 6);
-                if (n < 1) n = 1; if (n > 8) n = 8;
+                if (n < 1) n = 1;
+                if (n > 8) n = 8;
                 topk_n = n; pending_topk = 1;
                 printf("  [topk=%d armed — next input will print %d candidates]\n", n, n);
+            }
+            else if (!strcmp(line, ":ctx on")) {
+                (void)ai_get_context_pool(ai);
+                ctx_enabled = 1;
+                printf("  [ctx: on — slots=%u]\n",
+                       ai->context_pool ? pool_total_slots(ai->context_pool) : 0);
+            }
+            else if (!strcmp(line, ":ctx off")) {
+                ctx_enabled = 0;
+                printf("  [ctx: off — slots=%u (preserved)]\n",
+                       ai->context_pool ? pool_total_slots(ai->context_pool) : 0);
+            }
+            else if (!strcmp(line, ":ctx clear")) {
+                ai_clear_context_pool(ai);
+                printf("  [ctx: cleared — slots=%u]\n",
+                       ai->context_pool ? pool_total_slots(ai->context_pool) : 0);
+            }
+            else if (!strcmp(line, ":ctx status") || !strcmp(line, ":ctx")) {
+                printf("  [ctx: %s — slots=%u]\n",
+                       ctx_enabled ? "on" : "off",
+                       ai->context_pool ? pool_total_slots(ai->context_pool) : 0);
             }
             else printf("  unknown command: %s (try :help)\n", line);
             continue;
@@ -233,6 +270,14 @@ int main(int argc, char** argv) {
         if (pending_topk) {
             print_topk(ai, line, (uint32_t)topk_n);
             pending_topk = 0;
+        }
+
+        /* v4 Task E — accumulate the current user line into the context
+         * pool when :ctx is on. Skipped when off so the pool reflects
+         * only the turns the user explicitly scoped in. */
+        if (ctx_enabled) {
+            SpatialCanvasPool* cp = ai_get_context_pool(ai);
+            if (cp) (void)pool_add_clause(cp, line);
         }
 
         if (mode == MODE_GEN)      do_generate(ai, line);
