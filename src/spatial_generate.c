@@ -571,17 +571,138 @@ RefineConfig refine_config_default_image(void) {
     return c;
 }
 
-/* D1 stub — delegates to ai_generate_next so the parallel path is
- * callable end-to-end while the DraftField implementation is in
- * progress. D2 replaces this body with real draft_field_init, and D3
- * with the per-level refine loop. out_confidence / out_iterations
- * carry sentinel values so callers can still distinguish "stub
- * returned via baseline" from an eventual real refine run.
+/* ── D3: per-level refine loop ──────────────────────────
  *
- * Non-obvious: we intentionally do not compute draft statistics in
- * the stub. Confidence = baseline match similarity; iterations = 0.
- * Callers that rely on these signals will start seeing non-zero
- * values as soon as D3 lands. */
+ * Simplified (text-path) scoring:
+ *   For each candidate (y, x), use the long-term prior's per-cell
+ *   RGB means as the neighbor signature (radius is an upper-bound
+ *   cue, not a hard window — spec §D.1 explicitly allows level-by-
+ *   level policy swaps without changing the candidate set). When
+ *   short-term prior is available (cfg.use_context_pool + context
+ *   pool populated), blend with SPAI_W_LONG/SPAI_W_SHORT defaults.
+ *
+ * Confidence is the row-normalized score: score divided by row's
+ * total activity. Promotion fires when confidence >= threshold[L].
+ * Per-level loop stops when either max_iter[L] is reached or the
+ * per-iteration promotion rate falls below converge_rate[L].
+ *
+ * ANCHOR cells are completely untouched — the loop only considers
+ * cells with status == CELL_CANDIDATE. This is the enforcement
+ * point for spec §D.7's anchor-immutability rule.  */
+static double score_candidate_cell(const AggTables* agg_long,
+                                   const AggTables* agg_short,
+                                   uint32_t y, uint32_t x,
+                                   float wR, float wG, float wB) {
+    uint32_t i = y * GRID_SIZE + x;
+    double R = agg_long->R_mean[i];
+    double G = agg_long->G_mean[i];
+    double B = agg_long->B_mean[i];
+    double s_long  = agg_score_byte(agg_long,  y, (uint8_t)x, R, G, B);
+    double s_short = 0.0;
+    if (agg_short) {
+        s_short = agg_score_byte(agg_short, y, (uint8_t)x, R, G, B);
+    }
+    double w_avg = ((double)wR + (double)wG + (double)wB) / 3.0;
+    if (w_avg <= 0.0) w_avg = 1.0;
+    if (agg_short) {
+        return (SPAI_W_LONG_DEFAULT * s_long + SPAI_W_SHORT_DEFAULT * s_short) * w_avg;
+    }
+    return s_long * w_avg;
+}
+
+static uint32_t refine_run_levels(DraftField* df,
+                                  const AggTables* agg_long,
+                                  const AggTables* agg_short,
+                                  const RefineConfig* cfg) {
+    uint32_t iters_total = 0;
+    for (int L = 0; L < 3; L++) {
+        float wR = cfg->ch_weights[L][0];
+        float wG = cfg->ch_weights[L][1];
+        float wB = cfg->ch_weights[L][2];
+        float thr = cfg->promote_threshold[L];
+        float conv = cfg->converge_rate[L];
+        uint32_t max_iter = cfg->max_iter[L];
+
+        for (uint32_t iter = 0; iter < max_iter; iter++) {
+            uint32_t n_before = df->n_candidate;
+            if (n_before == 0) break;
+            uint32_t promoted = 0;
+
+            for (uint32_t y = 0; y < GRID_SIZE; y++) {
+                double row_total = agg_long->row_total_A[y];
+                if (row_total <= 0.0) continue;
+                for (uint32_t x = 0; x < GRID_SIZE; x++) {
+                    uint32_t i = y * GRID_SIZE + x;
+                    CellState* cs = &df->cells[i];
+                    if (cs->status != CELL_CANDIDATE) continue;  /* skips ANCHOR */
+                    double s = score_candidate_cell(agg_long, agg_short,
+                                                    y, x, wR, wG, wB);
+                    double conf = s / (row_total + 1e-9);
+                    if (conf > 1.0) conf = 1.0;
+                    cs->confidence = (float)conf;
+                    cs->value = (uint8_t)x;
+                    if (conf >= (double)thr) {
+                        cs->status = CELL_RESOLVED;
+                        df->n_candidate--;
+                        df->n_resolved++;
+                        promoted++;
+                    }
+                }
+            }
+            iters_total++;
+            df->n_promoted_this_iter = promoted;
+
+            if (promoted == 0) break;
+            float rate = (n_before > 0)
+                ? (float)promoted / (float)n_before
+                : 0.0f;
+            if (rate < conv) break;
+        }
+    }
+    return iters_total;
+}
+
+/* After refinement, pick one byte per row:
+ *   1. ANCHOR wins (input-derived).
+ *   2. Otherwise the RESOLVED cell in the row with highest confidence.
+ *   3. Otherwise no output — truncate at the first unresolved row. */
+static uint32_t refine_decode_rows(const DraftField* df,
+                                   char* out, uint32_t max_out) {
+    uint32_t written = 0;
+    for (uint32_t y = 0; y < GRID_SIZE && written < max_out; y++) {
+        uint8_t pick = 0;
+        float   pick_conf = -1.0f;
+        int     kind = CELL_EMPTY;
+
+        for (uint32_t x = 0; x < GRID_SIZE; x++) {
+            const CellState* cs = &df->cells[y * GRID_SIZE + x];
+            if (cs->status == CELL_ANCHOR) {
+                if (kind != CELL_ANCHOR || cs->confidence > pick_conf) {
+                    pick = cs->value;
+                    pick_conf = cs->confidence;
+                    kind = CELL_ANCHOR;
+                }
+            } else if (cs->status == CELL_RESOLVED && kind != CELL_ANCHOR) {
+                if (kind != CELL_RESOLVED || cs->confidence > pick_conf) {
+                    pick = cs->value;
+                    pick_conf = cs->confidence;
+                    kind = CELL_RESOLVED;
+                }
+            }
+        }
+        if (kind == CELL_EMPTY) break;  /* row has no decision → stop output */
+        out[written++] = (char)pick;
+    }
+    if (written < max_out) out[written] = '\0';
+    return written;
+}
+
+/* Minimum anchor count below which refinement has nothing to lock
+ * against. At that point we delegate to the baseline and log the
+ * fallback per spec §D.7. Empirically "a few dozen anchor cells per
+ * clause" is plenty, so 16 is deliberately conservative. */
+#define REFINE_ANCHOR_MIN 16
+
 uint32_t ai_generate_refine(SpatialAI* ai,
                             const char* input_text,
                             char* out, uint32_t max_out,
@@ -594,13 +715,90 @@ uint32_t ai_generate_refine(SpatialAI* ai,
         if (out && max_out > 0) out[0] = '\0';
         return 0;
     }
-    RefineConfig local = cfg ? *cfg : refine_config_default_text();
-    (void)local;  /* consumed by D2/D3 — acknowledged here to silence -Wunused */
 
-    float sim = 0.0f;
-    uint32_t n = ai_generate_next(ai, input_text, out, max_out, &sim);
-    if (out_confidence) *out_confidence = sim;
-    /* iterations stays 0: stub did not run the refine loop. */
-    fprintf(stderr, "refine_fallback: D1 stub delegated to ai_generate_next\n");
-    return n;
+    RefineConfig local = cfg ? *cfg : refine_config_default_text();
+
+    /* 1. Encode input (same front-end as ai_generate_next, but on a
+     *    scratch grid — we never mutate ai state from here). */
+    SpatialGrid* in_grid = grid_create();
+    if (!in_grid) { out[0] = '\0'; return 0; }
+    layers_encode_clause(input_text, NULL, in_grid);
+    update_rgb_directional(in_grid);
+    apply_ema_to_grid(ai, in_grid);
+
+    /* 2. Build priors. Short-term is optional; we only consult the
+     *    pool when the config opts in AND the pool has slots. */
+    AggTables* agg_long  = agg_build(ai);
+    AggTables* agg_short = NULL;
+    if (local.use_context_pool && ai->context_pool &&
+        pool_total_slots(ai->context_pool) > 0) {
+        agg_short = agg_build_from_pool(ai->context_pool);
+    }
+
+    /* 3. Initialize the draft field. */
+    DraftField* df = (DraftField*)calloc(1, sizeof(DraftField));
+    if (!df) {
+        grid_destroy(in_grid);
+        if (agg_long)  agg_destroy(agg_long);
+        if (agg_short) agg_destroy(agg_short);
+        out[0] = '\0';
+        return 0;
+    }
+    draft_field_init(df, in_grid, agg_long, &local);
+
+    /* 4. Low-anchor-density fallback. Even if the input encodes into
+     *    a lot of cells, deliberately-short prompts fall through to
+     *    the baseline so refine can't invent confidence out of thin
+     *    air. Spec §D.7 tags this path "refine_fallback". */
+    if (df->n_anchor < REFINE_ANCHOR_MIN) {
+        uint32_t n_anchor = df->n_anchor;
+        free(df);
+        grid_destroy(in_grid);
+        if (agg_long)  agg_destroy(agg_long);
+        if (agg_short) agg_destroy(agg_short);
+        float sim = 0.0f;
+        uint32_t n = ai_generate_next(ai, input_text, out, max_out, &sim);
+        if (out_confidence) *out_confidence = sim;
+        if (out_iterations) *out_iterations = 0;
+        fprintf(stderr, "refine_fallback: anchor density=%u < %d\n",
+                n_anchor, REFINE_ANCHOR_MIN);
+        return n;
+    }
+
+    /* 5. Per-level coarse → fine loop. */
+    uint32_t iters = refine_run_levels(df, agg_long, agg_short, &local);
+
+    /* 6. Decode. If refine produced no RESOLVED rows (e.g. thresholds
+     *    were too strict for this prompt), fall back to the baseline
+     *    so we still hand the caller a meaningful reply. */
+    uint32_t written = refine_decode_rows(df, out, max_out);
+
+    /* Confidence summary: average of RESOLVED + ANCHOR confidences. */
+    double conf_sum = 0.0;
+    uint32_t conf_n = 0;
+    for (uint32_t i = 0; i < GRID_SIZE * GRID_SIZE; i++) {
+        uint8_t st = df->cells[i].status;
+        if (st == CELL_RESOLVED || st == CELL_ANCHOR) {
+            conf_sum += df->cells[i].confidence;
+            conf_n++;
+        }
+    }
+
+    free(df);
+    grid_destroy(in_grid);
+    if (agg_long)  agg_destroy(agg_long);
+    if (agg_short) agg_destroy(agg_short);
+
+    if (written == 0) {
+        float sim = 0.0f;
+        uint32_t n = ai_generate_next(ai, input_text, out, max_out, &sim);
+        if (out_confidence) *out_confidence = sim;
+        if (out_iterations) *out_iterations = iters;  /* we did iterate, just didn't emit */
+        fprintf(stderr, "refine_fallback: no resolved rows after %u iterations\n", iters);
+        return n;
+    }
+
+    if (out_confidence) *out_confidence = (conf_n > 0) ? (float)(conf_sum / conf_n) : 0.0f;
+    if (out_iterations) *out_iterations = iters;
+    return written;
 }
