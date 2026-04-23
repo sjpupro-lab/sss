@@ -613,9 +613,12 @@ static double score_candidate_cell(const AggTables* agg_long,
 static uint32_t refine_run_levels(DraftField* df,
                                   const AggTables* agg_long,
                                   const AggTables* agg_short,
-                                  const RefineConfig* cfg) {
+                                  const RefineConfig* cfg,
+                                  RefineTrace* trace) {
     uint32_t iters_total = 0;
+    uint32_t last_level  = 0;
     for (int L = 0; L < 3; L++) {
+        last_level = (uint32_t)L;
         float wR = cfg->ch_weights[L][0];
         float wG = cfg->ch_weights[L][1];
         float wB = cfg->ch_weights[L][2];
@@ -652,13 +655,28 @@ static uint32_t refine_run_levels(DraftField* df,
             iters_total++;
             df->n_promoted_this_iter = promoted;
 
-            if (promoted == 0) break;
             float rate = (n_before > 0)
                 ? (float)promoted / (float)n_before
                 : 0.0f;
+
+            if (trace) {
+                if (trace->n < REFINE_TRACE_MAX) {
+                    RefineTraceEntry* e = &trace->entries[trace->n++];
+                    e->level         = (uint8_t)L;
+                    e->iter          = (uint16_t)(iter + 1);
+                    e->n_candidates  = n_before;
+                    e->n_promoted    = promoted;
+                    e->promote_rate  = rate;
+                } else {
+                    trace->dropped++;
+                }
+            }
+
+            if (promoted == 0) break;
             if (rate < conv) break;
         }
     }
+    if (trace) trace->last_level = (uint8_t)last_level;
     return iters_total;
 }
 
@@ -709,8 +727,21 @@ uint32_t ai_generate_refine(SpatialAI* ai,
                             const RefineConfig* cfg,
                             float* out_confidence,
                             uint32_t* out_iterations) {
+    return ai_generate_refine_traced(ai, input_text, out, max_out,
+                                     cfg, out_confidence, out_iterations,
+                                     NULL);
+}
+
+uint32_t ai_generate_refine_traced(SpatialAI* ai,
+                                   const char* input_text,
+                                   char* out, uint32_t max_out,
+                                   const RefineConfig* cfg,
+                                   float* out_confidence,
+                                   uint32_t* out_iterations,
+                                   RefineTrace* out_trace) {
     if (out_confidence) *out_confidence = 0.0f;
     if (out_iterations) *out_iterations = 0;
+    if (out_trace) memset(out_trace, 0, sizeof *out_trace);
     if (!ai || !input_text || !out || max_out == 0) {
         if (out && max_out > 0) out[0] = '\0';
         return 0;
@@ -760,13 +791,14 @@ uint32_t ai_generate_refine(SpatialAI* ai,
         uint32_t n = ai_generate_next(ai, input_text, out, max_out, &sim);
         if (out_confidence) *out_confidence = sim;
         if (out_iterations) *out_iterations = 0;
+        if (out_trace)      out_trace->fallback_fired = 1;
         fprintf(stderr, "refine_fallback: anchor density=%u < %d\n",
                 n_anchor, REFINE_ANCHOR_MIN);
         return n;
     }
 
     /* 5. Per-level coarse → fine loop. */
-    uint32_t iters = refine_run_levels(df, agg_long, agg_short, &local);
+    uint32_t iters = refine_run_levels(df, agg_long, agg_short, &local, out_trace);
 
     /* 6. Decode. If refine produced no RESOLVED rows (e.g. thresholds
      *    were too strict for this prompt), fall back to the baseline
@@ -794,11 +826,21 @@ uint32_t ai_generate_refine(SpatialAI* ai,
         uint32_t n = ai_generate_next(ai, input_text, out, max_out, &sim);
         if (out_confidence) *out_confidence = sim;
         if (out_iterations) *out_iterations = iters;  /* we did iterate, just didn't emit */
+        if (out_trace) {
+            out_trace->fallback_fired = 1;
+            out_trace->total_iters    = iters;
+            out_trace->final_confidence = sim;
+        }
         fprintf(stderr, "refine_fallback: no resolved rows after %u iterations\n", iters);
         return n;
     }
 
-    if (out_confidence) *out_confidence = (conf_n > 0) ? (float)(conf_sum / conf_n) : 0.0f;
+    float final_conf = (conf_n > 0) ? (float)(conf_sum / conf_n) : 0.0f;
+    if (out_confidence) *out_confidence = final_conf;
     if (out_iterations) *out_iterations = iters;
+    if (out_trace) {
+        out_trace->total_iters      = iters;
+        out_trace->final_confidence = final_conf;
+    }
     return written;
 }

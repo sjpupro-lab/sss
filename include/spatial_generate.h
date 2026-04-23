@@ -228,4 +228,38 @@ uint32_t ai_generate_refine(SpatialAI* ai,
                             float* out_confidence,
                             uint32_t* out_iterations);
 
+/* ── Refinement trace ──
+ * Optional per-iteration record for the refine loop, consumed by the
+ * REPL `:refine trace` command and by bench_refine. Unbounded traces
+ * don't help diagnose convergence, so entries beyond REFINE_TRACE_MAX
+ * are dropped (n stays at the cap; dropped_entries counts the loss). */
+#define REFINE_TRACE_MAX 64
+
+typedef struct {
+    uint8_t  level;           /* 0..2 */
+    uint16_t iter;            /* iter index within the level, starting at 1 */
+    uint32_t n_candidates;    /* CELL_CANDIDATE count at start of iter */
+    uint32_t n_promoted;      /* promotions during this iter */
+    float    promote_rate;    /* n_promoted / n_candidates */
+} RefineTraceEntry;
+
+typedef struct {
+    RefineTraceEntry entries[REFINE_TRACE_MAX];
+    uint32_t n;                /* valid entries in [0, REFINE_TRACE_MAX] */
+    uint32_t dropped;          /* overflow count; 0 in healthy runs */
+    uint32_t total_iters;      /* sum across levels */
+    float    final_confidence; /* same value written to out_confidence */
+    int      fallback_fired;   /* 1 when ai_generate_next took over */
+    uint8_t  last_level;       /* highest level actually entered */
+} RefineTrace;
+
+/* Same as ai_generate_refine but also fills `out_trace` if non-NULL. */
+uint32_t ai_generate_refine_traced(SpatialAI* ai,
+                                   const char* input_text,
+                                   char* out, uint32_t max_out,
+                                   const RefineConfig* cfg,
+                                   float* out_confidence,
+                                   uint32_t* out_iterations,
+                                   RefineTrace* out_trace);
+
 #endif /* SPATIAL_GENERATE_H */

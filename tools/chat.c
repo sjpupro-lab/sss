@@ -129,17 +129,28 @@ static void print_topk(SpatialAI* ai, const char* text, uint32_t k) {
     }
 }
 
+static void print_refine_trace(const RefineTrace* t);  /* forward decl */
+
 static void do_generate(SpatialAI* ai, const char* text,
-                        int gen_path, const RefineConfig* refine_cfg) {
+                        int gen_path, const RefineConfig* refine_cfg,
+                        int capture_trace) {
     char out[OUT_BUF];
     double t0 = now_sec();
     uint32_t n = 0;
     float sim = 0.0f;
     uint32_t iters = 0;
+    RefineTrace trace;
+    int have_trace = 0;
 
     if (gen_path == GEN_REFINE) {
-        n = ai_generate_refine(ai, text, out, sizeof out - 1,
-                               refine_cfg, &sim, &iters);
+        if (capture_trace) {
+            n = ai_generate_refine_traced(ai, text, out, sizeof out - 1,
+                                          refine_cfg, &sim, &iters, &trace);
+            have_trace = 1;
+        } else {
+            n = ai_generate_refine(ai, text, out, sizeof out - 1,
+                                   refine_cfg, &sim, &iters);
+        }
     } else {
         n = ai_generate_next(ai, text, out, sizeof out - 1, &sim);
     }
@@ -153,9 +164,37 @@ static void do_generate(SpatialAI* ai, const char* text,
     if (gen_path == GEN_REFINE) {
         printf("  (refine: conf=%.4f, iters=%u, %u bytes, %.1f ms)\n",
                sim, iters, n, dt * 1000.0);
+        if (have_trace) print_refine_trace(&trace);
     } else {
         printf("  (sim=%.4f, %u bytes, %.1f ms)\n", sim, n, dt * 1000.0);
     }
+}
+
+static void print_refine_trace(const RefineTrace* t) {
+    static const char* dom_names[3] = {
+        "B dominant, large radius",
+        "G dominant, medium radius",
+        "R dominant, small radius",
+    };
+    printf("  [refine trace]\n");
+    int last_level = -1;
+    for (uint32_t i = 0; i < t->n; i++) {
+        const RefineTraceEntry* e = &t->entries[i];
+        if ((int)e->level != last_level) {
+            printf("  Level %u (%s):\n", e->level,
+                   dom_names[e->level < 3 ? e->level : 0]);
+            last_level = e->level;
+        }
+        printf("    iter %02u: n_cand=%-6u promoted=%-5u rate=%5.2f%%\n",
+               e->iter, e->n_candidates, e->n_promoted, e->promote_rate * 100.0f);
+    }
+    if (t->dropped > 0) {
+        printf("    ... %u additional iterations dropped (trace buffer full)\n",
+               t->dropped);
+    }
+    printf("  Total iterations: %u\n", t->total_iters);
+    printf("  Final confidence: %.3f\n", t->final_confidence);
+    printf("  Fallback used:    %s\n", t->fallback_fired ? "yes" : "no");
 }
 
 static void print_refine_cfg(const RefineConfig* c) {
@@ -204,6 +243,7 @@ static void print_help(void) {
         "  :ctx clear    empty the context pool (keeps it live)\n"
         "  :ctx status   print current context pool state\n"
         "  :refine cfg   print the active RefineConfig\n"
+        "  :refine trace arm trace capture; next input prints the convergence graph\n"
         "\n"
         "  Otherwise, type any text to query the model.\n");
 }
@@ -251,6 +291,7 @@ int main(int argc, char** argv) {
      * unchanged-behavior invariant holds for users who don't opt in. */
     int gen_path = GEN_NEXT;
     RefineConfig refine_cfg = refine_config_default_text();
+    int pending_trace = 0;  /* armed by `:refine trace` for the next prompt */
 
     printf("\nCANVAS chat — KF=%u Delta=%u. Type :help for commands, :q to quit.\n\n",
            ai->kf_count, ai->df_count);
@@ -280,6 +321,14 @@ int main(int argc, char** argv) {
             else if (!strcmp(line, ":retr")) { mode = MODE_RETR; printf("  [mode: retr]\n"); }
             else if (!strcmp(line, ":both")) { mode = MODE_BOTH; printf("  [mode: both]\n"); }
             else if (!strcmp(line, ":refine cfg")) print_refine_cfg(&refine_cfg);
+            else if (!strcmp(line, ":refine trace")) {
+                if (gen_path != GEN_REFINE) {
+                    printf("  [refine trace: switching to :gen refine automatically]\n");
+                    gen_path = GEN_REFINE;
+                }
+                pending_trace = 1;
+                printf("  [refine trace armed — next input will print the convergence graph]\n");
+            }
             else if (!strncmp(line, ":topk", 5)) {
                 int n = 5;
                 if (line[5] == ' ') n = atoi(line + 6);
@@ -326,9 +375,11 @@ int main(int argc, char** argv) {
             if (cp) (void)pool_add_clause(cp, line);
         }
 
-        if (mode == MODE_GEN)      do_generate(ai, line, gen_path, &refine_cfg);
+        int consume_trace = pending_trace;
+        if (mode == MODE_GEN)      do_generate(ai, line, gen_path, &refine_cfg, consume_trace);
         else if (mode == MODE_RETR) do_retrieve(ai, line);
-        else /* BOTH */            { do_retrieve(ai, line); do_generate(ai, line, gen_path, &refine_cfg); }
+        else /* BOTH */            { do_retrieve(ai, line); do_generate(ai, line, gen_path, &refine_cfg, consume_trace); }
+        if (consume_trace) pending_trace = 0;
     }
 
     spatial_ai_destroy(ai);
