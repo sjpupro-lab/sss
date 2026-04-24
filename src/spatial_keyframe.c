@@ -603,6 +603,26 @@ uint32_t ai_force_keyframe(SpatialAI* ai, const char* clause_text, const char* l
     return new_id;
 }
 
+uint32_t ai_store_grid(SpatialAI* ai, const SpatialGrid* input, const char* label) {
+    if (!ai || !input) return UINT32_MAX;
+    if (!ensure_kf_capacity(ai)) return UINT32_MAX;
+
+    uint32_t new_id = ai->kf_count;
+    Keyframe* kf = &ai->keyframes[new_id];
+    kf->id = new_id;
+    if (label) strncpy(kf->label, label, 63);
+    kf->label[63] = '\0';
+    kf->text_byte_count = 0;
+    kf->topic_hash      = ai_resolve_topic(NULL, label);
+    kf->seq_in_topic    = next_seq_in_topic(ai, kf->topic_hash);
+    keyframe_alloc_grid(kf, input);
+
+    ai->kf_count++;
+    bucket_index_add(&ai->bucket_idx, input, new_id);
+    ema_update(ai, input);
+    return new_id;
+}
+
 uint32_t ai_predict(SpatialAI* ai, const char* input_text, float* out_similarity) {
     if (!ai || !input_text || ai->kf_count == 0) {
         if (out_similarity) *out_similarity = 0.0f;

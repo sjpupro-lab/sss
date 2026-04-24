@@ -157,6 +157,16 @@ uint32_t ai_force_keyframe(SpatialAI* ai,
                            const char* clause_text,
                            const char* label);
 
+/* Store a pre-populated grid as a new keyframe — image/modality
+   ingestion path. Skips the text-encoding layers (caller is expected
+   to have filled the grid, e.g. via image_to_grid). Topic is derived
+   from `label` alone; pass a non-NULL label for topic-aware retrieval.
+   The caller retains ownership of `input` — its contents are copied.
+   Returns the new keyframe ID, or UINT32_MAX on failure. */
+uint32_t ai_store_grid(SpatialAI* ai,
+                       const SpatialGrid* input,
+                       const char* label);
+
 /* Compute delta between two grids.
    Returns number of changed pixels. entries must be pre-allocated. */
 uint32_t compute_delta(const SpatialGrid* base, const SpatialGrid* target,

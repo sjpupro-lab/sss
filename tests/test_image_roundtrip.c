@@ -11,6 +11,8 @@
 
 #include "spatial_grid.h"
 #include "spatial_image.h"
+#include "spatial_io.h"
+#include "spatial_keyframe.h"
 
 #include <assert.h>
 #include <math.h>
@@ -142,12 +144,83 @@ static void test_malformed_inputs(void) {
     PASS();
 }
 
+/* ── F3 ── ai_store_grid commits an image grid as a keyframe ── */
+static void test_store_grid_as_keyframe(void) {
+    TEST("ai_store_grid commits image grid + saves/loads round-trip");
+
+    const char* img_a = "build/roundtrip_trainA.ppm";
+    const char* img_b = "build/roundtrip_trainB.ppm";
+    assert(write_synthetic_ppm(img_a));
+    /* Write a second, different synthetic image (shifted stripe). */
+    FILE* fp = fopen(img_b, "wb");
+    assert(fp);
+    fprintf(fp, "P6\n%u %u\n255\n", GRID_SIZE, GRID_SIZE);
+    for (uint32_t y = 0; y < GRID_SIZE; y++) {
+        for (uint32_t x = 0; x < GRID_SIZE; x++) {
+            uint8_t rgb[3];
+            rgb[0] = (uint8_t)(255 - x);
+            rgb[1] = (uint8_t)(255 - y);
+            rgb[2] = (uint8_t)((x ^ y) & 0xFF);
+            fwrite(rgb, 1, 3, fp);
+        }
+    }
+    fclose(fp);
+
+    SpatialAI* ai = spatial_ai_create();
+    assert(ai);
+    assert(ai->kf_count == 0);
+
+    /* NULL inputs fail gracefully. */
+    assert(ai_store_grid(NULL, (const SpatialGrid*)0x1, "x") == UINT32_MAX);
+    assert(ai_store_grid(ai,   NULL,                    "x") == UINT32_MAX);
+
+    SpatialGrid* ga = image_to_grid(img_a);
+    SpatialGrid* gb = image_to_grid(img_b);
+    assert(ga && gb);
+
+    uint32_t ida = ai_store_grid(ai, ga, "trainA");
+    uint32_t idb = ai_store_grid(ai, gb, "trainB");
+    assert(ida == 0 && idb == 1);
+    assert(ai->kf_count == 2);
+    assert(strcmp(ai->keyframes[0].label, "trainA") == 0);
+    assert(strcmp(ai->keyframes[1].label, "trainB") == 0);
+    /* distinct labels → distinct topic hashes */
+    assert(ai->keyframes[0].topic_hash != ai->keyframes[1].topic_hash);
+    /* ema_update should have registered evidence for every cell */
+    uint64_t covered = 0;
+    for (uint32_t i = 0; i < GRID_TOTAL; i++)
+        if (ai->ema_count[i] > 0.0f) covered++;
+    assert(covered > GRID_TOTAL / 2);
+
+    const char* model = "build/roundtrip_train.spai";
+    assert(ai_save(ai, model) == SPAI_OK);
+
+    SpaiStatus st = SPAI_OK;
+    SpatialAI* reloaded = ai_load(model, &st);
+    assert(reloaded && st == SPAI_OK);
+    assert(reloaded->kf_count == 2);
+    assert(strcmp(reloaded->keyframes[0].label, "trainA") == 0);
+    assert(strcmp(reloaded->keyframes[1].label, "trainB") == 0);
+
+    grid_destroy(ga);
+    grid_destroy(gb);
+    spatial_ai_destroy(ai);
+    spatial_ai_destroy(reloaded);
+    remove(img_a);
+    remove(img_b);
+    remove(model);
+    printf("\n    kf_count=2  labels={trainA,trainB}  EMA covered=%llu/%u\n",
+           (unsigned long long)covered, GRID_TOTAL);
+    PASS();
+}
+
 int main(void) {
     printf("=== test_image_roundtrip ===\n");
     /* build/ directory exists once make all has run; tests run after
      * all → OBJS so the directory is present. */
     test_roundtrip_rgb_lossless();
     test_malformed_inputs();
+    test_store_grid_as_keyframe();
 
     printf("  %d/%d passed\n\n", tests_passed, tests_total);
     return (tests_passed == tests_total) ? 0 : 1;
