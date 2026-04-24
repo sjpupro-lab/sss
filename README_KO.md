@@ -128,6 +128,29 @@ R/G/B 값은 **고정 테이블이 아닙니다** — AI가 방향성 확산을 
   종합                  │ 정확도 100% 유지         │ 20-100배
 ```
 
+### 6. 이미지 모달리티 (Task F — 실현가능성 프로토타입)
+
+동일한 256×256 격자를 이미지 캔버스로도 사용합니다. `image_to_grid`는 PPM P6
+픽셀 바이트를 격자의 RGB 플레인에 매핑하고(A 채널 ← 휘도), `grid_to_image`는
+RGB 플레인을 PPM으로 되돌려 씁니다. 이미지와 텍스트는 같은 키프레임 저장소를
+공유합니다.
+
+```c
+SpatialGrid* g = image_to_grid("photo.ppm");      /* 256×256 RGB  */
+uint32_t kf_id = ai_store_grid(ai, g, "photo");   /* → 키프레임 ID */
+grid_destroy(g);
+ai_save(ai, "model.spai");                        /* 함께 저장     */
+```
+
+`ai_store_grid`는 `ai_force_keyframe`을 이미지 경로로 미러링한 API로,
+텍스트 인코딩 레이어를 생략하고 호출자가 직접 채운 격자 + 레이블을 받습니다.
+레이블에서 파생된 `topic_hash`를 부여하기 때문에 기존의 토픽 버킷 인덱스와
+캐스케이드가 그대로 적용됩니다. 셀별 EMA 통계도 함께 갱신됩니다.
+
+Task F 범위 명시: 본 모듈은 **디퓨전 방식의 생성기가 아니라** 이미지 인입 +
+refine 기반 렌더링 프로토타입입니다. PNG과 베이스라인 JPEG 입력은 아래 툴로
+변환한 후 인입합니다 (엔진 자체는 PPM 전용 유지).
+
 ## 검증 결과
 
 ```
@@ -183,16 +206,18 @@ R/G/B 값은 **고정 테이블이 아닙니다** — AI가 방향성 확산을 
 │   ├── spatial_grid.h        # 256×256 격자, 인코딩/디코딩
 │   ├── spatial_layers.h      # 3-레이어 합산 엔진
 │   ├── spatial_morpheme.h    # 한국어 형태소 분리기
-│   ├── spatial_keyframe.h    # 키프레임 / 델타 / 프레임
+│   ├── spatial_keyframe.h    # 키프레임 / 델타 / 프레임 / ai_store_grid
 │   ├── spatial_match.h       # 코사인 유사도, 패턴 매칭
-│   └── spatial_context.h     # 컨텍스트 프레임, LRU 캐시
+│   ├── spatial_context.h     # 컨텍스트 프레임, LRU 캐시
+│   └── spatial_image.h       # 이미지 ↔ 격자 변환 (Task F 프로토타입)
 ├── src/                      # 소스 파일
 │   ├── spatial_grid.c
 │   ├── spatial_layers.c
 │   ├── spatial_morpheme.c
 │   ├── spatial_keyframe.c
 │   ├── spatial_match.c
-│   └── spatial_context.c
+│   ├── spatial_context.c
+│   └── spatial_image.c
 ├── dict/                     # 한국어 사전
 │   ├── nouns.txt
 │   ├── verbs.txt
@@ -221,6 +246,37 @@ make clean
 ```
 
 **필요 환경:** GCC (C11), Make, Linux/macOS/Windows (MinGW)
+
+### 이미지로 학습하기
+
+PNG / 베이스라인 JPEG 모두 지원됩니다. 엔진은 PPM P6 256×256만 받으므로
+보조 툴로 먼저 변환합니다.
+
+```bash
+# 1) 입력을 256×256 PPM으로 변환 (박스 평균 다운샘플)
+python3 tools/png_to_ppm256.py IMG_0304.png build/training/IMG_0304.ppm
+
+make image_tools          # img2grid / grid2img 빌드
+gcc -Wall -O2 -Iinclude tools/jpeg_to_ppm256.c -o build/jpeg_to_ppm256 -ljpeg
+./build/jpeg_to_ppm256 IMG_0305.jpeg build/training/IMG_0305.ppm
+
+# 2) 학습 / 검증 툴 빌드
+gcc -Wall -O2 -Iinclude tools/train_images.c       build/*.o -o build/train_images       -lm
+gcc -Wall -O2 -Iinclude tools/verify_image_train.c build/*.o -o build/verify_image_train -lm
+
+# 3) 학습: 이미지 1장당 키프레임 1개 + EMA 갱신
+./build/train_images build/training/img_model.spai \
+    build/training/IMG_0304.ppm \
+    build/training/IMG_0305.ppm
+
+./build/verify_image_train build/training/img_model.spai
+# → kf_count: 2   EMA cells w/ evi: 65536/65536 (100.0%)
+```
+
+`png_to_ppm256.py`는 stdlib만 사용 (8-bit RGB/RGBA non-interlaced PNG 디코딩).
+`jpeg_to_ppm256`은 libjpeg를 링크합니다 (`apt install libjpeg-dev`).
+`img2grid` / `grid2img`는 이미지 ↔ SpatialGrid 라운드트립을 보여주는
+참고용 도구입니다.
 
 ## 최근 검증 요약 (2026-04-15)
 

@@ -30,8 +30,10 @@
   - [3. Keyframe / Delta storage](#3-keyframe--delta-storage)
   - [4. Matching cascade](#4-matching-cascade)
   - [5. Canvas Pool (subtitle routing)](#5-canvas-pool-subtitle-routing)
+  - [6. Image modality (Task F — feasibility prototype)](#6-image-modality-task-f--feasibility-prototype)
 - [Current verified results](#current-verified-results)
 - [Build & run](#build--run)
+- [Image training](#image-training)
 - [Save / Load](#save--load)
 - [Project layout](#project-layout)
 - [Engine optimizations](#engine-optimizations)
@@ -215,6 +217,29 @@ This gives the "H.264 scene change" behavior:
 a canvas can be `KEYFRAME` or `DELTA-of-parent-canvas`, and save/load
 preserves parent_canvas_id + changed_ratio + classified flag.
 
+### 6. Image modality (Task F — feasibility prototype)
+
+The same 256×256 grid doubles as an image canvas. `image_to_grid` maps
+PPM P6 pixel bytes onto the grid's RGB planes (A channel ← luminance);
+`grid_to_image` writes the RGB planes back out as PPM. Images and text
+share one keyframe store:
+
+```c
+SpatialGrid* g = image_to_grid("photo.ppm");      /* 256×256 RGB  */
+uint32_t kf_id = ai_store_grid(ai, g, "photo");   /* → keyframe id */
+grid_destroy(g);
+ai_save(ai, "model.spai");                        /* persist both  */
+```
+
+`ai_store_grid` mirrors `ai_force_keyframe` but skips the text-encoding
+layers: the caller provides a ready grid and a label, and the keyframe
+inherits a label-derived `topic_hash`, so the topic-aware bucket index
+and cascade apply unchanged. The per-cell EMA store is updated too.
+
+Scope reminder (per Task F spec): this is an ingestion + refine-based
+render prototype, **not** a diffusion-style generator. PNG and baseline
+JPEG inputs are ingested via the tools below (the core stays PPM-only).
+
 ---
 
 ## Current verified results
@@ -369,6 +394,37 @@ weights, EMA coverage, sample keyframe labels) and stitches the
 frames into `training_evolution.mp4` via `ffmpeg` at 3 s per frame.
 The RGB composite shows B actually contributing — a visual
 confirmation that the POS-keyed seed reached the stored grid.
+
+### Image training
+
+Train a model from images — PNG and baseline JPEG are supported via
+small ingestion helpers; the engine's native format stays PPM P6 256×256.
+
+```bash
+# Convert inputs to 256×256 PPM (box-average downsample)
+python3 tools/png_to_ppm256.py IMG_0304.png build/training/IMG_0304.ppm
+
+make image_tools          # builds img2grid / grid2img
+gcc -Wall -O2 -Iinclude tools/jpeg_to_ppm256.c -o build/jpeg_to_ppm256 -ljpeg
+./build/jpeg_to_ppm256 IMG_0305.jpeg build/training/IMG_0305.ppm
+
+# Build the train / verify tools
+gcc -Wall -O2 -Iinclude tools/train_images.c       build/*.o -o build/train_images       -lm
+gcc -Wall -O2 -Iinclude tools/verify_image_train.c build/*.o -o build/verify_image_train -lm
+
+# Train: one keyframe per image + EMA update
+./build/train_images build/training/img_model.spai \
+    build/training/IMG_0304.ppm \
+    build/training/IMG_0305.ppm
+
+./build/verify_image_train build/training/img_model.spai
+# → kf_count: 2   EMA cells w/ evi: 65536/65536 (100.0%)
+```
+
+`png_to_ppm256.py` is stdlib-only (decodes 8-bit RGB/RGBA
+non-interlaced PNGs); `jpeg_to_ppm256` links against `libjpeg`
+(`apt install libjpeg-dev`). `img2grid` / `grid2img` demonstrate
+the raw image ↔ SpatialGrid roundtrip.
 
 ### Benchmarks (optional)
 
