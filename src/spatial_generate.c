@@ -557,17 +557,28 @@ void draft_field_init(DraftField* df,
 }
 
 RefineConfig refine_config_default_image(void) {
-    /* v4 feasibility prototype — image presets are tuned larger than
-     * text since image grids carry denser local structure. These are
-     * placeholders the Task F prototype will refine. */
+    /* Spec §F — Composition / Contour / Detail. Channel weights match
+     * the text preset in dominance order (B → G → R), but thresholds
+     * are relaxed and iteration budgets are larger because image
+     * anchor density is much lower than text and strict promotion
+     * never converges. Numerical targets here are experimental; per
+     * 08 the whole image path is a feasibility prototype. */
     RefineConfig c = refine_config_default_text();
+    c.ch_weights[0][0] = 0.1f; c.ch_weights[0][1] = 0.2f; c.ch_weights[0][2] = 1.0f;
+    c.ch_weights[1][0] = 0.3f; c.ch_weights[1][1] = 1.0f; c.ch_weights[1][2] = 0.3f;
+    c.ch_weights[2][0] = 1.0f; c.ch_weights[2][1] = 0.3f; c.ch_weights[2][2] = 0.1f;
+    c.promote_threshold[0] = 0.40f;
+    c.promote_threshold[1] = 0.50f;
+    c.promote_threshold[2] = 0.60f;
+    c.max_iter[0] = 20; c.max_iter[1] = 40; c.max_iter[2] = 80;
+    c.converge_rate[0] = 0.01f;
+    c.converge_rate[1] = 0.01f;
+    c.converge_rate[2] = 0.005f;
     c.neighbor_radius[0] = 32;
     c.neighbor_radius[1] = 16;
     c.neighbor_radius[2] = 4;
-    c.promote_threshold[0] = 0.50f;
-    c.promote_threshold[1] = 0.60f;
-    c.promote_threshold[2] = 0.70f;
-    c.use_context_pool     = 0;  /* image task isn't session-driven by default */
+    c.use_context_pool    = 0;   /* image task isn't session-driven */
+    c.allow_prior_anchors = 0;
     return c;
 }
 

@@ -17,7 +17,8 @@ SRCS = $(SRC_DIR)/spatial_grid.c \
        $(SRC_DIR)/spatial_io.c \
        $(SRC_DIR)/spatial_canvas.c \
        $(SRC_DIR)/spatial_subtitle.c \
-       $(SRC_DIR)/spatial_recluster.c
+       $(SRC_DIR)/spatial_recluster.c \
+       $(SRC_DIR)/spatial_image.c
 
 OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
