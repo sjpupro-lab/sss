@@ -22,9 +22,9 @@ SRCS = $(SRC_DIR)/spatial_grid.c \
 
 OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
-TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_recluster test_refine
+TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_recluster test_refine test_image_roundtrip
 
-.PHONY: all clean test gpu_train_help probe_task_a bench_context bench_refine
+.PHONY: all clean test gpu_train_help probe_task_a bench_context bench_refine image_tools
 
 all: $(BUILD_DIR) $(OBJS)
 	@echo "Build complete."
@@ -92,6 +92,20 @@ $(BUILD_DIR)/bench_context: $(TEST_DIR)/bench_context.c $(OBJS) | $(BUILD_DIR)
 
 $(BUILD_DIR)/bench_refine: $(TEST_DIR)/bench_refine.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_image_roundtrip: $(TEST_DIR)/test_image_roundtrip.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/img2grid: tools/img2grid.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/grid2img: tools/grid2img.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+image_tools: $(BUILD_DIR)/img2grid $(BUILD_DIR)/grid2img
+	@echo "Built image prototype tools. Examples:"
+	@echo "  ./build/img2grid  in.ppm  out.ppm"
+	@echo "  ./build/grid2img  model.spai 0 kf0.ppm"
 
 bench_context: $(BUILD_DIR)/bench_context
 	@./$(BUILD_DIR)/bench_context
