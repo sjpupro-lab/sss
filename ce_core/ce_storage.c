@@ -25,18 +25,27 @@ static void grow(CEStorage *s) {
     s->capacity = cap;
 }
 
-void ce_storage_add(CEStorage *s, uint32_t canvas_id, uint16_t slot,
-                    uint16_t block_idx,
-                    const CEUnit *keyframe, const CEUnit *delta) {
+void ce_storage_add_typed(CEStorage *s, uint32_t canvas_id, uint16_t slot,
+                          uint16_t block_idx, CEType type,
+                          const CEUnit *keyframe, const CEUnit *delta) {
     if (s->count >= s->capacity) grow(s);
     if (s->count >= s->capacity) return;
     CEStorageEntry *e = &s->entries[s->count++];
     e->canvas_id = canvas_id;
     e->slot = slot;
     e->block_idx = block_idx;
+    e->type = (uint8_t)type;
+    e->reserved[0] = e->reserved[1] = e->reserved[2] = 0;
     e->keyframe = *keyframe;
     if (delta) e->delta = *delta;
     else       memset(&e->delta, 0, sizeof(e->delta));
+}
+
+void ce_storage_add(CEStorage *s, uint32_t canvas_id, uint16_t slot,
+                    uint16_t block_idx,
+                    const CEUnit *keyframe, const CEUnit *delta) {
+    ce_storage_add_typed(s, canvas_id, slot, block_idx,
+                         CE_TYPE_TEXT, keyframe, delta);
 }
 
 void ce_storage_ingest(CEStorage *s, uint32_t canvas_id, uint16_t slot,

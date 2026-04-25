@@ -41,6 +41,8 @@ int ce_storage_save(const CEStorage *s, const char *path) {
         ok &= write_u32(fp, e->canvas_id);
         ok &= write_u16(fp, e->slot);
         ok &= write_u16(fp, e->block_idx);
+        uint8_t type_block[4] = { e->type, 0, 0, 0 };
+        ok &= (fwrite(type_block, 1, 4, fp) == 4);
         ok &= (fwrite(&e->keyframe, sizeof(CEUnit), 1, fp) == 1);
         ok &= (fwrite(&e->delta,    sizeof(CEUnit), 1, fp) == 1);
     }
@@ -55,10 +57,15 @@ int ce_storage_load(CEStorage *out, const char *path) {
     if (!fp) return 0;
 
     uint32_t magic = 0, version = 0, count = 0, reserved = 0;
-    if (!read_u32(fp, &magic)   || magic   != CE_STORAGE_MAGIC ||
-        !read_u32(fp, &version) || version != CE_STORAGE_VERSION ||
+    if (!read_u32(fp, &magic)   || magic != CE_STORAGE_MAGIC ||
+        !read_u32(fp, &version) ||
         !read_u32(fp, &count)   ||
         !read_u32(fp, &reserved)) {
+        fclose(fp);
+        return 0;
+    }
+    /* Accept current and previous versions. */
+    if (version != CE_STORAGE_VERSION && version != CE_STORAGE_VERSION_V1) {
         fclose(fp);
         return 0;
     }
@@ -69,10 +76,18 @@ int ce_storage_load(CEStorage *out, const char *path) {
         ok &= read_u32(fp, &e.canvas_id);
         ok &= read_u16(fp, &e.slot);
         ok &= read_u16(fp, &e.block_idx);
+        if (version >= CE_STORAGE_VERSION) {
+            uint8_t type_block[4];
+            ok &= (fread(type_block, 1, 4, fp) == 4);
+            if (ok) e.type = type_block[0];
+        } else {
+            /* v1 entries pre-date the type tag — treat as TEXT. */
+            e.type = (uint8_t)CE_TYPE_TEXT;
+        }
         ok &= (fread(&e.keyframe, sizeof(CEUnit), 1, fp) == 1);
         ok &= (fread(&e.delta,    sizeof(CEUnit), 1, fp) == 1);
-        if (ok) ce_storage_add(out, e.canvas_id, e.slot, e.block_idx,
-                               &e.keyframe, &e.delta);
+        if (ok) ce_storage_add_typed(out, e.canvas_id, e.slot, e.block_idx,
+                                     (CEType)e.type, &e.keyframe, &e.delta);
     }
     fclose(fp);
     return ok;

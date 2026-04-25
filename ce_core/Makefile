@@ -6,7 +6,7 @@ LDFLAGS = -lm
 # Engine sources (no external deps).
 SRCS = ce_core.c ce_storage.c ce_search.c ce_engine.c \
        ce_denoise.c ce_decode.c ce_extend.c ce_gen.c \
-       ce_storage_io.c
+       ce_storage_io.c ce_feed_image.c
 
 # Ingest unit pulls in stb_image.h (vendored, public domain). We compile
 # it with reduced warnings — stb_image is third-party and contains many
@@ -26,7 +26,8 @@ TEST_BINS = $(BUILD_DIR)/test_core \
             $(BUILD_DIR)/test_extend \
             $(BUILD_DIR)/test_gen \
             $(BUILD_DIR)/test_ingest \
-            $(BUILD_DIR)/test_decode_image_block
+            $(BUILD_DIR)/test_decode_image_block \
+            $(BUILD_DIR)/test_feed_image
 
 TOOL_BINS = $(BUILD_DIR)/ce_ingest
 
@@ -66,6 +67,9 @@ $(BUILD_DIR)/test_ingest: tests/test_ingest.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/test_decode_image_block: tests/test_decode_image_block.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_feed_image: tests/test_feed_image.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/ce_ingest: tools/ce_ingest.c $(OBJS) | $(BUILD_DIR)
