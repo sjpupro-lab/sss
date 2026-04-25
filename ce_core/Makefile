@@ -3,10 +3,19 @@ CC      = gcc
 CFLAGS  = -Wall -Wextra -O2 -std=c11
 LDFLAGS = -lm
 
+# Engine sources (no external deps).
 SRCS = ce_core.c ce_storage.c ce_search.c ce_engine.c \
-       ce_denoise.c ce_decode.c ce_extend.c ce_gen.c
+       ce_denoise.c ce_decode.c ce_extend.c ce_gen.c \
+       ce_storage_io.c
 
-OBJS = $(SRCS:.c=.o)
+# Ingest unit pulls in stb_image.h (vendored, public domain). We compile
+# it with reduced warnings — stb_image is third-party and contains many
+# benign warnings under -Wall -Wextra.
+INGEST_SRC = ce_ingest.c
+INGEST_OBJ = ce_ingest.o
+INGEST_CFLAGS = -Wall -O2 -std=c11 -Wno-unused-parameter -Wno-unused-but-set-variable
+
+OBJS = $(SRCS:.c=.o) $(INGEST_OBJ)
 
 BUILD_DIR = build
 
@@ -15,16 +24,24 @@ TEST_BINS = $(BUILD_DIR)/test_core \
             $(BUILD_DIR)/test_engine \
             $(BUILD_DIR)/test_denoise \
             $(BUILD_DIR)/test_extend \
-            $(BUILD_DIR)/test_gen
+            $(BUILD_DIR)/test_gen \
+            $(BUILD_DIR)/test_ingest
 
-.PHONY: all test clean
-all: $(BUILD_DIR) $(TEST_BINS)
+TOOL_BINS = $(BUILD_DIR)/ce_ingest
+
+.PHONY: all test tools clean
+all: $(BUILD_DIR) $(TEST_BINS) $(TOOL_BINS)
+tools: $(BUILD_DIR) $(TOOL_BINS)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# stb_image lives inside ce_ingest.c — relax warnings just for that TU.
+$(INGEST_OBJ): $(INGEST_SRC)
+	$(CC) $(INGEST_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/test_core: tests/test_core.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
@@ -42,6 +59,12 @@ $(BUILD_DIR)/test_extend: tests/test_extend.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/test_gen: tests/test_gen.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_ingest: tests/test_ingest.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/ce_ingest: tools/ce_ingest.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 test: all

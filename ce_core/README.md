@@ -59,16 +59,22 @@ make test
 
 ```
 ce_core/
-├── ce_core.{h,c}     기본 64바이트 셀 + 핵심 6개 API
-├── ce_storage.{h,c}  keyframe + delta 저장소 (auto-grow)
-├── ce_search.{h,c}   결정론적 노이즈 / 쿼리 그리드 / top-k 검색
-├── ce_engine.{h,c}   UNet 등가 연산 (down/conv/attn/cross/residual/skip/up)
-├── ce_denoise.{h,c}  denoise 반복 + loss + sampler 모드
-├── ce_decode.{h,c}   바이리니어 256x256 이미지 / ASCII 텍스트 출력
-├── ce_extend.{h,c}   sampler / memo / hint / inpaint / upscale / audio
-├── ce_gen.{h,c}      최상위 API (generate_image / text / inpaint / upscale)
+├── ce_core.{h,c}        기본 64바이트 셀 + 핵심 6개 API
+├── ce_storage.{h,c}     keyframe + delta 저장소 (auto-grow)
+├── ce_storage_io.{h,c}  바이너리 저장/로드 (.ces 포맷)
+├── ce_search.{h,c}      결정론적 노이즈 / 쿼리 그리드 / top-k 검색
+├── ce_engine.{h,c}      UNet 등가 연산 (down/conv/attn/cross/residual/skip/up)
+├── ce_denoise.{h,c}     denoise 반복 + loss + sampler 모드
+├── ce_decode.{h,c}      바이리니어 256x256 이미지 / ASCII 텍스트 출력
+├── ce_extend.{h,c}      sampler / memo / hint / inpaint / upscale / audio
+├── ce_ingest.{h,c}      디렉터리 -> CEStorage (PNG/JPG/BMP/TGA/PSD/GIF/PNM)
+├── ce_gen.{h,c}         최상위 API (generate_image / text / inpaint / upscale)
+├── third_party/
+│   └── stb_image.h      vendored, public domain (PNG/JPG 디코더)
+├── tools/
+│   └── ce_ingest.c      CLI: 폴더 -> .ces 변환기
 ├── Makefile
-└── tests/            6개 테스트 바이너리
+└── tests/               7개 테스트 바이너리
 ```
 
 ---
@@ -281,6 +287,108 @@ ce_apply(anchor, ce_delta(anchor, x)) == x   (byte-exact, mod 256)
 
 ---
 
+## 이미지 폴더 → 스토리지 (.ces)
+
+PNG/JPG/BMP/TGA 이미지를 8×8 블록으로 분할하여 keyframe + delta 로 저장하는 도구.
+
+### CLI 사용법 (한 줄씩)
+
+```bash
+# 빌드 (테스트 + 도구 함께)
+cd ce_core && make all
+
+# 폴더 안의 모든 이미지를 ingest 해서 .ces 파일로 저장
+./build/ce_ingest /path/to/images -o my_dataset.ces
+
+# 하위 디렉터리까지 재귀적으로 ingest
+./build/ce_ingest /path/to/images -o my_dataset.ces --recursive
+
+# 저장된 .ces 파일 정보 보기 (이미지 수 / 블록 수 / 크기 추정)
+./build/ce_ingest --info my_dataset.ces
+```
+
+출력 예시:
+
+```
+ingested      : 3 images from /tmp/ce_real
+  seen        : 3
+  decoded     : 3
+  blocks      : 13564
+  errors      : 0
+saved         : my_dataset.ces (13564 entries)
+```
+
+### C API 사용법
+
+```c
+#include "ce_ingest.h"
+#include "ce_storage_io.h"
+
+CEStorage S;
+ce_storage_init(&S, 1024);
+
+// 1) 단일 파일 ingest
+CEIngestStats stats = {0};
+ce_ingest_file(&S, "cat.png", &stats);
+
+// 2) 디렉터리 전체 ingest (PNG/JPG/JPEG/BMP/TGA 자동 감지)
+ce_ingest_directory(&S, "./images", &stats);
+
+// 3) 재귀 ingest
+ce_ingest_directory_recursive(&S, "./dataset", &stats);
+
+// 4) 바이너리로 저장
+ce_storage_save(&S, "dataset.ces");
+
+// 5) 다른 프로세스/세션에서 로드
+CEStorage L;
+ce_storage_load(&L, "dataset.ces");
+
+// 6) ce_generate_image 등에 그대로 전달
+ce_generate_image(&img, &L, "orange cat", 42, &cfg, NULL, NULL, NULL);
+
+ce_storage_free(&S);
+ce_storage_free(&L);
+```
+
+### 인덱싱 규칙
+
+각 이미지는 다음 규칙으로 CEStorage 에 저장된다:
+
+```
+canvas_id = FNV-1a(파일경로)        // 파일별 고유 ID
+slot      = 블록의 row 좌표 (block_y) // 8픽셀 단위
+block_idx = 블록의 col 좌표 (block_x) // 8픽셀 단위
+
+block 입력 = 8 × 8 × 4 = 256 bytes (RGBA)
+        ↓ ce_feed
+keyframe = CEUnit (64 bytes)
+delta    = ce_delta(prev_block, keyframe)  // 이미지 내 체이닝
+```
+
+가장자리는 0으로 패딩 (이미지 크기가 8의 배수가 아닐 때).
+
+### .ces 바이너리 포맷
+
+```
+offset  size  field
+   0      4   magic    "CES1" (0x31534543)
+   4      4   version  uint32 = 1
+   8      4   count    uint32 (entry 개수)
+  12      4   reserved 0
+  16+         entry[count] :
+              + uint32  canvas_id
+              + uint16  slot
+              + uint16  block_idx
+              + 64 byte keyframe
+              + 64 byte delta
+              = 136 bytes / entry
+```
+
+리틀엔디언 고정. 파일 크기 ≈ 16 + 136 × count.
+
+---
+
 ## 자주 쓰는 명령 모음
 
 ```bash
@@ -295,4 +403,10 @@ cd ce_core && make build/test_gen && ./build/test_gen
 
 # 빠른 sanity check (가장 짧음)
 cd ce_core && make build/test_core && ./build/test_core
+
+# 폴더 -> .ces 변환
+cd ce_core && make build/ce_ingest && ./build/ce_ingest /path/to/imgs -o out.ces
+
+# .ces 정보 확인
+cd ce_core && ./build/ce_ingest --info out.ces
 ```
