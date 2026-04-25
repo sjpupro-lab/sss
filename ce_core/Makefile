@@ -25,7 +25,8 @@ TEST_BINS = $(BUILD_DIR)/test_core \
             $(BUILD_DIR)/test_denoise \
             $(BUILD_DIR)/test_extend \
             $(BUILD_DIR)/test_gen \
-            $(BUILD_DIR)/test_ingest
+            $(BUILD_DIR)/test_ingest \
+            $(BUILD_DIR)/test_decode_image_block
 
 TOOL_BINS = $(BUILD_DIR)/ce_ingest
 
@@ -62,6 +63,9 @@ $(BUILD_DIR)/test_gen: tests/test_gen.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/test_ingest: tests/test_ingest.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_decode_image_block: tests/test_decode_image_block.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/ce_ingest: tools/ce_ingest.c $(OBJS) | $(BUILD_DIR)

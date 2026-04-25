@@ -29,6 +29,18 @@ void ce_decode_image(CEImage *out, const CELatentGrid *z);
 void ce_decode_text(uint8_t *out, uint32_t *out_len,
                     const CELatentGrid *z);
 
+/* Decode a single CEUnit into an 8x8 RGBA block (256 bytes, row-major).
+ *
+ * Image-specific normalization: read each channel from the inc.plus carry
+ * chain in base 256, rescale into [0, 255] against the per-block maximum
+ * 64 * 255 = 16320, and clamp. Distinct from ce_read (which mixes
+ * inc/dec/plus/minus into a signed projection) — this routine does NOT
+ * mix channels and does NOT mix halves. The 8x8 output is filled with
+ * the per-channel value; per-pixel detail must come from the surrounding
+ * grid (handled by callers), not from a single CEUnit.
+ */
+void ce_decode_image_block(uint8_t *out_rgba_8x8, const CEUnit *u);
+
 #ifdef __cplusplus
 }
 #endif
