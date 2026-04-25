@@ -1,0 +1,298 @@
+# ce_core — CE Cell 결정론적 생성 엔진
+
+64바이트 신호 셀(`CEUnit`) 위에 Diffusion 파이프라인을 1:1 대응시킨 CPU-only 생성 엔진.
+같은 (prompt, seed) → 같은 출력. 입력이 바뀌면 출력이 완전히 달라진다. 평균/뭉개기 없음.
+
+```
+  바이트 스트림                 32x32 latent grid              256x256 이미지
+  ─────────────                ─────────────────              ──────────────
+  "orange cat"  ──┐                ┌───────────┐                 ┌──────────┐
+                  │  ce_feed       │ . . . . . │  ce_decode      │          │
+  noise(seed) ───►├──► CEUnit ────►│ . . z . . │ ──────────────► │  RGBA    │
+                  │  64 bytes      │ . . . . . │  bilinear       │  256x256 │
+  keyframe ───────┘                └───────────┘                 └──────────┘
+                                     ↑↑↑
+                                 down/conv/attn/cross/residual/skip/up
+                                 (반복 = denoise loop)
+```
+
+---
+
+## 빌드 & 테스트 (한 줄씩)
+
+```bash
+# ce_core 디렉터리로 진입
+cd ce_core
+
+# 모든 .o 와 build/ 정리
+make clean
+
+# 6개 테스트 바이너리 빌드 + 실행 (PASS/FAIL 출력)
+make test
+```
+
+개별 테스트만 실행하고 싶을 때:
+
+```bash
+# Phase 0: CEUnit 기본 동작 (init/feed/distance/delta/apply/read)
+./build/test_core
+
+# Phase 1: storage + 검색 + 노이즈 + 쿼리 그리드
+./build/test_storage
+
+# Phase 2: 핵심 엔진 (down/conv/attn/cross/residual/skip/up)
+./build/test_engine
+
+# Phase 3: denoise loop + image/text decode + loss
+./build/test_denoise
+
+# Phase 4: sampler/memo/hint/inpaint/upscale/audio
+./build/test_extend
+
+# 통합: prompt -> image / text 전체 파이프라인
+./build/test_gen
+```
+
+---
+
+## 파일 구조
+
+```
+ce_core/
+├── ce_core.{h,c}     기본 64바이트 셀 + 핵심 6개 API
+├── ce_storage.{h,c}  keyframe + delta 저장소 (auto-grow)
+├── ce_search.{h,c}   결정론적 노이즈 / 쿼리 그리드 / top-k 검색
+├── ce_engine.{h,c}   UNet 등가 연산 (down/conv/attn/cross/residual/skip/up)
+├── ce_denoise.{h,c}  denoise 반복 + loss + sampler 모드
+├── ce_decode.{h,c}   바이리니어 256x256 이미지 / ASCII 텍스트 출력
+├── ce_extend.{h,c}   sampler / memo / hint / inpaint / upscale / audio
+├── ce_gen.{h,c}      최상위 API (generate_image / text / inpaint / upscale)
+├── Makefile
+└── tests/            6개 테스트 바이너리
+```
+
+---
+
+## 최소 사용 예제
+
+### 1. 텍스트 코퍼스 학습 → 이미지 생성
+
+```c
+#include "ce_gen.h"
+
+CEStorage S;
+ce_storage_init(&S, 16);                          // capacity 힌트만; 자동 확장
+
+CEUnit prev; ce_init(&prev);                       // 첫 keyframe 직전 anchor
+
+// 1번 캔버스 / 0번 슬롯에 6개 블록 ingest
+const char *blocks[] = {
+    "the orange cat eats fish",
+    "the gray cat plays with yarn",
+    "rain falls on the city street",
+    "snow covers the mountain top",
+    "the moon rises over the sea",
+    "the sun sets behind the trees"
+};
+for (int i = 0; i < 6; ++i) {
+    ce_storage_ingest(&S, /*canvas*/1, /*slot*/0, /*block*/i,
+                      (i == 0) ? NULL : &prev,
+                      (const uint8_t *)blocks[i],
+                      (uint32_t)strlen(blocks[i]));
+    prev = S.entries[S.count - 1].keyframe;        // 다음 anchor 로 전달
+}
+
+CEGenConfig cfg = ce_gen_config_default();         // total_steps=8, cfg=1.0 등
+cfg.total_steps = 50;                               // 50 step (실측 0.49s)
+
+CEImage img;
+ce_generate_image(&img, &S,
+                  "orange cat eating fish",         // prompt
+                  /*seed=*/0xC0FFEE,
+                  &cfg,
+                  /*memo=*/NULL,
+                  /*hint=*/NULL,
+                  /*audio=*/NULL);
+
+// img.pixels 는 RGBA 256x256 — PPM 으로 덤프하거나 즉시 화면 표시
+ce_storage_free(&S);
+```
+
+### 2. 결정론 vs 다양성 확인
+
+```c
+CEImage a, b, c;
+
+// 같은 (prompt, seed) → 바이트 단위까지 동일
+ce_generate_image(&a, &S, "cat", 42, &cfg, NULL, NULL, NULL);
+ce_generate_image(&b, &S, "cat", 42, &cfg, NULL, NULL, NULL);
+assert(memcmp(&a, &b, sizeof(CEImage)) == 0);
+
+// seed 만 바꿔도 25% 이상의 픽셀이 달라진다 (다양성)
+ce_generate_image(&c, &S, "cat", 99, &cfg, NULL, NULL, NULL);
+// memcmp(&a, &c, ...) != 0
+```
+
+### 3. Inpaint (anchor 보존 부분 재생성)
+
+```c
+CEInpaintMask mask;
+for (int i = 0; i < CE_GRID_N; ++i) {
+    mask.mask[i] = (i < 256) ? 1 : 0;              // 앞 256셀만 재생성
+}
+
+CEImage out;
+ce_generate_inpaint(&out, /*original=*/&a, &mask, &S,
+                    "snow on mountain", /*seed=*/42, &cfg);
+// mask=0 셀의 8x8 픽셀 블록은 원본 그대로 유지
+```
+
+### 4. Upscale (32x32 latent → 128x128)
+
+```c
+CELatentGrid lo;                                   // 32x32 = 1024 셀
+// ... lo 채우기 (예: ce_latent_init / ce_denoise_loop)
+
+CEHiresGrid hi;                                    // 128x128 = 16384 셀
+ce_generate_upscale(&hi, &lo, &S, &cfg);
+```
+
+### 5. 메모 레이어 (LoRA 등가) 적용
+
+```c
+CEUnit adjustments[2];
+ce_init(&adjustments[0]); ce_feed(&adjustments[0], (const uint8_t*)"수묵화", 9);
+ce_init(&adjustments[1]); ce_feed(&adjustments[1], (const uint8_t*)"먹빛",   6);
+
+CEMemoLayer memo = { .name = "ink_painting",
+                     .adjustments = adjustments,
+                     .count = 2 };
+
+ce_generate_image(&img, &S, "cat", 42, &cfg,
+                  &memo,                            // 스타일 적용
+                  NULL, NULL);
+```
+
+### 6. 힌트 레이어 (ControlNet 등가) 적용
+
+```c
+CEHintLayer hint;
+hint.type = CE_HINT_EDGE;
+hint.strength = 0.7f;
+for (int i = 0; i < CE_GRID_N; ++i) {
+    ce_init(&hint.cells[i]);
+    // 외곽선 / 깊이 / 포즈 / 컬러 가이드 셀 채우기
+}
+
+ce_generate_image(&img, &S, "cat", 42, &cfg,
+                  NULL,
+                  &hint,                            // 가이드 적용
+                  NULL);
+```
+
+### 7. 오디오 싱크 (시간축 강도 조절)
+
+```c
+uint8_t audio_bytes[44100 * 5];                    // 5초 오디오 raw
+// ... audio_bytes 채우기
+
+CEAudioTrack track;
+ce_audio_load(&track, audio_bytes, sizeof(audio_bytes), /*seg/step=*/4);
+
+ce_generate_image(&img, &S, "wave", 42, &cfg,
+                  NULL, NULL,
+                  &track);                          // 매 step 갱신 강도 조절
+
+ce_audio_free(&track);
+```
+
+---
+
+## Diffusion ↔ CE 1:1 대응표
+
+| 단계 | Diffusion       | CE                            |
+|------|-----------------|-------------------------------|
+| 0    | 사전 학습       | `ce_storage_ingest`           |
+| 1    | x_T 노이즈      | `ce_noise_init(seed)`         |
+| 2    | 노이즈 latent   | `CEQueryGrid`                 |
+| 3    | retrieval       | `ce_search_topk` (max-heap)   |
+| 4    | feature map     | `ce_extract_context`          |
+| 5    | anchor + var.   | `ce_select_kd_pair`           |
+| 6    | latent init     | `ce_latent_init` (5-source)   |
+| 7    | UNet encoder    | `ce_down`                     |
+| 8    | conv block      | `ce_conv`                     |
+| 9    | self-attn       | `ce_self_attention`           |
+| 10   | cross-attn      | `ce_cross_attention` (cfg)    |
+| 11   | residual        | `ce_residual`                 |
+| 12   | skip            | `ce_skip_connect`             |
+| 13   | UNet decoder    | `ce_up`                       |
+| 14   | denoise steps   | `ce_denoise_loop`             |
+| 15   | VAE decoder     | `ce_decode_image` / `_text`   |
+| ext  | LoRA            | `CEMemoLayer`                 |
+| ext  | ControlNet      | `CEHintLayer`                 |
+| ext  | inpaint         | `ce_inpaint`                  |
+| ext  | upscaler        | `ce_upscale`                  |
+| ext  | (캔버스 고유)   | `CEAudioTrack`                |
+
+---
+
+## 핵심 6개 API (`ce_core.h`)
+
+```c
+void     ce_init(CEUnit *u);                                      // 셀 초기화
+void     ce_feed(CEUnit *u, const uint8_t *data, uint32_t len);   // 바이트 → 신호
+uint32_t ce_distance(const CEUnit *a, const CEUnit *b);           // 64B SAD
+void     ce_delta(CEUnit *out, const CEUnit *anchor,              // 차이
+                  const CEUnit *current);
+void     ce_apply(CEUnit *out, const CEUnit *anchor,              // 복원
+                  const CEUnit *delta);
+int64_t  ce_read(const CEUnit *u, int channel);                   // R/G/B/A 읽기
+```
+
+가역성:
+
+```
+ce_apply(anchor, ce_delta(anchor, x)) == x   (byte-exact, mod 256)
+```
+
+모든 상위 연산은 위 6개의 가중 합산. 평균/뭉개기 없음.
+
+---
+
+## 성능 (현 CPU 실측)
+
+```
+  256x256 이미지 (4 step) :  0.04 s
+  256x256 이미지 (50 step):  0.49 s   (목표 2-3 s)
+  ce_distance 처리량      :  225 M cmp/s
+  런타임 메모리           :  ~1 MB
+  storage 엔트리당        :  132 B (canvas/slot/block + keyframe + delta)
+```
+
+---
+
+## 제약 조건 (지킨 것)
+
+- `rand()` 금지 → SplitMix64 기반 결정론적 난수만 사용.
+- 평균(mean / average) 금지 → 가중 `ce_apply` 체인 + `ce_delta_scale` 만 사용.
+- 외부 라이브러리 금지 → `<stdlib.h>`, `<string.h>`, `<stdio.h>`, `<math.h>` 만 사용.
+- GPU 불필요 → 50 step 256x256 생성도 0.49 s.
+- 각 단계마다 `tests/test_*.c` 가 PASS / FAIL 을 출력.
+
+---
+
+## 자주 쓰는 명령 모음
+
+```bash
+# 깨끗한 상태에서 전체 테스트
+cd ce_core && make clean && make test
+
+# 빌드만
+cd ce_core && make all
+
+# 통합 테스트만 (가장 흥미로운 출력)
+cd ce_core && make build/test_gen && ./build/test_gen
+
+# 빠른 sanity check (가장 짧음)
+cd ce_core && make build/test_core && ./build/test_core
+```
