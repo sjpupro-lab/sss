@@ -76,6 +76,41 @@ void ce_decode_image(CEImage *out, const CELatentGrid *z) {
     }
 }
 
+/* Per-block maximum for the inc.plus carry chain when fed by an 8x8
+ * RGBA block: 64 pixels * 255 = 16320. Used to rescale carry totals
+ * into [0, 255] for direct RGBA output. */
+#define CE_BLOCK_MAX_TOTAL 16320u
+
+static uint8_t decode_channel_plus(const CETier *tier) {
+    uint32_t total = (uint32_t)tier->plus[0]
+                   | ((uint32_t)tier->plus[1] << 8)
+                   | ((uint32_t)tier->plus[2] << 16)
+                   | ((uint32_t)tier->plus[3] << 24);
+    /* Image-specific normalize: rescale carry total into [0, 255].
+     * Totals above CE_BLOCK_MAX_TOTAL (e.g. accumulated by repeated
+     * carry-alignment passes) saturate at 255 rather than wrapping. */
+    if (total >= CE_BLOCK_MAX_TOTAL) return 255;
+    uint32_t normalized = (total * 255u) / CE_BLOCK_MAX_TOTAL;
+    if (normalized > 255u) normalized = 255u;
+    return (uint8_t)normalized;
+}
+
+void ce_decode_image_block(uint8_t *out_rgba_8x8, const CEUnit *u) {
+    uint8_t r = decode_channel_plus(&u->inc.R);
+    uint8_t g = decode_channel_plus(&u->inc.G);
+    uint8_t b = decode_channel_plus(&u->inc.B);
+    uint8_t a = decode_channel_plus(&u->inc.A);
+    if (a == 0) a = 255; /* avoid fully-transparent default */
+
+    for (int i = 0; i < 64; ++i) {
+        uint8_t *p = out_rgba_8x8 + (i * 4);
+        p[0] = r;
+        p[1] = g;
+        p[2] = b;
+        p[3] = a;
+    }
+}
+
 void ce_decode_text(uint8_t *out, uint32_t *out_len,
                     const CELatentGrid *z) {
     /* Map each cell to one printable ASCII char (32..126). */
