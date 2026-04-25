@@ -55,6 +55,12 @@ void ce_query_from_noise(CEQueryGrid *grid, uint64_t seed);
 int ce_search_topk(const CEStorage *storage, const CEUnit *query,
                    int k, CESearchResult *results);
 
+/* Step 3 (typed variant): top-k keyframe search filtered to entries with
+ * the given modality. Same return convention as ce_search_topk. Useful
+ * for image generation, which must not retrieve text keyframes. */
+int ce_search_by_type(const CEStorage *storage, const CEUnit *query,
+                      CEType type, int k, CESearchResult *results);
+
 /* Step 4: extract a cell + its <=8 spatial neighbours from the storage.
  * Neighbours share canvas_id and slot, with block_idx = center +/- {1, W, W+/-1}.
  * Falls back to the center cell when neighbours are missing. */

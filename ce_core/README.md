@@ -1,20 +1,30 @@
 # ce_core — CE Cell 결정론적 생성 엔진
 
-64바이트 신호 셀(`CEUnit`) 위에 Diffusion 파이프라인을 1:1 대응시킨 CPU-only 생성 엔진.
-같은 (prompt, seed) → 같은 출력. 입력이 바뀌면 출력이 완전히 달라진다. 평균/뭉개기 없음.
+64바이트 신호 셀(`CEUnit`) 기반 CPU-only 생성 엔진. 학습된 keyframe 풀에서
+modality 일치 항목을 retrieval 한 뒤, **CE Whole-Block Carry Alignment** (전체
+grid 동시 carry-tick 정렬)로 seed를 target에 점진적으로 끌어당기면서도 seed
+고유 패턴을 보존한다. 같은 (prompt, seed) → 같은 출력. 입력이 바뀌면 출력이
+완전히 달라진다. 평균/뭉개기 없음, diffusion 아님.
 
 ```
-  바이트 스트림                 32x32 latent grid              256x256 이미지
+  modality-tagged
+  CE Storage                    32x32 latent grid              256x256 이미지
   ─────────────                ─────────────────              ──────────────
-  "orange cat"  ──┐                ┌───────────┐                 ┌──────────┐
-                  │  ce_feed       │ . . . . . │  ce_decode      │          │
-  noise(seed) ───►├──► CEUnit ────►│ . . z . . │ ──────────────► │  RGBA    │
-                  │  64 bytes      │ . . . . . │  bilinear       │  256x256 │
-  keyframe ───────┘                └───────────┘                 └──────────┘
+  TEXT  keyframes  ─┐            ┌───────────┐                 ┌──────────┐
+                    │ retrieval  │ . . . . . │  ce_decode_     │          │
+  IMAGE keyframes ──┼──► CEUnit ►│ . . z . . │  image_block    │  RGBA    │
+                    │ (by type)  │ . . . . . │ ──────────────► │  256x256 │
+  AUDIO keyframes ──┘            └───────────┘  per-block       └──────────┘
                                      ↑↑↑
-                                 down/conv/attn/cross/residual/skip/up
-                                 (반복 = denoise loop)
+                                 carry-align (target ↔ seed)
+                                  + 주변 cell 반영 + cross-attn
+                                  + residual/skip
+                                  → 반복 (whole-block carry alignment)
 ```
+
+이미지 인코딩(`ce_feed_image`)은 RGBA 채널을 분리하여 inc.plus 캐리 체인에
+누적하고, 4사분면 평균 차이로 4방향(LR/UD/D1/D2) gradient·edge를
+dec.{plus,minus} 에 별도로 저장한다. 텍스트 인코딩(`ce_feed`)은 그대로 유지.
 
 ---
 
@@ -40,10 +50,10 @@ make test
 # Phase 1: storage + 검색 + 노이즈 + 쿼리 그리드
 ./build/test_storage
 
-# Phase 2: 핵심 엔진 (down/conv/attn/cross/residual/skip/up)
+# Phase 2: 핵심 엔진 (down/conv/attn/cross/residual/skip/up — carry-align 등가)
 ./build/test_engine
 
-# Phase 3: denoise loop + image/text decode + loss
+# Phase 3: carry-align loop + image/text decode + loss
 ./build/test_denoise
 
 # Phase 4: sampler/memo/hint/inpaint/upscale/audio
@@ -51,6 +61,12 @@ make test
 
 # 통합: prompt -> image / text 전체 파이프라인
 ./build/test_gen
+
+# 이미지 modality 인코딩 + 4방향 gradient + type-filtered 검색
+./build/test_feed_image
+
+# 단일 CEUnit -> 8x8 RGBA 블록 디코딩
+./build/test_decode_image_block
 ```
 
 ---
@@ -60,21 +76,23 @@ make test
 ```
 ce_core/
 ├── ce_core.{h,c}        기본 64바이트 셀 + 핵심 6개 API
-├── ce_storage.{h,c}     keyframe + delta 저장소 (auto-grow)
-├── ce_storage_io.{h,c}  바이너리 저장/로드 (.ces 포맷)
-├── ce_search.{h,c}      결정론적 노이즈 / 쿼리 그리드 / top-k 검색
-├── ce_engine.{h,c}      UNet 등가 연산 (down/conv/attn/cross/residual/skip/up)
-├── ce_denoise.{h,c}     denoise 반복 + loss + sampler 모드
-├── ce_decode.{h,c}      바이리니어 256x256 이미지 / ASCII 텍스트 출력
+├── ce_type.h            CEType enum (TEXT/IMAGE/AUDIO modality 태그)
+├── ce_feed_image.{h,c}  이미지 전용 인코딩 (RGBA carry tick + 4방향 gradient)
+├── ce_storage.{h,c}     type-tagged keyframe + delta 저장소 (auto-grow)
+├── ce_storage_io.{h,c}  바이너리 저장/로드 (.ces v2, v1 호환)
+├── ce_search.{h,c}      결정론적 노이즈 / 쿼리 그리드 / top-k + by-type 검색
+├── ce_engine.{h,c}      carry-align 단계별 연산 (down/conv/attn/cross/residual/skip/up)
+├── ce_denoise.{h,c}     whole-block carry alignment 반복 + loss + sampler 모드
+├── ce_decode.{h,c}      256x256 이미지 / ASCII 텍스트 출력 + per-block decode
 ├── ce_extend.{h,c}      sampler / memo / hint / inpaint / upscale / audio
-├── ce_ingest.{h,c}      디렉터리 -> CEStorage (PNG/JPG/BMP/TGA/PSD/GIF/PNM)
+├── ce_ingest.{h,c}      디렉터리 -> CEStorage (PNG/JPG/BMP/TGA/PSD/GIF/PNM, type=IMAGE)
 ├── ce_gen.{h,c}         최상위 API (generate_image / text / inpaint / upscale)
 ├── third_party/
 │   └── stb_image.h      vendored, public domain (PNG/JPG 디코더)
 ├── tools/
 │   └── ce_ingest.c      CLI: 폴더 -> .ces 변환기
 ├── Makefile
-└── tests/               7개 테스트 바이너리
+└── tests/               9개 테스트 바이너리
 ```
 
 ---
@@ -214,31 +232,43 @@ ce_audio_free(&track);
 
 ---
 
-## Diffusion ↔ CE 1:1 대응표
+## CE Whole-Block Carry Alignment 단계 매핑
 
-| 단계 | Diffusion       | CE                            |
-|------|-----------------|-------------------------------|
-| 0    | 사전 학습       | `ce_storage_ingest`           |
-| 1    | x_T 노이즈      | `ce_noise_init(seed)`         |
-| 2    | 노이즈 latent   | `CEQueryGrid`                 |
-| 3    | retrieval       | `ce_search_topk` (max-heap)   |
-| 4    | feature map     | `ce_extract_context`          |
-| 5    | anchor + var.   | `ce_select_kd_pair`           |
-| 6    | latent init     | `ce_latent_init` (5-source)   |
-| 7    | UNet encoder    | `ce_down`                     |
-| 8    | conv block      | `ce_conv`                     |
-| 9    | self-attn       | `ce_self_attention`           |
-| 10   | cross-attn      | `ce_cross_attention` (cfg)    |
-| 11   | residual        | `ce_residual`                 |
-| 12   | skip            | `ce_skip_connect`             |
-| 13   | UNet decoder    | `ce_up`                       |
-| 14   | denoise steps   | `ce_denoise_loop`             |
-| 15   | VAE decoder     | `ce_decode_image` / `_text`   |
-| ext  | LoRA            | `CEMemoLayer`                 |
-| ext  | ControlNet      | `CEHintLayer`                 |
-| ext  | inpaint         | `ce_inpaint`                  |
-| ext  | upscaler        | `ce_upscale`                  |
-| ext  | (캔버스 고유)   | `CEAudioTrack`                |
+이 엔진은 diffusion이 아니다. 단계 이름은 호환성 때문에 유지하지만 의미는
+"전체 grid를 동시에 target 방향으로 carry-tick 정렬한다"이며, 매 step 마다
+seed 고유 패턴을 일정 비율 보존한다(완전 수렴 금지).
+
+| 단계 | 외부 등가 표현    | CE 함수                        | carry-align 의미              |
+|------|-------------------|--------------------------------|-------------------------------|
+| 0    | 사전 학습         | `ce_storage_ingest` /          | type-tagged keyframe 적재    |
+|      |                   | `ce_ingest_*` (IMAGE)          |                              |
+| 1    | x_T 노이즈        | `ce_noise_init(seed)`          | seed 고유 시작 상태          |
+| 2    | 노이즈 latent     | `CEQueryGrid`                  | 32x32 동시 정렬 대상         |
+| 3    | retrieval         | `ce_search_topk` /             | type-filtered top-k          |
+|      |                   | `ce_search_by_type`            | (modality 누수 차단)          |
+| 4    | feature map       | `ce_extract_context`           | 주변 cell 카탈로그           |
+| 5    | anchor + var.     | `ce_select_kd_pair`            | keyframe + delta 후보        |
+| 6    | latent init       | `ce_latent_init` (5-source)    | seed_origin 보존 시작         |
+| 7    | UNet encoder      | `ce_down`                      | 의미 압축 방향 carry-tick    |
+| 8    | conv block        | `ce_conv`                      | 주변 cell 반영               |
+| 9    | self-attn         | `ce_self_attention`            | grid 내 edge continuity      |
+| 10   | cross-attn        | `ce_cross_attention` (cfg)     | 프롬프트 조건 alignment      |
+| 11   | residual          | `ce_residual`                  | 직전 step 신호 보존          |
+| 12   | skip              | `ce_skip_connect`              | down 단계 정보 → up 단계      |
+| 13   | UNet decoder      | `ce_up`                        | 디테일 복원 방향 carry-tick   |
+| 14   | (반복 step)       | `ce_denoise_loop`              | whole-block carry alignment  |
+|      |                   |                                | 반복 (target ↔ seed 균형)    |
+| 15   | VAE decoder       | `ce_decode_image` /            | latent → 256x256 RGBA /      |
+|      |                   | `ce_decode_image_block` /      | 단일 cell → 8x8 block /      |
+|      |                   | `ce_decode_text`               | latent → ASCII text          |
+| ext  | LoRA              | `CEMemoLayer`                  | 스타일 delta 추가            |
+| ext  | ControlNet        | `CEHintLayer`                  | 가이드 cell 강제             |
+| ext  | inpaint           | `ce_inpaint`                   | mask 외 anchor 보존           |
+| ext  | upscaler          | `ce_upscale`                   | sub-cell 분기                |
+| ext  | (캔버스 고유)     | `CEAudioTrack`                 | 시간축 강도 변조             |
+
+`ce_denoise_loop` 라는 이름은 호환성 위해 유지(파일명·심볼명 변경 없음). 실제
+동작은 noise 제거가 아니라 carry-align step 반복이다.
 
 ---
 
@@ -272,7 +302,7 @@ ce_apply(anchor, ce_delta(anchor, x)) == x   (byte-exact, mod 256)
   256x256 이미지 (50 step):  0.49 s   (목표 2-3 s)
   ce_distance 처리량      :  225 M cmp/s
   런타임 메모리           :  ~1 MB
-  storage 엔트리당        :  132 B (canvas/slot/block + keyframe + delta)
+  storage 엔트리당        :  140 B (canvas/slot/block/type + keyframe + delta)
 ```
 
 ---
@@ -361,31 +391,35 @@ slot      = 블록의 row 좌표 (block_y) // 8픽셀 단위
 block_idx = 블록의 col 좌표 (block_x) // 8픽셀 단위
 
 block 입력 = 8 × 8 × 4 = 256 bytes (RGBA)
-        ↓ ce_feed
-keyframe = CEUnit (64 bytes)
+        ↓ ce_feed_image  (채널 분리 + 4방향 gradient)
+keyframe = CEUnit (64 bytes, type=CE_TYPE_IMAGE)
 delta    = ce_delta(prev_block, keyframe)  // 이미지 내 체이닝
 ```
 
-가장자리는 0으로 패딩 (이미지 크기가 8의 배수가 아닐 때).
+가장자리는 0으로 패딩 (이미지 크기가 8의 배수가 아닐 때). 이미지 ingest 경로는
+text용 `ce_feed`를 호출하지 않으며, modality는 entry에 `CE_TYPE_IMAGE`로 태깅된다.
 
-### .ces 바이너리 포맷
+### .ces 바이너리 포맷 (v2, 현재)
 
 ```
 offset  size  field
-   0      4   magic    "CES1" (0x31534543)
-   4      4   version  uint32 = 1
+   0      4   magic    "CES1" (0x31534543, sanity check)
+   4      4   version  uint32 = 2
    8      4   count    uint32 (entry 개수)
   12      4   reserved 0
   16+         entry[count] :
               + uint32  canvas_id
               + uint16  slot
               + uint16  block_idx
+              + uint8   type           (CEType: TEXT=0, IMAGE=1, AUDIO=2)
+              + uint8   reserved[3]    (zero)
               + 64 byte keyframe
               + 64 byte delta
-              = 136 bytes / entry
+              = 140 bytes / entry
 ```
 
-리틀엔디언 고정. 파일 크기 ≈ 16 + 136 × count.
+리틀엔디언 고정. 파일 크기 ≈ 16 + 140 × count. v1 (type 없음, 136 B/entry)
+파일도 그대로 로드되며, 모든 entry는 `CE_TYPE_TEXT`로 태깅된다.
 
 ---
 

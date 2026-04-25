@@ -1,4 +1,6 @@
 #include "ce_ingest.h"
+#include "ce_feed_image.h"
+#include "ce_type.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -95,8 +97,12 @@ int ce_ingest_file(CEStorage *s, const char *path, CEIngestStats *stats) {
         for (int bx = 0; bx < blocks_x; ++bx) {
             copy_block(img, w, h, bx, by, block_buf);
 
-            CEUnit fresh; ce_init(&fresh);
-            ce_feed(&fresh, block_buf, CE_BLOCK_RGBA_BYTES);
+            CEUnit fresh;
+            /* Image-modality encoder: per-channel sums in inc.plus,
+             * 4-direction gradients in dec.{plus,minus}. Distinct
+             * from the text path's ce_feed (no channel mixing, no
+             * position-mixing salt). */
+            ce_feed_image(&fresh, block_buf);
 
             CEUnit delta;
             if (added == 0) {
@@ -107,10 +113,11 @@ int ce_ingest_file(CEStorage *s, const char *path, CEIngestStats *stats) {
                 ce_delta(&delta, &prev, &fresh);
             }
 
-            ce_storage_add(s, canvas_id,
-                           (uint16_t)(by & 0xFFFF),
-                           (uint16_t)(bx & 0xFFFF),
-                           &fresh, &delta);
+            ce_storage_add_typed(s, canvas_id,
+                                 (uint16_t)(by & 0xFFFF),
+                                 (uint16_t)(bx & 0xFFFF),
+                                 CE_TYPE_IMAGE,
+                                 &fresh, &delta);
             prev = fresh;
             ++added;
             if (stats) ++stats->blocks_added;

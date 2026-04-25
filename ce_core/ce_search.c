@@ -55,31 +55,47 @@ static int cmp_result(const void *a, const void *b) {
     return (ia < ib) ? -1 : (ia > ib);
 }
 
-int ce_search_topk(const CEStorage *storage, const CEUnit *query,
-                   int k, CESearchResult *results) {
+/* Common worker: top-k over storage with an optional modality filter.
+ * `match_type < 0` disables the filter (matches all entries). */
+static int search_topk_filtered(const CEStorage *storage, const CEUnit *query,
+                                int match_type, int k,
+                                CESearchResult *results) {
     if (k <= 0 || storage->count == 0) return 0;
     int n = (int)storage->count;
-    if (k > n) k = n;
 
-    /* Initial fill */
-    for (int i = 0; i < k; ++i) {
-        results[i].entry_idx = (uint32_t)i;
-        results[i].distance = ce_distance(query, &storage->entries[i].keyframe);
-    }
-    /* Build max-heap */
-    for (int i = k / 2 - 1; i >= 0; --i) heap_sift_down(results, k, i);
-
-    for (int i = k; i < n; ++i) {
+    /* Streaming heap fill: only keep at most k candidates that pass the
+     * filter. Without a filter, this is identical to the unfiltered path. */
+    int kept = 0;
+    for (int i = 0; i < n; ++i) {
+        if (match_type >= 0 && (int)storage->entries[i].type != match_type) continue;
         uint32_t d = ce_distance(query, &storage->entries[i].keyframe);
-        if (d < results[0].distance) {
-            results[0].distance = d;
+        if (kept < k) {
+            results[kept].entry_idx = (uint32_t)i;
+            results[kept].distance  = d;
+            ++kept;
+            if (kept == k) {
+                /* Build max-heap once we hit k entries. */
+                for (int j = k / 2 - 1; j >= 0; --j) heap_sift_down(results, k, j);
+            }
+        } else if (d < results[0].distance) {
+            results[0].distance  = d;
             results[0].entry_idx = (uint32_t)i;
             heap_sift_down(results, k, 0);
         }
     }
     /* Final sort ascending for caller convenience. */
-    qsort(results, k, sizeof(*results), cmp_result);
-    return k;
+    qsort(results, kept, sizeof(*results), cmp_result);
+    return kept;
+}
+
+int ce_search_topk(const CEStorage *storage, const CEUnit *query,
+                   int k, CESearchResult *results) {
+    return search_topk_filtered(storage, query, /*match_type=*/-1, k, results);
+}
+
+int ce_search_by_type(const CEStorage *storage, const CEUnit *query,
+                      CEType type, int k, CESearchResult *results) {
+    return search_topk_filtered(storage, query, (int)type, k, results);
 }
 
 void ce_extract_context(const CEStorage *storage, uint32_t canvas_id,
