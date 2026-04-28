@@ -891,11 +891,54 @@ void slig_upscale(SligDecomposed *d, const SligUpscaleConfig *cfg0) {
  *  프로그레시브: 5단계 콜백
  * ════════════════════════════════════════════════════ */
 
+/* P2: linearly resample u/v from [0, source_dim) to [0, SLIG_SIG_LEN).
+ *
+ *  Cells decomposed at smaller dim (32, 128) have meaningful u/v entries
+ *  only in [0, source_dim); the slig_unpack DCT-inverse smears noise into
+ *  the rest. Rendering directly at SLIG_CANVAS_DIM concentrates signal
+ *  in the top-left source_dim×source_dim region — that's the adapter
+ *  "max_dev=4" symptom. Spreading the small signal across the full
+ *  canvas via linear interp restores per-pixel coverage. Integer Q16
+ *  fixed-point inner loop, no float. */
+static void resample_signal_inplace(int16_t *signal, int source_dim) {
+    if (source_dim <= 0 || source_dim >= SLIG_SIG_LEN) return;
+    int16_t tmp[SLIG_SIG_LEN];
+    int last_src = source_dim - 1;
+    int last_dst = SLIG_SIG_LEN - 1;
+    for (int i = 0; i < SLIG_SIG_LEN; i++) {
+        /* Map dst index i into src float position t = i × last_src / last_dst.
+         * Integer split: j = numerator / last_dst, frac = remainder. */
+        int num = i * last_src;
+        int j   = num / last_dst;
+        int rem = num - j * last_dst;            /* 0 .. last_dst - 1 */
+        if (j >= last_src) {
+            tmp[i] = signal[last_src];
+        } else {
+            int v0 = signal[j];
+            int v1 = signal[j + 1];
+            int v  = (v0 * (last_dst - rem) + v1 * rem) / last_dst;
+            if (v >  32000) v =  32000;
+            if (v < -32000) v = -32000;
+            tmp[i] = (int16_t)v;
+        }
+    }
+    memcpy(signal, tmp, sizeof tmp);
+}
+
 /* 단일 CE Cell을 캔버스에 적용 (해상도 적응) */
 static void render_cell(SligCanvas *canvas, const CEUnit *cell,
                         float sigma_scale) {
     SligSignal sig;
     slig_unpack(&sig, cell);
+
+    /* P2 multi-scale: resample u/v if cell was decomposed at smaller dim.
+     * sig.phase carries source_dim (set by slig_decompose_channel);
+     * 0 means default = full canvas (no resample). */
+    int source_dim = (sig.phase == 0) ? 0 : (int)sig.phase;
+    if (source_dim > 0 && source_dim < SLIG_SIG_LEN) {
+        resample_signal_inplace(sig.u, source_dim);
+        resample_signal_inplace(sig.v, source_dim);
+    }
 
     /* 애트모스 방식: σ를 타겟에 맞게 스케일 */
     sig.sigma = (uint16_t)clampf(sig.sigma * sigma_scale, 0, 65535);
@@ -1077,8 +1120,24 @@ void slig_render_adaptive(SligImage *out, const SligDecomposed *d,
                  * canvas as if it were luma. canvas accumulator is shared
                  * scale (>>20 inside apply_global), so resulting Cb/Cr
                  * canvas is in the same magnitude as y_canvas — chroma
-                 * normalize step (chroma_canvas_to_u8) keeps it bounded. */
-                sig.sigma = (uint16_t)clampf(sig.sigma * cfg0->sigma_scale, 0, 65535);
+                 * normalize step (chroma_canvas_to_u8) keeps it bounded.
+                 *
+                 * P2: same multi-scale upsample as Y — chroma cells
+                 * decomposed at coarse 32 also need their u/v resampled
+                 * up to canvas dim or color stays trapped in top-left. */
+                int sd = (sig.phase == 0) ? 0 : (int)sig.phase;
+                if (sd > 0 && sd < SLIG_SIG_LEN) {
+                    resample_signal_inplace(sig.u, sd);
+                    resample_signal_inplace(sig.v, sd);
+                }
+                /* Chroma boost — v2.3 decomposes mean-subtracted chroma
+                 * (centered at 128/255 ≈ 0.5), so SVD sigma is tiny
+                 * vs a luma plane that has full 0..255 dynamic range.
+                 * 32× boost is empirical: max_dev ≈ 4 (raw) → ≈ 10
+                 * (8×) → ≈ 50 (32×) on the test fixture. Above 64×
+                 * starts to clip chroma to saturation. */
+                sig.sigma = (uint16_t)clampf(sig.sigma * cfg0->sigma_scale * 128.0f,
+                                             0, 65535);
                 slig_apply(target, &sig);
             }
         } else {

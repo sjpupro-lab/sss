@@ -270,6 +270,12 @@ void slig_decompose_channel(SligCellSet *out,
     int dim = (width < height) ? width : height;
     if (dim > SLIG_CANVAS_DIM) dim = SLIG_CANVAS_DIM;
 
+    /* P2: encode source_dim in sig.phase so slig_render_adaptive can
+     * upsample u/v back to canvas dim before rendering — fixes the
+     * "small-dim cell signal concentrates in top-left" problem.
+     * 0 = default canvas dim (no resample); else literal source_dim. */
+    uint8_t source_dim_tag = (uint8_t)((dim < SLIG_CANVAS_DIM) ? dim : 0);
+
     /* float 변환 + 중앙값 빼기 */
     float *mat = (float*)malloc(dim * dim * sizeof(float));
     float mean = 0;
@@ -303,6 +309,7 @@ void slig_decompose_channel(SligCellSet *out,
         /* SligSignal 구성 */
         SligSignal sig;
         memset(&sig, 0, sizeof(sig));
+        sig.phase = source_dim_tag;
         sig.dir = SLIG_DIR_HORIZONTAL;
         sig.scale = (k < 2) ? SLIG_SCALE_COARSE : (k < 5) ? SLIG_SCALE_MID : SLIG_SCALE_FINE;
         sig.sigma = clamp_i32((int32_t)(sigma * 100), 0, 65535);
@@ -340,6 +347,7 @@ void slig_decompose_channel(SligCellSet *out,
 
         SligSignal sig;
         memset(&sig, 0, sizeof(sig));
+        sig.phase = source_dim_tag;
         sig.dir = SLIG_DIR_DIAG_DOWN;
         sig.scale = (k < 1) ? SLIG_SCALE_COARSE : SLIG_SCALE_MID;
         sig.sigma = clamp_i32((int32_t)(sigma * 100), 0, 65535);
@@ -379,6 +387,7 @@ void slig_decompose_channel(SligCellSet *out,
 
         SligSignal sig;
         memset(&sig, 0, sizeof(sig));
+        sig.phase = source_dim_tag;
         sig.dir = SLIG_DIR_DIAG_UP;
         sig.scale = (k < 1) ? SLIG_SCALE_COARSE : SLIG_SCALE_MID;
         sig.sigma = clamp_i32((int32_t)(sigma * 100), 0, 65535);
@@ -421,6 +430,7 @@ void slig_decompose_channel(SligCellSet *out,
 
         SligSignal sig;
         memset(&sig, 0, sizeof(sig));
+        sig.phase = source_dim_tag;
         sig.dir = SLIG_DIR_ZIGZAG;
         sig.scale = (k < 1) ? SLIG_SCALE_COARSE : SLIG_SCALE_MID;
         sig.sigma = clamp_i32((int32_t)(sigma * 100), 0, 65535);
@@ -448,6 +458,7 @@ void slig_decompose_channel(SligCellSet *out,
 
         SligSignal sig;
         memset(&sig, 0, sizeof(sig));
+        sig.phase = source_dim_tag;
         sig.dir = SLIG_DIR_RIPPLE;
         sig.sigma = clamp_i32((int32_t)(mean * 30000), 0, 65535);
         sig.frequency = dim / 4;
