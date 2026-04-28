@@ -781,29 +781,39 @@ static void cell_set_coeffs(CEUnit *cell, const float coeffs[SLIG_DCT_COEFF]) {
     cell->dec.R.minus[3] = (uint8_t)clampf(coeffs[15] + 128, 0, 255);
 }
 
-/* Harmonic damping: how much of the predicted harmonic to mix into
- * existing coefficients. Keep low to add subtle texture without
- * smashing PSNR. Per measurement table:
+/* Harmonic damping default — used when the cell has no per-cell
+ * material descriptor. Per measurement:
  *   0.00 → ±0 dB     2785 depth   (baseline / no harmonic)
  *   0.02 → −0.94 dB  4001 depth   "subtle texture"      ← chosen
  *   0.03 → −1.88 dB  4498 depth   "texture applied"
- * Higher values trade fidelity for perceptual richness. */
-#define SLIG_HARMONIC_DAMPING 0.02f
+ * Cells WITH material override this with a per-cell value derived
+ * from sig.h_strength (Mat-S2): smooth surfaces get less harmonic
+ * (low h_strength → small damping), textured surfaces get more. */
+#define SLIG_HARMONIC_DAMPING_DEFAULT 0.02f
 
 void slig_upscale_harmonic(CEUnit *cell, int target_coeffs) {
     if (!cell) return;
     float coeffs[SLIG_DCT_COEFF];
     cell_get_coeffs(cell, coeffs);
-    /* Subtle harmonic blend: every coefficient k receives a tiny
-     * fraction (DAMPING) of base × 0.55^(k−h) where h = k/2. The
-     * earlier "replace if existing < 30% of predicted" is too
-     * aggressive — it spikes high-frequency noise the renderer
-     * shows as moiré. Now we add a small bias instead. */
+
+    /* Mat-S2: derive damping from per-cell h_strength when available.
+     * h_strength is a uint8 in [0, 255] — 0 means smooth (no harmonic
+     * texture), 255 means heavily textured (apply full damping band).
+     * Map linearly to [0, 0.04]: matches the user's table top-end
+     * without exceeding the −1.88 dB cliff at 0.03+.  Cells without
+     * material fall back to the constant default. */
+    float damping = SLIG_HARMONIC_DAMPING_DEFAULT;
+    /* sig.flags lives at cell->inc.R.minus[3]; HAS_MATERIAL = 0x08. */
+    if (cell->inc.R.minus[3] & 0x08u) {
+        uint8_t h_strength = cell->dec.A.plus[3];
+        damping = (float)h_strength * (0.04f / 255.0f);
+    }
+
     for (int k = 1; k < SLIG_DCT_COEFF; k++) {
         int harmonic = k / 2;
         float base = coeffs[harmonic];
         float predicted = base * powf(0.55f, (float)(k - harmonic));
-        coeffs[k] += predicted * SLIG_HARMONIC_DAMPING;
+        coeffs[k] += predicted * damping;
     }
     cell_set_coeffs(cell, coeffs);
     (void)target_coeffs;
