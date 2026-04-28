@@ -76,6 +76,60 @@ int32_t ce_storage_find(const CEStorage *s, uint32_t canvas_id,
     return -1;
 }
 
+uint32_t ce_storage_ingest_rgba_16(CEStorage *s,
+                                   uint32_t canvas_id,
+                                   const uint8_t *rgba, int width, int height) {
+    if (!s || !rgba || width <= 0 || height <= 0) return 0;
+
+    int blocks_x = (width  + CE_IMAGE_BLOCK16_PX - 1) / CE_IMAGE_BLOCK16_PX;
+    int blocks_y = (height + CE_IMAGE_BLOCK16_PX - 1) / CE_IMAGE_BLOCK16_PX;
+
+    uint8_t block16[CE_IMAGE_BLOCK16_BYTES];
+    CEUnit prev; ce_init(&prev);
+    int has_prev = 0;
+
+    uint32_t added = 0;
+    for (int by = 0; by < blocks_y; ++by) {
+        for (int bx = 0; bx < blocks_x; ++bx) {
+            memset(block16, 0, sizeof(block16));
+            int x0 = bx * CE_IMAGE_BLOCK16_PX;
+            int y0 = by * CE_IMAGE_BLOCK16_PX;
+            for (int dy = 0; dy < CE_IMAGE_BLOCK16_PX; ++dy) {
+                int y = y0 + dy;
+                if (y >= height) break;
+                for (int dx = 0; dx < CE_IMAGE_BLOCK16_PX; ++dx) {
+                    int x = x0 + dx;
+                    if (x >= width) break;
+                    const uint8_t *src = rgba + ((size_t)y * (size_t)width + (size_t)x) * 4u;
+                    uint8_t *dst = block16 + ((size_t)dy * CE_IMAGE_BLOCK16_PX + (size_t)dx) * 4u;
+                    dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3];
+                }
+            }
+
+            CEUnit q[4];
+            ce_feed_image_16(q, block16);
+
+            for (int qi = 0; qi < 4; ++qi) {
+                CEUnit delta;
+                if (!has_prev) {
+                    CEUnit zero; ce_init(&zero);
+                    ce_delta(&delta, &zero, &q[qi]);
+                } else {
+                    ce_delta(&delta, &prev, &q[qi]);
+                }
+                uint16_t slot = (uint16_t)(by & 0xFFFF);
+                uint16_t bidx = (uint16_t)(((bx & 0x3FFF) << 2) | (qi & 0x3));
+                ce_storage_add_typed(s, canvas_id, slot, bidx,
+                                     CE_TYPE_IMAGE, &q[qi], &delta);
+                prev = q[qi];
+                has_prev = 1;
+                ++added;
+            }
+        }
+    }
+    return added;
+}
+
 uint32_t ce_storage_ingest_rgba(CEStorage *s,
                                 uint32_t canvas_id,
                                 const uint8_t *rgba, int width, int height) {

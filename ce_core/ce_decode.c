@@ -111,6 +111,22 @@ void ce_decode_image_block(uint8_t *out_rgba_8x8, const CEUnit *u) {
     }
 }
 
+void ce_decode_image_block_16(uint8_t *out_rgba_16x16, const CEUnit q[4]) {
+    /* TL=0, TR=1, BL=2, BR=3 — same ordering as ce_feed_image_16. */
+    uint8_t tile[64 * 4];
+    for (int qi = 0; qi < 4; ++qi) {
+        ce_decode_image_block(tile, &q[qi]);
+        int qx = (qi & 1) * 8;
+        int qy = (qi >> 1) * 8;
+        for (int dy = 0; dy < 8; ++dy) {
+            const uint8_t *src_row = tile + (size_t)(dy * 8) * 4u;
+            uint8_t *dst_row = out_rgba_16x16
+                + (size_t)((qy + dy) * 16 + qx) * 4u;
+            for (int k = 0; k < 8 * 4; ++k) dst_row[k] = src_row[k];
+        }
+    }
+}
+
 void ce_decode_text(uint8_t *out, uint32_t *out_len,
                     const CELatentGrid *z) {
     /* Map each cell to one printable ASCII char (32..126). */

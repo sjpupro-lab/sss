@@ -41,19 +41,27 @@ void ce_generate_image_typed(
     const CEGenConfig *config,
     uint32_t wave_refine_iters);
 
-/* Label-routed image generation. WIP / superseded — uses byte-level
- * ce_feed for prompt encoding which puts text CEUnits in a different
- * cell space than image CEUnits, so the cross-modal alignment relies
- * on lucky byte overlap between prompt tokens and stored labels.
+/* Canvas-routed image generation. The caller has already picked the
+ * canvas_id whose IMAGE entries should drive retrieval (typically by
+ * tokenising the prompt with morpheme_tokenize_clause, voting across
+ * CE_TYPE_TEXT entries via ce_search_by_type, and taking the winner's
+ * canvas_id — see tools/gen_image_ce.c for the worked example).
  *
- * The architecturally correct path (per project owner's direction)
- * routes through SSS's layers_encode_clause (256x256 SpatialGrid) with
- * 16x16 ce_feed_image_16 blocks so text and image cells share the
- * same CE space. That refactor is the next iteration; this function
- * is kept here as a reference of the byte-level baseline. */
-void ce_generate_image_label_routed(
+ * This function:
+ *   1. Seeds the initial latent from the first CE_TYPE_IMAGE entry whose
+ *      canvas_id matches `routed_canvas`. If none exists, falls back to
+ *      ce_generate_image_typed(CE_TYPE_IMAGE, ...).
+ *   2. Runs ce_denoise_loop + ce_decode_image to produce a 256x256 RGBA
+ *      starting canvas.
+ *   3. (When wave_refine_iters > 0) walks `storage` and groups every 4
+ *      CE_TYPE_IMAGE entries that share canvas_id/slot/(block_idx>>2)
+ *      into a 16x16 atomic patch via ce_decode_image_block_16, ranks
+ *      groups by ce_distance against the centre latent cell, and uses
+ *      the top-CE_WAVE_TOPK as wave-refine targets. */
+void ce_generate_image_canvas_routed(
     CEImage *output,
     const CEStorage *storage,
+    uint32_t routed_canvas,
     const char *prompt,
     uint64_t seed,
     const CEGenConfig *config,

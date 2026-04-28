@@ -1,4 +1,5 @@
 #include "ce_gen.h"
+#include "ce_feed_image.h"
 #include "ce_image_wave_refine.h"
 #include <string.h>
 #include <stdlib.h>
@@ -231,42 +232,81 @@ void ce_generate_image_typed(
     free(prompt_cells);
 }
 
-void ce_generate_image_label_routed(
+/* Build a CEImageLink64 whose 256x256 target is the 16x16-tiled decode
+ * of the 4 quadrant CEUnits supplied. Tiles the 16x16 reconstruction
+ * across the canvas (256/16 = 16 repeats per axis), giving wave-refine
+ * a uniformly-coloured 16x16 patch contribution per group. */
+static void link_from_quadrants_16(CEImageLink64 *link,
+                                   const CEUnit q[4],
+                                   float score) {
+    if (!link) return;
+    link->score = score;
+    memset(link->semantic, 0, sizeof(link->semantic));
+
+    uint8_t patch[CE_IMAGE_BLOCK16_BYTES];
+    ce_decode_image_block_16(patch, q);
+
+    for (int y = 0; y < CE_WAVE_IMG_H; ++y) {
+        for (int x = 0; x < CE_WAVE_IMG_W; ++x) {
+            int px = x % CE_IMAGE_BLOCK16_PX;
+            int py = y % CE_IMAGE_BLOCK16_PX;
+            const uint8_t *p = patch
+                + (size_t)(py * CE_IMAGE_BLOCK16_PX + px) * 4u;
+            CEPixelF *d = &link->target[(size_t)y * CE_WAVE_IMG_W + (size_t)x];
+            d->r = (float)p[0];
+            d->g = (float)p[1];
+            d->b = (float)p[2];
+            d->a = (float)p[3];
+        }
+    }
+}
+
+/* Group helper: given the 4 quadrant entries that share (canvas_id, slot,
+ * block_idx>>2) reassemble q[0..3] in TL/TR/BL/BR order. Returns 1 if
+ * all four quadrants were found. */
+static int collect_quadrants(const CEStorage *storage,
+                             uint32_t canvas_id, uint16_t slot, uint16_t bcol,
+                             CEUnit q[4]) {
+    int seen[4] = {0, 0, 0, 0};
+    for (uint32_t i = 0; i < storage->count; ++i) {
+        const CEStorageEntry *e = &storage->entries[i];
+        if (e->type != CE_TYPE_IMAGE)        continue;
+        if (e->canvas_id != canvas_id)       continue;
+        if (e->slot != slot)                 continue;
+        if ((uint16_t)(e->block_idx >> 2) != bcol) continue;
+        int qi = e->block_idx & 0x3;
+        q[qi] = e->keyframe;
+        seen[qi] = 1;
+    }
+    return seen[0] && seen[1] && seen[2] && seen[3];
+}
+
+void ce_generate_image_canvas_routed(
     CEImage *output,
     const CEStorage *storage,
+    uint32_t routed_canvas,
     const char *prompt,
     uint64_t seed,
     const CEGenConfig *config,
     uint32_t wave_refine_iters) {
 
-    /* Stage 1: token-wise TEXT search.  ce_feed mixes channels with a
-     * position-mixing salt, so a single CEUnit fed from "red apple"
-     * sits far from one fed from "apple" alone — the byte-level
-     * encoding is not commutative across token concatenation.  To make
-     * routing robust, encode each whitespace-delimited token as its
-     * own CEUnit and pick the closest TEXT entry across all tokens. */
-    int route_token_count = 0;
-    CEUnit *route_tokens = prompt_to_cells(prompt, &route_token_count);
-
-    uint32_t target_canvas = 0;
-    uint32_t best_dist = (uint32_t)-1;
-    int found_text = 0;
-    if (storage && storage->count > 0) {
-        for (int t = 0; t < route_token_count; ++t) {
-            CESearchResult tres;
-            int n = ce_search_by_type(storage, &route_tokens[t],
-                                      CE_TYPE_TEXT, 1, &tres);
-            if (n > 0 && tres.distance < best_dist) {
-                best_dist = tres.distance;
-                target_canvas = storage->entries[tres.entry_idx].canvas_id;
-                found_text = 1;
+    /* Locate any IMAGE entry under routed_canvas to seed the latent.
+     * If none is found the caller's routing is stale -> typed fallback. */
+    CEUnit kf, dl;
+    ce_init(&kf); ce_init(&dl);
+    int found_image = 0;
+    if (storage) {
+        for (uint32_t i = 0; i < storage->count; ++i) {
+            const CEStorageEntry *e = &storage->entries[i];
+            if (e->type == CE_TYPE_IMAGE && e->canvas_id == routed_canvas) {
+                kf = e->keyframe;
+                dl = e->delta;
+                found_image = 1;
+                break;
             }
         }
     }
-    free(route_tokens);
-
-    /* Fallback: no TEXT bridge in storage -> use the typed image path. */
-    if (!found_text) {
+    if (!found_image) {
         ce_generate_image_typed(output, storage, CE_TYPE_IMAGE,
                                 prompt, seed, config, wave_refine_iters);
         return;
@@ -274,28 +314,14 @@ void ce_generate_image_label_routed(
 
     CEGenConfig cfg = config ? *config : ce_gen_config_hq();
 
-    /* Build the initial latent the same way ce_generate_image_typed does,
-     * but seed it from one of the routed canvas_id IMAGE entries so the
-     * denoise loop's residual stays in-domain. */
-    CEUnit noise; ce_noise_init(&noise, seed);
-    CEUnit kf, dl;
-    ce_init(&kf);
-    ce_init(&dl);
-    for (uint32_t i = 0; i < storage->count; ++i) {
-        const CEStorageEntry *e = &storage->entries[i];
-        if (e->type == CE_TYPE_IMAGE && e->canvas_id == target_canvas) {
-            kf = e->keyframe;
-            dl = e->delta;
-            break;
-        }
-    }
-
     int prompt_count = 0;
     CEUnit *prompt_cells = prompt_to_cells(prompt, &prompt_count);
     CEUnit prompt_avg; ce_init(&prompt_avg);
     if (prompt_count > 0 && prompt_cells) {
         prompt_avg = prompt_cells[prompt_count - 1];
     }
+
+    CEUnit noise; ce_noise_init(&noise, seed);
     float w[5] = { 0.30f, 0.25f, 0.20f, 0.25f, 0.0f };
     CELatentGrid z;
     ce_latent_init(&z, &noise, &kf, &dl,
@@ -305,55 +331,63 @@ void ce_generate_image_label_routed(
     ce_denoise_loop(&z, storage, prompt_cells, prompt_count, NULL, &cfg);
     ce_decode_image(output, &z);
 
-    /* Wave-refine: pull up to CE_WAVE_TOPK image entries from the
-     * routed canvas_id and use them as targets. We pick by ce_distance
-     * to the prompt-mixed latent center cell so the targets that
-     * survive are the ones the denoised canvas already wants. */
+    /* Wave-refine: collect 16x16 atomic groups (4 contiguous quadrants
+     * sharing canvas_id/slot/(block_idx>>2)) under routed_canvas. Score
+     * by ce_distance of the rank-0 quadrant against the centre latent
+     * cell, keep the top-CE_WAVE_TOPK groups, and tile each as a wave
+     * target. */
     if (wave_refine_iters > 0) {
-        CEStorageEntry routed[CE_WAVE_TOPK];
-        int routed_count = 0;
+        const CEUnit *centre = &z.cells[CE_GRID_N / 2];
 
-        /* Collect candidates with the routed canvas_id, ranked by
-         * distance to the (single) center latent cell. Tiny K and
-         * small storage make a linear scan with insertion sort fine. */
-        const CEUnit *q = &z.cells[CE_GRID_N / 2];
-        uint32_t best_dist[CE_WAVE_TOPK];
-        for (int i = 0; i < CE_WAVE_TOPK; ++i) best_dist[i] = (uint32_t)-1;
+        /* Enumerate distinct (slot, block_idx>>2) groups via TL quadrants
+         * (block_idx & 3) == 0 entries. */
+        typedef struct { uint32_t dist; uint16_t slot; uint16_t bcol; } G;
+        G top[CE_WAVE_TOPK];
+        for (int i = 0; i < CE_WAVE_TOPK; ++i) {
+            top[i].dist = (uint32_t)-1; top[i].slot = 0; top[i].bcol = 0;
+        }
+        int top_count = 0;
 
         for (uint32_t i = 0; i < storage->count; ++i) {
             const CEStorageEntry *e = &storage->entries[i];
-            if (e->type != CE_TYPE_IMAGE) continue;
-            if (e->canvas_id != target_canvas) continue;
+            if (e->type != CE_TYPE_IMAGE)         continue;
+            if (e->canvas_id != routed_canvas)    continue;
+            if ((e->block_idx & 0x3) != 0)        continue; /* TL only */
 
-            uint32_t d = ce_distance(q, &e->keyframe);
-            /* Insert into the sorted top-K (ascending). */
+            uint32_t d = ce_distance(centre, &e->keyframe);
+            uint16_t slot = e->slot;
+            uint16_t bcol = (uint16_t)(e->block_idx >> 2);
             for (int k = 0; k < CE_WAVE_TOPK; ++k) {
-                if (d < best_dist[k]) {
-                    /* shift down */
-                    for (int s = CE_WAVE_TOPK - 1; s > k; --s) {
-                        best_dist[s] = best_dist[s - 1];
-                        routed[s]    = routed[s - 1];
-                    }
-                    best_dist[k] = d;
-                    routed[k]    = *e;
-                    if (routed_count < CE_WAVE_TOPK) ++routed_count;
+                if (d < top[k].dist) {
+                    for (int s = CE_WAVE_TOPK - 1; s > k; --s) top[s] = top[s - 1];
+                    top[k].dist = d; top[k].slot = slot; top[k].bcol = bcol;
+                    if (top_count < CE_WAVE_TOPK) ++top_count;
                     break;
                 }
             }
         }
 
-        if (routed_count > 0) {
-            CEImageLink64 *links = (CEImageLink64 *)calloc((size_t)routed_count, sizeof(CEImageLink64));
+        if (top_count > 0) {
+            CEImageLink64 *links = (CEImageLink64 *)calloc(
+                (size_t)top_count, sizeof(CEImageLink64));
             CEImageLink64 *top3[CE_WAVE_TOPK] = { NULL, NULL, NULL };
-            for (int i = 0; i < routed_count; ++i) {
-                float score = 1.0f / (1.0f + (float)best_dist[i]);
-                link_from_entry(&links[i], &routed[i], score);
-                top3[i] = &links[i];
+            int filled = 0;
+            for (int i = 0; i < top_count; ++i) {
+                CEUnit q[4];
+                if (!collect_quadrants(storage, routed_canvas,
+                                       top[i].slot, top[i].bcol, q)) continue;
+                float score = 1.0f / (1.0f + (float)top[i].dist);
+                link_from_quadrants_16(&links[filled], q, score);
+                top3[filled] = &links[filled];
+                ++filled;
+                if (filled >= CE_WAVE_TOPK) break;
             }
-            CEImageCanvas canvas;
-            image_to_canvas(&canvas, output);
-            ce_image_wave_refine(&canvas, top3, wave_refine_iters);
-            canvas_to_image(output, &canvas);
+            if (filled > 0) {
+                CEImageCanvas canvas;
+                image_to_canvas(&canvas, output);
+                ce_image_wave_refine(&canvas, top3, wave_refine_iters);
+                canvas_to_image(output, &canvas);
+            }
             free(links);
         }
     }

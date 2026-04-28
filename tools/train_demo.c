@@ -1,32 +1,36 @@
-/* train_demo.c — joint text+image trainer.
+/* train_demo.c — joint text+image trainer (16×16 atomic + per-morpheme).
  *
  * Reads a TSV produced by make_demo_dataset:
  *   <label>\t<clause>\t<image_path_relative_to_dataset_dir>
  *
  * For each row:
- *   1. image_to_grid(<dataset>/<image>) -> SpatialGrid
- *   2. ai_store_auto_with_image(ai, clause, grid, label)
- *        — encodes the clause text, attaches the grid as a keyframe
- *          image, and threads in Mat-1..4 material harmonics.
- *   3. ce_storage_ingest_rgba(ces, hash(image_path), rgba, 256, 256)
- *        — appends 32x32=1024 CE_TYPE_IMAGE entries per image to the
- *          CEStorage so ce_search_by_type / ce_generate_image_typed
- *          can retrieve them.
+ *   1. image_to_grid(<dataset>/<image>) -> SpatialGrid (256x256 RGB).
+ *   2. ai_store_auto_with_image(ai, clause, grid, label) — SpatialAI
+ *      keyframe with text+image features (Mat-1..4 included).
+ *   3. ce_storage_ingest_rgba_16(ces, canvas_id, rgba, w, h) —
+ *      16x16 atomic blocks via ce_feed_image_16. 4 quadrant CEUnits per
+ *      block (TL/TR/BL/BR), 16x16 grid of blocks across 256x256 image
+ *      → 1024 CE_TYPE_IMAGE entries per image, all sharing canvas_id.
+ *   4. morpheme bridge — `morpheme_tokenize_clause(clause, ...)` then,
+ *      per morpheme: `ce_feed(.., m.token, len)` → one CE_TYPE_TEXT
+ *      entry. All TEXT entries share canvas_id with the image entries
+ *      so generation can: prompt → morpheme tokenize → per-morpheme
+ *      ce_search_by_type(TEXT) → vote canvas_id → IMAGE entries with
+ *      matching canvas_id.
  *
  * Outputs:
- *   <out_base>.spai  (SpatialAI model: text + image keyframes)
- *   <out_base>.ces   (CEStorage:      8x8 image blocks)
+ *   <out_base>.spai   SpatialAI joint text+image keyframes.
+ *   <out_base>.ces    CEStorage: per-row IMAGE + TEXT entries sharing
+ *                     canvas_id = fnv1a(image_path).
  *
  * Usage:
  *   train_demo <dataset_dir> <out_base>
- *     dataset_dir must contain labels.tsv (paths inside it are resolved
- *                 relative to dataset_dir).
  */
 
 #include "spatial_grid.h"
 #include "spatial_image.h"
 #include "spatial_keyframe.h"
-#include "spatial_layers.h"
+#include "spatial_morpheme.h"
 #include "spatial_io.h"
 
 #include "ce_core.h"
@@ -39,6 +43,8 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+#define MAX_MORPHS 256
 
 static uint32_t fnv1a(const char *s) {
     uint32_t h = 0x811C9DC5u;
@@ -63,6 +69,44 @@ static uint8_t *grid_to_rgba(const SpatialGrid *g, int *w, int *h) {
     return rgba;
 }
 
+/* Append one CE_TYPE_TEXT entry per morpheme of `clause`. canvas_id
+ * matches the paired image's canvas_id; slot = morpheme index;
+ * block_idx = morpheme part-of-speech tag. delta of the first morpheme
+ * is taken against the zero CEUnit, subsequent morphemes chain the
+ * previous morpheme's keyframe. Returns morphemes added. */
+static uint32_t ingest_clause_morphemes(CEStorage *s,
+                                        uint32_t canvas_id,
+                                        const char *clause) {
+    Morpheme morphs[MAX_MORPHS];
+    uint32_t n = morpheme_tokenize_clause(clause, morphs, MAX_MORPHS);
+    CEUnit prev; ce_init(&prev);
+    int has_prev = 0;
+    uint32_t added = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const char *tok = morphs[i].token;
+        size_t len = strlen(tok);
+        if (len == 0) continue;
+        CEUnit kf;
+        ce_init(&kf);
+        ce_feed(&kf, (const uint8_t *)tok, (uint32_t)len);
+        CEUnit delta;
+        if (!has_prev) {
+            CEUnit zero; ce_init(&zero);
+            ce_delta(&delta, &zero, &kf);
+        } else {
+            ce_delta(&delta, &prev, &kf);
+        }
+        ce_storage_add_typed(s, canvas_id,
+                             (uint16_t)i,
+                             (uint16_t)morphs[i].pos,
+                             CE_TYPE_TEXT, &kf, &delta);
+        prev = kf;
+        has_prev = 1;
+        ++added;
+    }
+    return added;
+}
+
 /* strip leading/trailing whitespace in-place */
 static char *trim(char *s) {
     while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') ++s;
@@ -85,6 +129,9 @@ int main(int argc, char **argv) {
     FILE *tsv = fopen(tsv_path, "r");
     if (!tsv) { perror(tsv_path); return 1; }
 
+    /* idempotent — also called from spatial_keyframe.c. */
+    morpheme_init();
+
     SpatialAI *ai = spatial_ai_create();
     if (!ai) { fclose(tsv); return 1; }
 
@@ -92,7 +139,8 @@ int main(int argc, char **argv) {
     ce_storage_init(&ces, 256);
 
     int rows = 0, ai_ok = 0;
-    uint32_t total_blocks = 0;
+    uint32_t total_image_entries = 0;
+    uint32_t total_text_entries  = 0;
 
     char line[1024];
     while (fgets(line, sizeof(line), tsv)) {
@@ -119,70 +167,35 @@ int main(int argc, char **argv) {
         }
 
         ++rows;
+        uint32_t cid = fnv1a(img_path);
 
         /* 1. SpatialAI joint text+image store. */
         uint32_t kf = ai_store_auto_with_image(ai, clause, g, label);
         if (kf != UINT32_MAX) {
             ++ai_ok;
-            fprintf(stderr, "[train_demo] +KF id=%u  label=%-10s  clause=\"%s\"\n",
+            fprintf(stderr, "[train_demo] +KF id=%u  label=%-12s  clause=\"%s\"\n",
                     kf, label, clause);
         } else {
             fprintf(stderr, "[train_demo] !! ai_store_auto_with_image failed for %s\n",
                     label);
         }
 
-        /* 2. CEStorage image-block ingest. */
-        uint32_t cid = fnv1a(img_path);
+        /* 2. CEStorage 16x16 atomic image ingest. */
         int w = 0, h = 0;
         uint8_t *rgba = grid_to_rgba(g, &w, &h);
         if (rgba) {
-            uint32_t added = ce_storage_ingest_rgba(&ces, cid, rgba, w, h);
-            total_blocks += added;
+            uint32_t added_img = ce_storage_ingest_rgba_16(&ces, cid, rgba, w, h);
+            total_image_entries += added_img;
             free(rgba);
-            fprintf(stderr, "[train_demo]  +CES blocks=%u  (cumulative=%u)\n",
-                    added, total_blocks);
+            fprintf(stderr, "[train_demo]  +IMG entries=%u (16x16 quadrants)  cid=0x%08x\n",
+                    added_img, cid);
         }
 
-        /* 3. Label / clause bridge — proper SSS text encoding.
-         *
-         * The byte-level ce_feed used previously put text CEUnits in a
-         * different cell space than image CEUnits (FNV-style channel
-         * mixing on raw bytes vs per-channel sums on RGBA pixels), so
-         * a prompt CEUnit was never directly comparable to an image
-         * CEUnit by ce_distance.
-         *
-         * Correct path: encode the clause through layers_encode_clause
-         * into a 256x256 SpatialGrid (X=byte, Y=position, A=3-layer
-         * sum), then ingest that grid into CEStorage exactly like an
-         * image — 8x8 blocks, ce_feed_image, CE_TYPE_TEXT tag, same
-         * canvas_id as the image entries. After this, text and image
-         * cells live in the same CE space and ce_distance is
-         * meaningful across the two modalities. */
-        SpatialGrid *text_grid = grid_create();
-        if (text_grid) {
-            layers_encode_clause(clause, NULL, text_grid);
-            int tw = 0, th = 0;
-            uint8_t *trgba = grid_to_rgba(text_grid, &tw, &th);
-            if (trgba) {
-                /* Use a slightly different canvas_id so the TEXT
-                 * entries don't collide with IMAGE entries on
-                 * (canvas_id, slot, block_idx) lookups. The router
-                 * normalises this by bit-clearing the high bit. */
-                uint32_t text_cid = cid ^ 0x80000000u;
-                uint32_t added_t = ce_storage_ingest_rgba(
-                    &ces, text_cid, trgba, tw, th);
-                /* Re-tag the just-inserted TEXT-grid entries from
-                 * IMAGE to TEXT so ce_search_by_type(CE_TYPE_TEXT)
-                 * picks them up. */
-                for (uint32_t i = ces.count - added_t; i < ces.count; ++i) {
-                    ces.entries[i].type = CE_TYPE_TEXT;
-                }
-                fprintf(stderr, "[train_demo]  +TXT blocks=%u  cid=0x%08x\n",
-                        added_t, text_cid);
-                free(trgba);
-            }
-            grid_destroy(text_grid);
-        }
+        /* 3. Per-morpheme TEXT bridge sharing canvas_id with IMAGE entries. */
+        uint32_t added_txt = ingest_clause_morphemes(&ces, cid, clause);
+        total_text_entries += added_txt;
+        fprintf(stderr, "[train_demo]  +TXT morphemes=%u  cid=0x%08x\n",
+                added_txt, cid);
 
         grid_destroy(g);
     }
@@ -215,8 +228,10 @@ int main(int argc, char **argv) {
         spatial_ai_destroy(ai);
         return 1;
     }
-    fprintf(stderr, "[train_demo] saved %s (%u blocks across %d images)\n",
-            ces_path, total_blocks, rows);
+    fprintf(stderr,
+            "[train_demo] saved %s (IMG=%u TEXT=%u total=%u entries across %d rows)\n",
+            ces_path, total_image_entries, total_text_entries,
+            total_image_entries + total_text_entries, rows);
 
     ce_storage_free(&ces);
     spatial_ai_destroy(ai);

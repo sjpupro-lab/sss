@@ -14,6 +14,10 @@ def main():
     args = sys.argv[1:]
     out_dir = None
     if args and args[0] == "--out":
+        if len(args) < 2:
+            sys.stderr.write("error: --out requires a directory argument\n")
+            print(__doc__)
+            return 2
         out_dir = args[1]
         args = args[2:]
         os.makedirs(out_dir, exist_ok=True)
