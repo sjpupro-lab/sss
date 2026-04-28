@@ -154,6 +154,18 @@ $(BUILD_DIR)/train_images_ce: tools/train_images_ce.c $(OBJS) | $(BUILD_DIR)
 $(BUILD_DIR)/gen_image_ce: tools/gen_image_ce.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
+$(BUILD_DIR)/make_demo_dataset: tools/make_demo_dataset.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< -o $@
+
+$(BUILD_DIR)/train_demo: tools/train_demo.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+demo_tools: $(BUILD_DIR)/make_demo_dataset $(BUILD_DIR)/train_demo $(BUILD_DIR)/gen_image_ce
+	@echo "Built demo tools. Pipeline:"
+	@echo "  ./build/make_demo_dataset data/demo"
+	@echo "  ./build/train_demo data/demo build/models/demo"
+	@echo "  ./build/gen_image_ce build/models/demo.ces \"red apple\" out.ppm 0 50 200"
+
 train_images_ce: $(BUILD_DIR)/train_images_ce
 	@echo "Built train_images_ce. Example:"
 	@echo "  ./build/train_images_ce build/models/demo  data/img/*.ppm"

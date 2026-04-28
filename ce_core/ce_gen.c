@@ -231,6 +231,136 @@ void ce_generate_image_typed(
     free(prompt_cells);
 }
 
+void ce_generate_image_label_routed(
+    CEImage *output,
+    const CEStorage *storage,
+    const char *prompt,
+    uint64_t seed,
+    const CEGenConfig *config,
+    uint32_t wave_refine_iters) {
+
+    /* Stage 1: token-wise TEXT search.  ce_feed mixes channels with a
+     * position-mixing salt, so a single CEUnit fed from "red apple"
+     * sits far from one fed from "apple" alone — the byte-level
+     * encoding is not commutative across token concatenation.  To make
+     * routing robust, encode each whitespace-delimited token as its
+     * own CEUnit and pick the closest TEXT entry across all tokens. */
+    int route_token_count = 0;
+    CEUnit *route_tokens = prompt_to_cells(prompt, &route_token_count);
+
+    uint32_t target_canvas = 0;
+    uint32_t best_dist = (uint32_t)-1;
+    int found_text = 0;
+    if (storage && storage->count > 0) {
+        for (int t = 0; t < route_token_count; ++t) {
+            CESearchResult tres;
+            int n = ce_search_by_type(storage, &route_tokens[t],
+                                      CE_TYPE_TEXT, 1, &tres);
+            if (n > 0 && tres.distance < best_dist) {
+                best_dist = tres.distance;
+                target_canvas = storage->entries[tres.entry_idx].canvas_id;
+                found_text = 1;
+            }
+        }
+    }
+    free(route_tokens);
+
+    /* Fallback: no TEXT bridge in storage -> use the typed image path. */
+    if (!found_text) {
+        ce_generate_image_typed(output, storage, CE_TYPE_IMAGE,
+                                prompt, seed, config, wave_refine_iters);
+        return;
+    }
+
+    CEGenConfig cfg = config ? *config : ce_gen_config_hq();
+
+    /* Build the initial latent the same way ce_generate_image_typed does,
+     * but seed it from one of the routed canvas_id IMAGE entries so the
+     * denoise loop's residual stays in-domain. */
+    CEUnit noise; ce_noise_init(&noise, seed);
+    CEUnit kf, dl;
+    ce_init(&kf);
+    ce_init(&dl);
+    for (uint32_t i = 0; i < storage->count; ++i) {
+        const CEStorageEntry *e = &storage->entries[i];
+        if (e->type == CE_TYPE_IMAGE && e->canvas_id == target_canvas) {
+            kf = e->keyframe;
+            dl = e->delta;
+            break;
+        }
+    }
+
+    int prompt_count = 0;
+    CEUnit *prompt_cells = prompt_to_cells(prompt, &prompt_count);
+    CEUnit prompt_avg; ce_init(&prompt_avg);
+    if (prompt_count > 0 && prompt_cells) {
+        prompt_avg = prompt_cells[prompt_count - 1];
+    }
+    float w[5] = { 0.30f, 0.25f, 0.20f, 0.25f, 0.0f };
+    CELatentGrid z;
+    ce_latent_init(&z, &noise, &kf, &dl,
+                   (prompt_count > 0) ? &prompt_avg : NULL,
+                   NULL, w);
+
+    ce_denoise_loop(&z, storage, prompt_cells, prompt_count, NULL, &cfg);
+    ce_decode_image(output, &z);
+
+    /* Wave-refine: pull up to CE_WAVE_TOPK image entries from the
+     * routed canvas_id and use them as targets. We pick by ce_distance
+     * to the prompt-mixed latent center cell so the targets that
+     * survive are the ones the denoised canvas already wants. */
+    if (wave_refine_iters > 0) {
+        CEStorageEntry routed[CE_WAVE_TOPK];
+        int routed_count = 0;
+
+        /* Collect candidates with the routed canvas_id, ranked by
+         * distance to the (single) center latent cell. Tiny K and
+         * small storage make a linear scan with insertion sort fine. */
+        const CEUnit *q = &z.cells[CE_GRID_N / 2];
+        uint32_t best_dist[CE_WAVE_TOPK];
+        for (int i = 0; i < CE_WAVE_TOPK; ++i) best_dist[i] = (uint32_t)-1;
+
+        for (uint32_t i = 0; i < storage->count; ++i) {
+            const CEStorageEntry *e = &storage->entries[i];
+            if (e->type != CE_TYPE_IMAGE) continue;
+            if (e->canvas_id != target_canvas) continue;
+
+            uint32_t d = ce_distance(q, &e->keyframe);
+            /* Insert into the sorted top-K (ascending). */
+            for (int k = 0; k < CE_WAVE_TOPK; ++k) {
+                if (d < best_dist[k]) {
+                    /* shift down */
+                    for (int s = CE_WAVE_TOPK - 1; s > k; --s) {
+                        best_dist[s] = best_dist[s - 1];
+                        routed[s]    = routed[s - 1];
+                    }
+                    best_dist[k] = d;
+                    routed[k]    = *e;
+                    if (routed_count < CE_WAVE_TOPK) ++routed_count;
+                    break;
+                }
+            }
+        }
+
+        if (routed_count > 0) {
+            CEImageLink64 *links = (CEImageLink64 *)calloc((size_t)routed_count, sizeof(CEImageLink64));
+            CEImageLink64 *top3[CE_WAVE_TOPK] = { NULL, NULL, NULL };
+            for (int i = 0; i < routed_count; ++i) {
+                float score = 1.0f / (1.0f + (float)best_dist[i]);
+                link_from_entry(&links[i], &routed[i], score);
+                top3[i] = &links[i];
+            }
+            CEImageCanvas canvas;
+            image_to_canvas(&canvas, output);
+            ce_image_wave_refine(&canvas, top3, wave_refine_iters);
+            canvas_to_image(output, &canvas);
+            free(links);
+        }
+    }
+
+    free(prompt_cells);
+}
+
 void ce_generate_text(
     uint8_t *output, uint32_t *output_len,
     const CEStorage *storage,

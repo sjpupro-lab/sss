@@ -41,6 +41,24 @@ void ce_generate_image_typed(
     const CEGenConfig *config,
     uint32_t wave_refine_iters);
 
+/* Label-routed image generation. WIP / superseded — uses byte-level
+ * ce_feed for prompt encoding which puts text CEUnits in a different
+ * cell space than image CEUnits, so the cross-modal alignment relies
+ * on lucky byte overlap between prompt tokens and stored labels.
+ *
+ * The architecturally correct path (per project owner's direction)
+ * routes through SSS's layers_encode_clause (256x256 SpatialGrid) with
+ * 16x16 ce_feed_image_16 blocks so text and image cells share the
+ * same CE space. That refactor is the next iteration; this function
+ * is kept here as a reference of the byte-level baseline. */
+void ce_generate_image_label_routed(
+    CEImage *output,
+    const CEStorage *storage,
+    const char *prompt,
+    uint64_t seed,
+    const CEGenConfig *config,
+    uint32_t wave_refine_iters);
+
 void ce_generate_text(
     uint8_t *output, uint32_t *output_len,
     const CEStorage *storage,

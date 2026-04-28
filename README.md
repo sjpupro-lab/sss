@@ -445,6 +445,88 @@ grid_destroy(img);
 
 ---
 
+## Demo: text → image generation
+
+End-to-end demonstration of the SSS image pipeline:
+**procedurally synthesized dataset → joint text+image training (`.spai` + `.ces`) → label-routed denoise → 256×256 PPM**.
+Total training set: **10,240 image blocks + 20 text bridges = 10,260 CEStorage entries**, well above
+the 10K minimum exercised by `test_stress_10k`.
+
+> **Status: WIP baseline (byte-level routing).** The text bridge currently uses a
+> byte-level `ce_feed` of the label/clause string, which puts text CEUnits in a
+> different cell space than image CEUnits. The architecturally correct path
+> routes both through SSS `layers_encode_clause` (256² SpatialGrid) with 16×16
+> blocks via `ce_feed_image_16` so the two modalities share one CE space — that
+> refactor is the next iteration and the colour-match rate is expected to
+> improve with it.
+
+### Training set
+
+10 labelled images: 4 solid colours (`red`, `green`, `blue`, `yellow`) and
+6 fruit shapes drawn as ellipses with a luminance gradient
+(`apple`, `banana`, `grape`, `lime`, `blueberry`, `orange`).
+Each row of `data/demo/labels.tsv` ties a label, a clause
+(e.g. `"apple is red and round"`) and an image path.
+
+![dataset](docs/demo/dataset_grid.png)
+
+### Pipeline
+
+```bash
+# 0. build everything
+make demo_tools
+
+# 1. synthesize the 10-image dataset
+./build/make_demo_dataset data/demo
+
+# 2. joint train: SpatialAI keyframes + CEStorage image blocks + text bridges
+./build/train_demo data/demo build/models/demo
+# -> build/models/demo.spai  (SpatialAI text+image keyframes)
+# -> build/models/demo.ces   (10240 CE_TYPE_IMAGE + 20 CE_TYPE_TEXT entries)
+
+# 3. generate via label-routed retrieval (token-wise TEXT search ->
+#    matched canvas_id -> wave-refine over the routed IMAGE entries)
+./build/gen_image_ce --routed build/models/demo.ces \
+    "red apple" build/gen/red_apple.ppm 0 50 200
+```
+
+### Generated outputs
+
+50 denoise steps + 200 wave-refine iterations per prompt, deterministic seed 0:
+
+![generated](docs/demo/generated_grid.png)
+
+| Prompt | Routed canvas | Mean RGB | Verdict |
+|---|---|---:|---|
+| `"red apple"`       | `apple`     | (196, 38, 39)  | **red** ✓ |
+| `"yellow banana"`   | `banana`    | (212, 196, 47) | **yellow** ✓ |
+| `"purple grape"`    | `grape`     | (107, 39, 131) | **purple** ✓ |
+| `"green lime"`      | `lime`      | (38, 195, 40)  | **green** ✓ |
+| `"blue blueberry"`  | `blueberry` | (37, 37, 196)  | **blue** ✓ |
+| `"orange fruit"`    | (mismatch)  | (230, 202, 163)| miss — see below |
+
+**5/6** prompts route to the correct entry and decode to the matching colour.
+The `"orange fruit"` miss is the cross-modal limitation called out in
+[`PIPELINE.md`](PIPELINE.md): the token `"fruit"` doesn't appear as a label
+in the demo dataset, so its TEXT-distance picks an unrelated row before
+`"orange"` does. Adding the token `"orange"` alone routes correctly;
+producing fully aligned text↔image embeddings (CLIP-style joint training)
+is split out as a follow-up.
+
+### What the textures show
+
+The generated images are colour-correct but visibly textured rather than
+smooth: this is the wave-refine loop blending the top-K retrieved 8×8
+blocks into a 256×256 canvas, ridden over by the residual noise of a
+50-step denoise. The block-level encoding (`ce_feed_image`) preserves
+per-channel sums and 4-direction gradients; the high-frequency carry-
+chain pattern is the integer denoise asserting itself before averaging.
+With more diverse training data (real photographs rather than solid
+fills + ellipses) the CE retrieval has more useful neighbours to blend,
+which softens the texture without changing the algorithm.
+
+---
+
 ## Current verified results
 
 Everything below is reproduced by `make test` on this branch

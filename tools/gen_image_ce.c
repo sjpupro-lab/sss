@@ -38,16 +38,28 @@ static int write_ppm(const char *path, const CEImage *img) {
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr,
-                "usage: %s <model.ces> <prompt> <out.ppm> [seed] [steps] [wave_iters]\n",
+                "usage: %s [--routed] <model.ces> <prompt> <out.ppm> [seed] [steps] [wave_iters]\n",
                 argv[0]);
         return 2;
     }
-    const char *ces_path  = argv[1];
-    const char *prompt    = argv[2];
-    const char *out_path  = argv[3];
-    uint64_t seed         = (argc > 4) ? (uint64_t)strtoull(argv[4], NULL, 0) : 0u;
-    int steps             = (argc > 5) ? atoi(argv[5]) : 8;
-    uint32_t wave_iters   = (argc > 6) ? (uint32_t)strtoul(argv[6], NULL, 0) : 200u;
+    int routed = 0;
+    int argi = 1;
+    if (strcmp(argv[argi], "--routed") == 0) {
+        routed = 1;
+        ++argi;
+    }
+    if (argc - argi < 3) {
+        fprintf(stderr,
+                "usage: %s [--routed] <model.ces> <prompt> <out.ppm> [seed] [steps] [wave_iters]\n",
+                argv[0]);
+        return 2;
+    }
+    const char *ces_path  = argv[argi];
+    const char *prompt    = argv[argi + 1];
+    const char *out_path  = argv[argi + 2];
+    uint64_t seed         = (argc - argi > 3) ? (uint64_t)strtoull(argv[argi + 3], NULL, 0) : 0u;
+    int steps             = (argc - argi > 4) ? atoi(argv[argi + 4]) : 8;
+    uint32_t wave_iters   = (argc - argi > 5) ? (uint32_t)strtoul(argv[argi + 5], NULL, 0) : 200u;
 
     CEStorage S;
     if (!ce_storage_load(&S, ces_path)) {
@@ -66,8 +78,12 @@ int main(int argc, char **argv) {
             "[gen_image_ce] prompt=\"%s\" seed=0x%llx steps=%d wave_iters=%u\n",
             prompt, (unsigned long long)seed, cfg.total_steps, wave_iters);
 
-    ce_generate_image_typed(img, &S, CE_TYPE_IMAGE,
-                            prompt, seed, &cfg, wave_iters);
+    if (routed) {
+        ce_generate_image_label_routed(img, &S, prompt, seed, &cfg, wave_iters);
+    } else {
+        ce_generate_image_typed(img, &S, CE_TYPE_IMAGE,
+                                prompt, seed, &cfg, wave_iters);
+    }
 
     /* Print summary stats so an automated pipeline test can verify the
      * generated image without parsing the PPM. */
