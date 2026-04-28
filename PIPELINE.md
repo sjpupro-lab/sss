@@ -25,13 +25,13 @@
 | Freq 분해 | slig_decompose_v2 (구조/엣지/텍스처/색상/이벤트) | slig_pipeline.c | OK |
 | Spatial Attn Mask | slig_apply_masked + mask_left/right/top/bottom | slig_signal.c | TODO 미연결 |
 | Atmos 오브젝트 배치 | slig_apply_masked per 형태소 | slig_signal.c | TODO 미연결 |
-| Wave Refine | ce_image_wave_refine (0.01→3→0.01 사이클) | ce_image_wave_refine.c | TODO 완전 미연결 |
+| Wave Refine | ce_image_wave_refine (0.01→3→0.01 사이클) | ce_image_wave_refine.c | OK ce_generate_image_typed에 연결됨 |
 | Tick 정수엔진 | TICK_SIN/COS/GAUSS_TABLE + WAVE_STEPS[7] | slig_tick_math.c | WARN 부분사용 |
 | Material 텍스처 | slig_material_harmonic Mat-1/2/3/4 | slig_material_harmonic.c | WARN spai v6에서만 |
 | Audio Sync | ce_audio_load + ce_audio_energy_at | ce_extend.c | TODO 데드코드 |
 | Keyframe/Delta 저장 | ai_store_auto_with_image | spatial_keyframe.c | OK |
-| CEStorage 훈련 | ce_storage_add_typed | ce_storage.c | TODO 훈련 시 미호출 |
-| 형태소→이미지 검색 | ce_search_by_type(CE_TYPE_IMAGE) | ce_search.c | TODO 미연결 |
+| CEStorage 훈련 | ce_storage_add_typed | ce_storage.c | OK ce_storage_ingest_rgba / train_images_ce |
+| 형태소→이미지 검색 | ce_search_by_type(CE_TYPE_IMAGE) | ce_search.c | OK ce_generate_image_typed에 연결됨 |
 
 ## CE Block 크기 문제
 
@@ -81,8 +81,9 @@
 
 ## TODO
 
-### 완료 (1a4c38a)
+### 완료
 
+**1a4c38a — CE 파이프라인 통합**
 - [x] ce_feed_image 16×16 블록 버전 (4 quadrant CEUnits)
 - [x] ce_denoise 스텝 파라미터화 — `ce_gen_config_hq()` 50-step 프리셋
 - [x] CEStorage ↔ SpatialAI 브릿지 — `train_images_ce` (.spai + .ces 동시 저장)
@@ -90,19 +91,23 @@
 - [x] ce_search_by_type 생성 진입점 — `ce_generate_image_typed`
 - [x] 10000+ 학습 스케일 검증 — `test_stress_10k` (12K/100K 모두 통과)
 
-### 별도 작업으로 분리
+**3bd277a — SLIG 측 에너지/방향**
+- [x] `slig_decompose_structure` HORIZONTAL → SVD u/v 분산비 기반 H/V/Diag 분류
+- [x] `cond_threshold` 누적 에너지 커버리지로 채움 (분해 시)
+- [x] `dec.A audio_amps[2]` 컴포넌트별 에너지 비율로 채움 (분해 시)
+- [x] `apply_global` 렌더 시 amp[2]로 진폭 변조 (하위호환 sentinel)
+- [x] 회귀 테스트 `test_slig_energy` 9/9 통과 + 시각 회귀 0건
 
-| TODO | 분리 사유 |
+### 후속 작업으로 분리
+
+| 항목 | 분리 사유 |
 |---|---|
-| `dec.A[2] energy_ratio → apply_global amp 변조` | SLIG 렌더러 내부 변경. 시각 회귀 테스트 필요 |
-| `cond_threshold 실제 에너지비율로 설정` | `slig_decompose_v2` 캘리브레이션 변경. 사전 측정 필요 |
-| `slig_decompose_structure HORIZONTAL → SVD 방향` | 새 수학 모듈(SVD), 결정성/성능 검증 필요 |
-| `LoRA (ce_memo) 스타일 파인튜닝` | 새 학습 루프, .cmemo 포맷, 적용 API 신규 설계 |
-| `ControlNet (ce_hint) edge/depth/pose/color` | 각 hint 타입별 인코더 + UNet 주입 인프라 신규 |
-| `Audio track: 음악 → 이미지` | WAV 로더 + 스펙트럼 + 영상 페어 데이터셋 필요 |
-| **Cross-modal 텍스트↔이미지 정렬** | E2E 테스트에서 발견 — "blue" 프롬프트가 blue KF로 안 옴. CLIP-style joint training 또는 라벨 키 인덱스 필요 |
-
-공통 분리 사유: 위 항목들은 (1) 새 알고리즘/수학, (2) 새 데이터셋, (3) 시각 회귀 검증, (4) 새 파일 포맷 중 하나 이상 필요. 한 PR에 묶으면 충돌면이 너무 커서 리뷰/롤백 불가.
+| `LoRA (ce_memo) 스타일 파인튜닝` | 사용자 지시: 신규 자세/이미지 학습 시 형태소 관계·품사·RGBA 중요도에 따라 CE cell이 자동 추가됨 — 별도 API 불필요. 데드코드 `ce_memo` 정리 검토만 |
+| `ControlNet (ce_hint) edge/depth/pose/color` | 사용자 지시: depth/edge map을 audio track 인프라로 전송하는 통합 설계로 검토 (별도 PR) |
+| `Audio track: 음악 → 이미지` | 동영상 생성 경로용 (별도 PR). WAV 로더 + 스펙트럼 + 영상 페어 데이터셋 필요 |
+| **Cross-modal 텍스트↔이미지 정렬** | E2E에서 발견 — "blue" 프롬프트가 blue KF로 안 옴. CLIP-style joint training 또는 라벨 키 인덱스 필요 |
+| `.ces 델타 압축 (varint/zlib)` | `train_loop_bench` 결과: spatial-prev 델타가 21× 작음 → 압축 시 disk 70%↓ |
+| `ce_storage_ingest_rgba(..., dedup_eps)` 옵션 | 메모리 제약 시나리오 (eps=50 → 278× 압축, recall 1/3 비용) |
 
 ### 훈련 루프 비교 (`tools/train_loop_bench`)
 

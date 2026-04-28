@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "../ce_core.h"
 #include "../ce_storage.h"
@@ -102,8 +103,12 @@ int main(void) {
     CHECK(found == 8, "ce_search_by_type returns 8");
     CHECK(t_search < 1.0, "single search under 1s");
 
-    /* 3. Save / load round-trip. */
-    const char *path = "/tmp/ce_stress_N entries.ces";
+    /* 3. Save / load round-trip. PID-suffixed path keeps parallel test
+     * runs from clobbering each other's scratch file and avoids spaces
+     * in the filename so downstream tooling stays simple. */
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/ce_stress_%d_%d.ces",
+             (int)getpid(), N_ENTRIES);
     double t2 = now_s();
     int saved = ce_storage_save(&S, path);
     double t_save = now_s() - t2;
