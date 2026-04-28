@@ -79,15 +79,38 @@
 11. slig_postprocess → 최종 출력
 ```
 
-## TODO (부족한 부분)
+## TODO
 
-- [ ] ce_feed_image 16×16 블록 버전 추가
-- [ ] ce_denoise 스텝 파라미터화 (기본 50)
-- [ ] dec.A[2](energy_ratio) → apply_global amp 변조 연결
-- [ ] cond_threshold 분해 시 실제 에너지비율로 설정
-- [ ] slig_decompose_structure 방향 HORIZONTAL→SVD 방향 계산
-- [ ] CEStorage ↔ SpatialAI 브릿지 (.spai + .ces 동시 저장)
-- [ ] ce_image_wave_refine 생성 파이프라인에 연결
-- [ ] LoRA (ce_memo): 스타일 파인튜닝 인터페이스
-- [ ] ControlNet (ce_hint): 엣지/깊이 조건 입력
-- [ ] Audio track: 음악→이미지 생성 경로
+### 완료 (1a4c38a)
+
+- [x] ce_feed_image 16×16 블록 버전 (4 quadrant CEUnits)
+- [x] ce_denoise 스텝 파라미터화 — `ce_gen_config_hq()` 50-step 프리셋
+- [x] CEStorage ↔ SpatialAI 브릿지 — `train_images_ce` (.spai + .ces 동시 저장)
+- [x] ce_image_wave_refine 생성 파이프라인 연결 — `ce_generate_image_typed`
+- [x] ce_search_by_type 생성 진입점 — `ce_generate_image_typed`
+- [x] 10000+ 학습 스케일 검증 — `test_stress_10k` (12K/100K 모두 통과)
+
+### 별도 작업으로 분리
+
+| TODO | 분리 사유 |
+|---|---|
+| `dec.A[2] energy_ratio → apply_global amp 변조` | SLIG 렌더러 내부 변경. 시각 회귀 테스트 필요 |
+| `cond_threshold 실제 에너지비율로 설정` | `slig_decompose_v2` 캘리브레이션 변경. 사전 측정 필요 |
+| `slig_decompose_structure HORIZONTAL → SVD 방향` | 새 수학 모듈(SVD), 결정성/성능 검증 필요 |
+| `LoRA (ce_memo) 스타일 파인튜닝` | 새 학습 루프, .cmemo 포맷, 적용 API 신규 설계 |
+| `ControlNet (ce_hint) edge/depth/pose/color` | 각 hint 타입별 인코더 + UNet 주입 인프라 신규 |
+| `Audio track: 음악 → 이미지` | WAV 로더 + 스펙트럼 + 영상 페어 데이터셋 필요 |
+| **Cross-modal 텍스트↔이미지 정렬** | E2E 테스트에서 발견 — "blue" 프롬프트가 blue KF로 안 옴. CLIP-style joint training 또는 라벨 키 인덱스 필요 |
+
+공통 분리 사유: 위 항목들은 (1) 새 알고리즘/수학, (2) 새 데이터셋, (3) 시각 회귀 검증, (4) 새 파일 포맷 중 하나 이상 필요. 한 PR에 묶으면 충돌면이 너무 커서 리뷰/롤백 불가.
+
+### 학습 스케일
+
+`test_stress_10k` 측정 (CE_TYPE_IMAGE 엔트리, single thread, -O2):
+
+| N | ingest | search (k=8) | save | load | generate (4-step + wave 30) |
+|---:|---:|---:|---:|---:|---:|
+| 12,000  | 5 ms (2.66M b/s) | 0.2 ms | <1 ms | <1 ms | 60 ms |
+| 100,000 | 60 ms (1.69M b/s) | 1.5 ms | 100 ms | 130 ms | 90 ms |
+
+→ 10K 학습 최소요건은 압도적으로 만족. 1M 엔트리(∼1000 이미지 × 1024 블록) 까지도 generate 0.1s 수준.

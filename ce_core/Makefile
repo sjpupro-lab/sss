@@ -31,7 +31,8 @@ TEST_BINS = $(BUILD_DIR)/test_core \
             $(BUILD_DIR)/test_feed_image \
             $(BUILD_DIR)/test_image_wave_refine \
             $(BUILD_DIR)/test_slig_signal \
-            $(BUILD_DIR)/test_pipeline
+            $(BUILD_DIR)/test_pipeline \
+            $(BUILD_DIR)/test_stress_10k
 
 TOOL_BINS = $(BUILD_DIR)/ce_ingest
 
@@ -83,6 +84,9 @@ $(BUILD_DIR)/test_slig_signal: tests/test_slig_signal.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/test_pipeline: tests/test_pipeline.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_stress_10k: tests/test_stress_10k.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/ce_ingest: tools/ce_ingest.c $(OBJS) | $(BUILD_DIR)
