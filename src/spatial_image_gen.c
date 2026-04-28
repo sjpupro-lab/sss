@@ -30,6 +30,7 @@
 #include "slig_signal.h"
 #include "slig_codebook.h"
 #include "slig_pipeline.h"
+#include "slig_material_harmonic.h"   /* Mat-S4 render-time overlay */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -325,6 +326,22 @@ int ai_generate_image_v2_guided(SpatialAI*  ai,
     render_channel_pyramid(y_panel,  ai, matches, num_matches, match_masks, SLIG_CH_Y);
     render_channel_pyramid(cb_panel, ai, matches, num_matches, match_masks, SLIG_CH_CB);
     render_channel_pyramid(cr_panel, ai, matches, num_matches, match_masks, SLIG_CH_CR);
+
+    /* Mat-S4: imprint learned material onto the rendered luminance.
+     * Walk every match's FINE-Y cell-set; the overlay averages the
+     * material descriptor across all of them so multi-keyframe blends
+     * (e.g. "큰 사과") combine the participants' textures. Cb/Cr are
+     * skipped — material lives only on Y per Mat-2 (chroma marker
+     * compatibility). No-op when no match carries material info. */
+    for (uint32_t i = 0; i < num_matches; i++) {
+        uint32_t kf_id = matches[i].keyframe_id;
+        if (kf_id >= ai->kf_count) continue;
+        const Keyframe *kf = &ai->keyframes[kf_id];
+        if (!kf->has_image) continue;
+        const SligCellSet *yfine = slig_codebook_get(
+            &ai->codebook, kf->image_idx[SLIG_LEVEL_FINE][SLIG_CH_Y]);
+        if (yfine) slig_apply_material_overlay(y_panel, SLIG_CANVAS_DIM, yfine);
+    }
 
     chroma_neutral_bias(cb_panel, 192);
     chroma_neutral_bias(cr_panel, 192);

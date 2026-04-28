@@ -186,3 +186,80 @@ int slig_mat_has(const CEUnit *cell) {
     if (!cell) return 0;
     return (cell->inc.R.minus[3] & SLIG_FLAG_HAS_MATERIAL) ? 1 : 0;
 }
+
+/* ──────────────────────────────────────────────────────
+ *  Mat-S4 — render-time material overlay.
+ *
+ *  Rationale: harmonic damping (Mat-S2) shapes the DCT spectrum, but
+ *  the rendered FINE-Y panel still hits the YCbCr→RGB mapping as a
+ *  smooth surface — the visible texture (pore dots, roughness grain)
+ *  never imprints on output pixels. This overlay adds a bounded,
+ *  deterministic per-pixel perturbation driven by the average
+ *  material descriptor of the rendering cells, so "사과 사진 학습 →
+ *  사과 입력" actually shows the learned roughness/pore on the
+ *  generated luminance.
+ *
+ *  Pattern is content-addressed:
+ *    signature = djb2-style mix of (roughness, pore) across the cells
+ *    pixel hash = signature ^ x*GR1 ^ y*GR2 ; xorshift mix ; multiply
+ *    delta_rough = sign-extended low byte → ±rough_amp range
+ *    delta_pore  = sparse trigger when middle byte is heavily negative
+ *    delta_grain = top byte / 256 → low-amplitude shimmer
+ *
+ *  All deterministic — same cells + same panel → same output. No RNG
+ *  state, no time dependence. ── */
+
+void slig_apply_material_overlay(uint8_t *panel, int dim,
+                                 const SligCellSet *cells) {
+    if (!panel || dim <= 0 || !cells || cells->num_cells == 0) return;
+
+    uint32_t sum_rough = 0, sum_pore = 0, sum_grain = 0;
+    uint32_t mat_count = 0;
+    uint32_t signature = 0x9E3779B9u;   /* golden-ratio seed */
+    for (uint32_t i = 0; i < cells->num_cells; i++) {
+        if (!slig_mat_has(&cells->cells[i])) continue;
+        SligMaterialTick m;
+        slig_mat_from_cell(&m, &cells->cells[i]);
+        sum_rough += m.roughness;
+        sum_pore  += m.pore;
+        sum_grain += m.grain;
+        signature = signature * 1103515245u + (uint32_t)m.roughness +
+                    ((uint32_t)m.pore << 8) + ((uint32_t)m.grain << 16);
+        mat_count++;
+    }
+    if (mat_count == 0) return;
+
+    uint32_t roughness = sum_rough / mat_count;   /* [0..255] */
+    uint32_t pore      = sum_pore  / mat_count;
+    uint32_t grain     = sum_grain / mat_count;
+
+    /* Amplitudes — chosen so a fully-rough/pore preset (roughness=255,
+     * pore=255) produces ±~32 luminance deviation, well below clamp.  */
+    int rough_amp = (int)(roughness >> 2);   /* /4  → max 63   */
+    int pore_amp  = (int)(pore      >> 3);   /* /8  → max 31   */
+    int grain_amp = (int)(grain     >> 3);   /* /8  → max 31   */
+
+    for (int y = 0; y < dim; y++) {
+        for (int x = 0; x < dim; x++) {
+            uint32_t h = signature;
+            h ^= (uint32_t)x * 0x9E3779B1u;
+            h ^= (uint32_t)y * 0x85EBCA77u;
+            h ^= h >> 13;
+            h *= 0xC2B2AE3Du;
+            h ^= h >> 16;
+
+            int8_t rn = (int8_t)( h        & 0xFF);
+            int8_t pn = (int8_t)((h >> 8)  & 0xFF);
+            int8_t gn = (int8_t)((h >> 16) & 0xFF);
+
+            int delta = ((int)rn * rough_amp) >> 7;          /* ±rough_amp */
+            if (pore_amp > 0 && pn < -100) delta -= pore_amp * 2;
+            delta += ((int)gn * grain_amp) >> 8;             /* low shimmer */
+
+            int v = (int)panel[y * dim + x] + delta;
+            if (v < 0)   v = 0;
+            if (v > 255) v = 255;
+            panel[y * dim + x] = (uint8_t)v;
+        }
+    }
+}

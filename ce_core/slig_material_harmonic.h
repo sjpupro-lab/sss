@@ -24,6 +24,7 @@
 
 #include <stdint.h>
 #include "ce_core.h"
+#include "slig_signal.h"   /* SligCellSet (used by overlay API) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -77,6 +78,27 @@ void slig_mat_from_cell(SligMaterialTick *out, const CEUnit *cell);
 
 /* Returns 1 iff cell->inc.R.minus[3] carries SLIG_FLAG_HAS_MATERIAL. */
 int  slig_mat_has(const CEUnit *cell);
+
+/* Mat-S4 — render-time material overlay.
+ *
+ * Apply a deterministic per-pixel texture on top of a rendered
+ * grayscale luminance panel, driven by the average material descriptor
+ * across `cells` that carry HAS_MATERIAL. Cells without material data
+ * are ignored. No-op if no cell carries material info.
+ *
+ * The overlay is a 3-component pixel hash:
+ *   - roughness drives a band-limited high-frequency micro-texture
+ *   - pore drives sparse dark spots (occasional outliers)
+ *   - grain drives a low-amplitude directional shimmer
+ *
+ * The overlay is fully deterministic: same input cells + same panel →
+ * same output panel. No RNG state, no time dependence — different
+ * materials (different signature) produce different patterns, but each
+ * material's pattern is reproducible.
+ *
+ * `panel` is in/out, `dim`×`dim`, row-major uint8 luminance. */
+void slig_apply_material_overlay(uint8_t *panel, int dim,
+                                 const SligCellSet *cells);
 
 #ifdef __cplusplus
 }

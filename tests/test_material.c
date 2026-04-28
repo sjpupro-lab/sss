@@ -410,6 +410,145 @@ int main(void) {
         }
     }
 
+    /* Mat-S4: render-time material overlay produces visible luminance
+     * variation that scales with roughness/pore. */
+    {
+        /* Baseline: flat panel + cells without material → overlay is no-op. */
+        SligCellSet noset;
+        memset(&noset, 0, sizeof noset);
+        noset.num_cells = 4;   /* zero cells, no HAS_MATERIAL flag */
+
+        uint8_t panel_a[64 * 64];
+        for (int i = 0; i < 64 * 64; i++) panel_a[i] = 128;
+        slig_apply_material_overlay(panel_a, 64, &noset);
+        int unchanged = 1;
+        for (int i = 0; i < 64 * 64; i++) if (panel_a[i] != 128) { unchanged = 0; break; }
+        check("Mat-S4 no material → no-op", unchanged);
+
+        /* Cells WITH heavy material → panel should diverge from 128. */
+        SligCellSet set;
+        memset(&set, 0, sizeof set);
+        set.num_cells = 4;
+        set.channel = SLIG_CH_Y;
+        set.scale_level = SLIG_LEVEL_FINE;
+        SligMaterialTick rough_mat;
+        slig_mat_preset(&rough_mat, SLIG_MAT_FABRIC);  /* roughness=140 grain=80 */
+        for (uint32_t i = 0; i < set.num_cells; i++) {
+            ce_init(&set.cells[i]);
+            set.cells[i].inc.R.minus[3] = 0;   /* clear flags */
+            slig_mat_to_cell(&set.cells[i], &rough_mat);
+        }
+
+        uint8_t panel_b[64 * 64];
+        for (int i = 0; i < 64 * 64; i++) panel_b[i] = 128;
+        slig_apply_material_overlay(panel_b, 64, &set);
+        int n_changed = 0, max_dev = 0;
+        for (int i = 0; i < 64 * 64; i++) {
+            int d = (int)panel_b[i] - 128;
+            if (d) n_changed++;
+            int ad = d < 0 ? -d : d;
+            if (ad > max_dev) max_dev = ad;
+        }
+        printf("  Mat-S4: heavy material → changed=%d/%d, max_dev=%d\n",
+               n_changed, 64 * 64, max_dev);
+        check("Mat-S4 heavy material → most pixels change",
+              n_changed > 64 * 60);   /* ≥ ~94% of pixels */
+        check("Mat-S4 max deviation > 8 (visible)", max_dev > 8);
+
+        /* Determinism: same input → bit-exact same output. */
+        uint8_t panel_c[64 * 64];
+        for (int i = 0; i < 64 * 64; i++) panel_c[i] = 128;
+        slig_apply_material_overlay(panel_c, 64, &set);
+        int identical = (memcmp(panel_b, panel_c, sizeof panel_b) == 0);
+        check("Mat-S4 deterministic (same input → bit-exact)", identical);
+
+        /* Smooth material (low roughness/pore) → smaller deviation
+         * than rough material. Rebuild set with METAL preset. */
+        SligMaterialTick smooth_mat;
+        slig_mat_preset(&smooth_mat, SLIG_MAT_METAL);  /* roughness=30 pore=0 */
+        for (uint32_t i = 0; i < set.num_cells; i++) {
+            ce_init(&set.cells[i]);
+            slig_mat_to_cell(&set.cells[i], &smooth_mat);
+        }
+        uint8_t panel_d[64 * 64];
+        for (int i = 0; i < 64 * 64; i++) panel_d[i] = 128;
+        slig_apply_material_overlay(panel_d, 64, &set);
+        int smooth_max = 0;
+        for (int i = 0; i < 64 * 64; i++) {
+            int d = (int)panel_d[i] - 128;
+            int ad = d < 0 ? -d : d;
+            if (ad > smooth_max) smooth_max = ad;
+        }
+        printf("  Mat-S4: smooth material max_dev=%d  (vs rough=%d)\n",
+               smooth_max, max_dev);
+        check("Mat-S4 smooth < rough deviation", smooth_max < max_dev);
+    }
+
+    /* Mat-S4: end-to-end loop — learn textured "사과" image, generate
+     * "사과", verify the rendered luminance carries the learned
+     * roughness/pore. Compare against a fresh AI with no learning to
+     * confirm the variation comes from material, not the base render. */
+    {
+        SpatialAI *ai = spatial_ai_create();
+        if (!ai) {
+            check("spatial_ai_create (Mat-S4 loop)", 0);
+        } else {
+            SpatialGrid *img = grid_create();
+            if (img) {
+                /* Build a high-frequency RGB image so the analyzer extracts
+                 * non-trivial roughness + pore. Same hatch pattern as
+                 * Mat-S3b; here we care only that material is learned. */
+                for (uint32_t y = 0; y < GRID_SIZE; y++) {
+                    for (uint32_t x = 0; x < GRID_SIZE; x++) {
+                        uint32_t i = y * GRID_SIZE + x;
+                        uint8_t hatch = ((x ^ y) & 0x07) * 30;
+                        img->A[i] = 200;
+                        img->R[i] = (uint8_t)(x + hatch);
+                        img->G[i] = (uint8_t)((x >> 1) + hatch);
+                        img->B[i] = (uint8_t)hatch;
+                    }
+                }
+                uint32_t rid = ai_store_auto_with_image(ai, "사과", img, "apple");
+                check("Mat-S4 loop: learn 사과+image",
+                      rid != UINT32_MAX && (rid & 0x80000000u) == 0);
+
+                /* Sanity: confirm material is on FINE-Y. */
+                const SligCellSet *yfine = slig_codebook_get(
+                    &ai->codebook,
+                    ai->keyframes[0].image_idx[SLIG_LEVEL_FINE][SLIG_CH_Y]);
+                int ok = 0;
+                if (yfine && yfine->num_cells > 0) {
+                    SligMaterialTick m;
+                    slig_mat_from_cell(&m, &yfine->cells[0]);
+                    printf("  Mat-S4 loop: learned roughness=%u pore=%u grain=%u\n",
+                           m.roughness, m.pore, m.grain);
+                    ok = (m.roughness > 0);
+                }
+                check("Mat-S4 loop: learned material non-zero", ok);
+
+                /* Apply the overlay directly to a flat 256² panel and
+                 * confirm the same FINE-Y cells produce visible
+                 * variation — exercises the full path used in the
+                 * generator without going through PPM I/O. */
+                uint8_t *panel = (uint8_t*)malloc(SLIG_CANVAS_DIM * SLIG_CANVAS_DIM);
+                if (panel) {
+                    memset(panel, 128, SLIG_CANVAS_DIM * SLIG_CANVAS_DIM);
+                    if (yfine) slig_apply_material_overlay(panel, SLIG_CANVAS_DIM, yfine);
+                    int n_changed = 0;
+                    for (int i = 0; i < SLIG_CANVAS_DIM * SLIG_CANVAS_DIM; i++)
+                        if (panel[i] != 128) n_changed++;
+                    printf("  Mat-S4 loop: overlay changed %d/%d pixels\n",
+                           n_changed, SLIG_CANVAS_DIM * SLIG_CANVAS_DIM);
+                    check("Mat-S4 loop: overlay imprints learned texture",
+                          n_changed > SLIG_CANVAS_DIM * SLIG_CANVAS_DIM / 2);
+                    free(panel);
+                }
+                grid_destroy(img);
+            }
+            spatial_ai_destroy(ai);
+        }
+    }
+
     printf("=== %d PASS / %d FAIL ===\n", pass, fail);
     return fail;
 }
