@@ -32,6 +32,7 @@
   - [5. Canvas Pool (subtitle routing)](#5-canvas-pool-subtitle-routing)
   - [6. Image modality (Task F — feasibility prototype)](#6-image-modality-task-f--feasibility-prototype)
   - [7. SLIG v2/v3 — signal-latent image generation](#7-slig-v2v3--signal-latent-image-generation)
+  - [8. Material auto-learn (Mat-1/2/3/4)](#8-material-auto-learn-mat-1234)
 - [Current verified results](#current-verified-results)
 - [Build & run](#build--run)
 - [Image training](#image-training)
@@ -237,6 +238,13 @@ layers: the caller provides a ready grid and a label, and the keyframe
 inherits a label-derived `topic_hash`, so the topic-aware bucket index
 and cascade apply unchanged. The per-cell EMA store is updated too.
 
+For joint text+image ingestion (e.g. captioned photos) use
+`ai_store_auto_with_image(ai, clause, img_grid, label)` — see
+[§8 Material auto-learn](#8-material-auto-learn-mat-1234) for the full
+flow. It mirrors `ai_store_auto`'s match logic and additionally writes
+`DeltaFrame.cell_deltas[]` against the parent's FINE-Y cells when the
+clause is similar enough to land on the delta path.
+
 Scope reminder (per Task F spec): this is an ingestion + refine-based
 render prototype, **not** a diffusion-style generator. PNG and baseline
 JPEG inputs are ingested via the tools below (the core stays PPM-only).
@@ -381,6 +389,62 @@ to `/sdcard/Download/sss_bench/`.
 
 ---
 
+### 8. Material auto-learn (Mat-1/2/3/4)
+
+A 4-stage pipeline that closes the loop **"이미지 학습 → 재질 자동
+추출 → CE Cell에 기록 → 생성 시 텍스처 보임"** without any external
+labels or presets. Each cell carries its own 8-byte material descriptor
+(roughness / anisotropy / dir_angle / h_strength / h_decay / pore /
+specular / grain) extracted from the 8×8 source block during decompose.
+
+```
+  image                                                 generated image
+  ┌────────┐                                           ┌────────┐
+  │ pixels │ ──▶ Mat-1 ──▶ Mat-2 ──▶ Mat-3 ──▶ Mat-4 ──▶ pixels │
+  │ (RGB)  │     analyze   damp     delta     overlay  │ (RGB)  │
+  └────────┘                                           └────────┘
+              auto-extract per-cell roughness/pore
+                  ↓
+           CE Cell.dec.A (8B) + HAS_MATERIAL flag
+```
+
+| Step | What it does | Where |
+|---|---|---|
+| **Mat-1** | 8×8 block → integer roughness/anisotropy/dir/grain — no float, no presets, no labels. Stored in cell `dec.A` after `slig_pack`, flag bit `0x08` in `inc.R.minus[3]`. Cb/Cr cells skip this so the chroma marker (`audio_bins[0]=1/2`) stays intact. | `slig_material_harmonic.{c,h}` |
+| **Mat-2** | `slig_upscale_harmonic` reads each cell's `h_strength` and maps it to a per-cell DCT damping factor in `[0, 0.04]`. Smooth surfaces → low damping (clean edges); textured surfaces → high damping (visible high-freq energy). Cells without material fall back to the `0.02` constant default. | `slig_pipeline.c` |
+| **Mat-3** | `DeltaFrame.cell_deltas[32]` — when a clause+image pair lands on the delta path (text grid similar to a parent), `ce_delta(parent_FINE_Y[i], new_FINE_Y[i])` is recorded inline. `ce_apply` reverses it byte-exactly. Adds 2 KB / delta. `.spai v6` serializes; v5 files load with `cell_delta_count = 0`. | `spatial_keyframe.h`, `spatial_io.c` |
+| **Mat-4** | `slig_apply_material_overlay(panel, dim, cells)` imprints the average material onto the rendered Y panel: `roughness/4` noise band + sparse pore dark spots + grain shimmer. Content-addressed — same cells + same panel → bit-exact same output. Hooked into `ai_generate_image_v2_guided` after `render_channel_pyramid`. | `slig_material_harmonic.c`, `spatial_image_gen.c` |
+
+#### `ai_store_auto_with_image` — joint text + image ingestion
+
+The Mat pipeline's primary ingestion entry point. Mirrors `ai_store_auto`'s
+match flow but takes both a text clause and an image grid:
+
+```c
+SpatialGrid *img = image_to_grid("apple.ppm");
+ai_store_auto_with_image(ai, "사과", img, "apple");
+/*  → text grid match against existing keyframes:
+ *    - similarity ≥ threshold   → DeltaFrame with cell_deltas vs parent FINE-Y
+ *    - similarity <  threshold  → new Keyframe with full image_idx pyramid
+ *    Either way, Mat-1 has already filled per-cell roughness/pore during
+ *    the pyramid decompose, and Mat-4 will surface them at render time.   */
+grid_destroy(img);
+```
+
+#### Verified results (test_material — 47 PASS)
+
+```
+  apple texture learn:      roughness=113  pore=182  grain=61   (auto-extracted)
+  overlay on flat panel:    64434 / 65536 pixels changed (≈98%)
+  max luminance deviation:  40 luma   (visible, well below clamp)
+  smooth material (METAL):  max_dev 7   ←  1/5× rougher material → less texture
+  determinism:              same cells + same panel → bit-exact
+  delta-path cell_delta:    20 entries  → ce_apply roundtrip exact
+  .spai v6 roundtrip:       cell_delta_count survives
+```
+
+---
+
 ## Current verified results
 
 Everything below is reproduced by `make test` on this branch
@@ -389,20 +453,26 @@ Everything below is reproduced by `make test` on this branch
 ### Test suite
 
 ```
-  test_grid         6/6
-  test_morpheme     5/5
-  test_layers       3/3
-  test_match        5/5
-  test_keyframe     6/6
-  test_context      5/5
-  test_integration  4/4
-  test_io           7/7
-  test_cascade      6/6
-  test_canvas       6/6
-  test_adaptive     8/8
-  test_subtitle     8/8
-  ───────────────────────
-  total            69/69   ALL TESTS PASSED
+  test_grid             6/6
+  test_morpheme         5/5
+  test_layers           3/3
+  test_match            5/5
+  test_keyframe         6/6
+  test_context          5/5
+  test_integration      4/4
+  test_io               7/7
+  test_cascade          6/6
+  test_canvas           8/8
+  test_adaptive         8/8
+  test_subtitle         8/8
+  test_recluster        7/7
+  test_refine          13/13
+  test_image_roundtrip  3/3
+  test_image_gen       59/59   (SLIG v2.3 integration)
+  test_tick            28/28   (tick math + frequency search)
+  test_material        47/47   (Mat-1/2/3/4 auto-learn)
+  ────────────────────────────
+  total               228/228   ALL TESTS PASSED
 ```
 
 ### Brightness distribution
@@ -472,7 +542,7 @@ same 10k-line synthetic corpus went from **58.85 s → 22.14 s**
 # Build everything
 make all
 
-# Full test suite (69 tests across 12 binaries)
+# Full test suite (228 tests across 18 binaries)
 make test
 
 # Clean
@@ -621,8 +691,8 @@ python3 tools/visualize_training.py build/models
 
 ## Save / Load
 
-Binary format `.spai` — `SPAI` magic, current version **5**. Versions
-3 and 4 load transparently (missing fields default to zero).
+Binary format `.spai` — `SPAI` magic, current version **6**. Versions
+3, 4, and 5 load transparently (missing fields default to zero).
 
 ```
   [Header 32B]   magic "SPAI" | version | kf_count | df_count | reserved[3]
@@ -632,7 +702,8 @@ Binary format `.spai` — `SPAI` magic, current version **5**. Versions
                          (v5: topic_hash + seq_in_topic) +
                          A + R + G + B
     tag 0x02  Delta:     id + parent_id + label[64] + count + change_ratio +
-                         entries[]  (v4+: 9 B/entry with diff_B; v3: 8 B)
+                         entries[]  (v4+: 9 B/entry with diff_B; v3: 8 B) +
+                         (v6: cell_delta_count + CEUnit cell_deltas[N], up to 32; Mat-S3)
     tag 0x03  Weights:   global ChannelWeight (4× float)
     tag 0x04  Canvas:    slot_count, canvas_type, frame_type, parent_canvas_id,
                          changed_ratio, classified, SlotMeta[32], A + R + G + B
@@ -651,6 +722,13 @@ Version bumps:
 - **v4 → v5** added `topic_hash` + `seq_in_topic` to every keyframe
   record so `ai_generate_next` can walk same-topic threads instead
   of falling back to `id + 1`.
+- **v5 → v6** appended `cell_delta_count` + `CEUnit cell_deltas[N]`
+  to every Delta record (Mat-S3). When a clause+image pair lands on
+  the delta path with `parent.has_image`, up to `SLIG_MAX_CELLS=32`
+  CE-Cell deltas (`ce_delta(parent_FINE_Y, new_FINE_Y)`) are stored
+  inline so the variant's image is recoverable byte-exactly via
+  `ce_apply`. v5 readers stop before this trailing block; v6 readers
+  loading a v5 file see `cell_delta_count = 0` (memset zeroed).
 
 Public API (`include/spatial_io.h`):
 
@@ -701,10 +779,15 @@ Guarantees validated by `test_io`:
 │   ├── slig_signal.{c,h}     # SligSignal / decompose / render / canvas / masks /
 │   │                         #   guidance / animation tick / pyramid helpers
 │   ├── slig_codebook.{c,h}   # SligCodebook — texture pattern dictionary
+│   ├── slig_material_harmonic.{c,h}  # Mat-1/2/4: per-cell roughness/pore +
+│   │                                 #   render-time material overlay
+│   ├── slig_tick_math.{c,h}  # 32-bit tick arithmetic + frequency search
 │   └── slig_pipeline.{c,h}   # v3 standalone 5-stage pipeline
 ├── dict/                     # Korean dictionaries (nouns/verbs/adj/particles/endings)
-├── tests/                    # 13+ test binaries, 60+ tests total
-│   └── test_image_gen.c       # SLIG v2.3 integration suite (59 cases)
+├── tests/                    # 18 test binaries, 228 tests total
+│   ├── test_image_gen.c       # SLIG v2.3 integration suite (59 cases)
+│   ├── test_tick.c            # tick math + frequency search (28 cases)
+│   └── test_material.c        # Mat-1/2/3/4 auto-learn (47 cases)
 ├── data/                     # Sample corpora + download scripts
 ├── tools/
 │   ├── stream_train.c         # Line-by-line streaming trainer (C binary)
