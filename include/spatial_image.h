@@ -96,4 +96,18 @@ uint32_t ai_generate_animation(SpatialAI*  ai,
                                const char* output_dir,
                                uint32_t    num_frames);
 
+/* SSS-driven generation through the v3 standalone renderer.
+ *
+ * Bridges v2.3 codebook patterns (for the matched keyframe) into a
+ * SligDecomposed and runs slig_render_adaptive — gives access to v3's
+ * progressive callback, depth/sigma/guidance knobs, and Atmos-style
+ * 3-canvas Y/Cb/Cr render — without rerunning slig_learn_image's SVD
+ * (~233 ms saved per call). guidance_scale follows the same convention
+ * as ai_generate_image_v2_guided. Returns 1 on success, 0 on failure
+ * (no morpheme match, no has_image keyframe, render error). */
+int ai_generate_image_v3(SpatialAI*  ai,
+                         const char* prompt_text,
+                         const char* out_path,
+                         float       guidance_scale);
+
 #endif /* SPATIAL_IMAGE_H */

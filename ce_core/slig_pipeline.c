@@ -152,12 +152,17 @@ void slig_preprocess_config_default(SligPreprocessConfig *cfg) {
 
 void slig_decompose_config_default(SligDecomposeConfig *cfg) {
     if (!cfg) return;
-    cfg->max_structure_cells = 8;
-    cfg->max_edge_cells = 8;
-    cfg->max_texture_cells = 8;
-    cfg->max_color_cells = 6;
+    /* Cell budget bumped for fidelity (was 8/8/8/6/4 = 34, → 12/16/16/8/4 = 56).
+     * Each additional cell adds 64B; total raw payload 56 × 64 = 3.5 KB
+     * (well under SligDecomposed's 64-cell cap × 64B = 4 KB). The biggest
+     * PSNR gain comes from edge / texture which capture mid/high-frequency
+     * detail; structure rank ~12 is enough for big-shape coverage. */
+    cfg->max_structure_cells = 12;
+    cfg->max_edge_cells = 16;
+    cfg->max_texture_cells = 16;
+    cfg->max_color_cells = 8;
     cfg->max_event_cells = 4;
-    cfg->energy_target = 0.95f;
+    cfg->energy_target = 0.97f;
 }
 
 void slig_upscale_config_default(SligUpscaleConfig *cfg) {
@@ -1020,28 +1025,52 @@ void slig_render_adaptive(SligImage *out, const SligDecomposed *d,
         if (marker == 1 || marker == 2) {
             has_color_cells = 1;
             SligCanvas *target = (marker == 1) ? &cb_canvas : &cr_canvas;
-            int chroma = (int)sig.audio_amps[0] - 128;     /* signed [-128, 127] */
-            if (sig.flags & SLIG_FLAG_NEGATIVE)
-                chroma = -((chroma < 0) ? -chroma : chroma);
-            int cx = sig.origin_x;
-            int cy = sig.origin_y;
-            int half = N / 4;                               /* 2×2 grid 가정: 64×64 블록 */
-            int32_t scale = (int32_t)(cfg0->sigma_scale * 256);
-            int32_t base  = chroma * scale;                 /* signed, fixed-point */
-            for (int dy = -half; dy < half; dy++) {
-                int y = cy + dy;
-                if (y < 0 || y >= N) continue;
-                for (int dx = -half; dx < half; dx++) {
-                    int x = cx + dx;
-                    if (x < 0 || x >= N) continue;
-                    int ax = (dx < 0) ? -dx : dx;
-                    int ay = (dy < 0) ? -dy : dy;
-                    int max_ad = (ax > ay) ? ax : ay;
-                    /* triangular falloff (256 -> 0 over `half`) */
-                    int falloff = 256 - (max_ad * 256 / half);
-                    if (falloff < 0) falloff = 0;
-                    target->pixels[y][x] += (base * falloff) >> 8;
+            /* Two encodings of color cells:
+             *
+             *  (A) v3 native — slig_decompose_color emits cells with u/v
+             *      empty (memset 0) and stores the 0..255 chroma value in
+             *      audio_amps[0] for a 2×2 block layout. We block-write
+             *      around (origin_x, origin_y) with triangular falloff.
+             *
+             *  (B) v2.3 native — slig_decompose_channel emits real SVD
+             *      cells on the Cb / Cr plane with u/v populated and
+             *      audio_amps[0] still at 0. The adapter (v23 → v3 in
+             *      spatial_image_gen.c) sets the marker but leaves the
+             *      amp blank. For these, slig_apply does the right thing
+             *      when targeted at the chroma canvas.
+             */
+            if (sig.audio_amps[0] != 0) {
+                /* (A) v3 block-falloff path */
+                int chroma = (int)sig.audio_amps[0] - 128;
+                if (sig.flags & SLIG_FLAG_NEGATIVE)
+                    chroma = -((chroma < 0) ? -chroma : chroma);
+                int cx = sig.origin_x;
+                int cy = sig.origin_y;
+                int half = N / 4;
+                int32_t scale = (int32_t)(cfg0->sigma_scale * 256);
+                int32_t base  = chroma * scale;
+                for (int dy = -half; dy < half; dy++) {
+                    int y = cy + dy;
+                    if (y < 0 || y >= N) continue;
+                    for (int dx = -half; dx < half; dx++) {
+                        int x = cx + dx;
+                        if (x < 0 || x >= N) continue;
+                        int ax = (dx < 0) ? -dx : dx;
+                        int ay = (dy < 0) ? -dy : dy;
+                        int max_ad = (ax > ay) ? ax : ay;
+                        int falloff = 256 - (max_ad * 256 / half);
+                        if (falloff < 0) falloff = 0;
+                        target->pixels[y][x] += (base * falloff) >> 8;
+                    }
                 }
+            } else {
+                /* (B) v2.3 SVD path — render the cell into the chroma
+                 * canvas as if it were luma. canvas accumulator is shared
+                 * scale (>>20 inside apply_global), so resulting Cb/Cr
+                 * canvas is in the same magnitude as y_canvas — chroma
+                 * normalize step (chroma_canvas_to_u8) keeps it bounded. */
+                sig.sigma = (uint16_t)clampf(sig.sigma * cfg0->sigma_scale, 0, 65535);
+                slig_apply(target, &sig);
             }
         } else {
             /* 마커 없는 컬러 셀은 luma 로 fallback */

@@ -188,6 +188,68 @@ int main(void) {
     fprintf(stderr, "[v3-progressive] saved=%d render=%.1fms RSS=%ldKB\n",
             pctx.saved, t_v3_prog, rss_final);
 
+    /* ---------- 4.5  SSS adapter → v3 renderer (P1: codebook reuse) ---------- */
+    fprintf(stderr, "\n[v3-adapter] (codebook → SligDecomposed)\n");
+    SpatialAI *ai_ad = spatial_ai_create();
+    ai_learn_image(ai_ad, "/tmp/bench_input.ppm", "사과");
+    char ad_out[512];
+    snprintf(ad_out, sizeof(ad_out), "%s/03_v3_adapter.ppm", out_dir);
+    t0 = now_ms();
+    int ok_ad = ai_generate_image_v3(ai_ad, "사과", ad_out, 1.0f);
+    double t_v3_adapter = now_ms() - t0;
+    fprintf(stderr, "[v3-adapter] ok=%d gen=%.1fms (skips slig_learn_image SVD)\n",
+            ok_ad, t_v3_adapter);
+    spatial_ai_destroy(ai_ad);
+
+    /* ---------- 4.6  Upscaler ablation (P4) ---------- */
+    fprintf(stderr, "\n[ablation] upscale technique contribution\n");
+    struct AblationRow {
+        const char *name;
+        SligUpscaleConfig cfg;
+        float psnr;
+        double t_render_ms;
+    } abl[] = {
+        { "baseline (no upscale)", {0,0,0,0,32,50}, 0,0 },
+        { "harmonic only",         {1,0,0,0,32,50}, 0,0 },
+        { "SBR only",              {0,1,0,0,32,50}, 0,0 },
+        { "Wiener only",           {0,0,1,0,32,50}, 0,0 },
+        { "harmonic + Wiener (default)", {1,0,1,0,32,50}, 0,0 },
+        { "all (harmonic+SBR+Wiener+CS)",{1,1,1,1,32,50}, 0,0 },
+    };
+    int nabl = sizeof(abl) / sizeof(abl[0]);
+
+    SligImage *abl_orig = slig_image_alloc(N, N, 3);
+    for (int i = 0; i < N*N*3; i++) abl_orig->data[i] = fixture[i] / 255.0f;
+
+    for (int i = 0; i < nabl; i++) {
+        SligDecomposed dec_a;
+        slig_learn_image(&dec_a, fixture, N, N, 3);
+        slig_upscale(&dec_a, &abl[i].cfg);
+
+        SligImage *rec = slig_image_alloc(N, N, 3);
+        SligRenderConfig rc_a;
+        slig_render_config_default(&rc_a);
+        rc_a.target_width = N; rc_a.target_height = N;
+
+        double tt = now_ms();
+        slig_render_adaptive(rec, &dec_a, &rc_a);
+        abl[i].t_render_ms = now_ms() - tt;
+
+        /* PSNR vs original */
+        double mse = 0;
+        size_t nn = (size_t)N * N * 3;
+        for (size_t k = 0; k < nn; k++) {
+            double e = abl_orig->data[k] - rec->data[k];
+            mse += e * e;
+        }
+        mse /= (double)nn;
+        abl[i].psnr = (mse <= 1e-12) ? 99.0f : (float)(10.0 * log10(1.0 / mse));
+        slig_image_free(rec);
+        fprintf(stderr, "[ablation] %-30s  PSNR=%.2f dB  render=%.1fms\n",
+                abl[i].name, abl[i].psnr, abl[i].t_render_ms);
+    }
+    slig_image_free(abl_orig);
+
     /* ---------- 5. SUMMARY.txt ---------- */
     char summary[512];
     snprintf(summary, sizeof(summary), "%s/SUMMARY.txt", out_dir);
@@ -218,6 +280,7 @@ int main(void) {
             { "00_input.ppm",       "fixture (red apple + leaves)" },
             { "01_v2_codebook.ppm", "SSS v2.3 (codebook + pyramid + residual)" },
             { "02_v3_pipeline.ppm", "v3 slig_generate_image (one-shot)" },
+            { "03_v3_adapter.ppm",  "v3 via SSS adapter (P1: codebook reuse)" },
             { "05_phase_1.ppm",     "v3 progressive — after structure" },
             { "05_phase_2.ppm",     "v3 progressive — after edges" },
             { "05_phase_3.ppm",     "v3 progressive — after texture" },
@@ -242,6 +305,17 @@ int main(void) {
         fprintf(fs, "  v3   generate (one-shot)      : %9.2f ms\n", t_v3_gen);
         fprintf(fs, "  v3   progressive render+I/O   : %9.2f ms  (phases saved=%d)\n",
                 t_v3_prog, pctx.saved);
+        fprintf(fs, "  v3   adapter (codebook reuse) : %9.2f ms  (ok=%d) [P1]\n",
+                t_v3_adapter, ok_ad);
+        fprintf(fs, "    └─ skips slig_learn_image (~233ms) by pulling cells\n"
+                    "       from the v2.3 codebook of the matched keyframe.\n");
+        fprintf(fs, "\n");
+
+        fprintf(fs, "[Upscaler ablation — PSNR contribution per technique]\n");
+        for (int i = 0; i < nabl; i++) {
+            fprintf(fs, "  %-32s  PSNR=%6.2f dB  render=%6.1f ms\n",
+                    abl[i].name, abl[i].psnr, abl[i].t_render_ms);
+        }
         fprintf(fs, "\n");
 
         fprintf(fs, "[v3 cell distribution]\n");

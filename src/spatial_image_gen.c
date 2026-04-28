@@ -29,6 +29,7 @@
 #include "spatial_grid.h"
 #include "slig_signal.h"
 #include "slig_codebook.h"
+#include "slig_pipeline.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -380,4 +381,139 @@ uint32_t ai_generate_animation(SpatialAI*  ai,
 
     s_event_max_tick = prev_tick;
     return written;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  v2.3 codebook → v3 SligDecomposed adapter (P1 priority)
+ *
+ *  Pull pre-decomposed CEUnits from the engine codebook (matched
+ *  keyframe → image_idx[scale][channel] → codebook patterns) into
+ *  a SligDecomposed structured for slig_render_adaptive. Mapping:
+ *
+ *    structure_end : coarse-Y cells   (low-rank big shape)
+ *    edge_end      : + mid-Y cells     (mid-frequency detail)
+ *    texture_end   : + fine-Y cells    (high-freq detail)
+ *    color_end     : + Cb/Cr cells     (audio_bins[0]=1/2 marker set)
+ *    num_cells     : total
+ *
+ *  The Cb/Cr cells from v2.3 are SVD-decomposed (audio_amps[0]=0),
+ *  so Phase 4's render dispatch (slig_pipeline.c) routes them via
+ *  slig_apply onto the dedicated chroma canvas — see the (B) v2.3
+ *  SVD path in slig_render_adaptive.
+ *
+ *  Skips the v3-style learn cost (~233 ms slig_learn_image SVD) and
+ *  reuses cells the engine has already cached. Speed win: ~100ms+
+ *  per generate call once the keyframe is in the codebook.
+ * ══════════════════════════════════════════════════════════════ */
+
+static uint32_t v23_pack_set(SligDecomposed *out,
+                             const SligCellSet *set,
+                             uint8_t marker /* 0 = no marker */) {
+    if (!set || set->num_cells == 0) return 0;
+    uint32_t added = 0;
+    for (uint32_t i = 0; i < set->num_cells; i++) {
+        if (out->num_cells >= 64) break;
+        if (marker == 0) {
+            out->cells[out->num_cells++] = set->cells[i];
+        } else {
+            /* Inject channel marker into audio_bins[0]; leave amps=0
+             * so Phase 4 takes the SVD-render-to-chroma path. */
+            SligSignal sig;
+            slig_unpack(&sig, &set->cells[i]);
+            sig.audio_bins[0] = marker;
+            slig_pack(&out->cells[out->num_cells], &sig);
+            out->num_cells++;
+        }
+        added++;
+    }
+    return added;
+}
+
+static int v23_to_v3_decomposed(SligDecomposed *out,
+                                const SpatialAI *ai,
+                                uint32_t kf_id) {
+    if (!out || !ai) return 0;
+    memset(out, 0, sizeof(*out));
+    if (kf_id >= ai->kf_count) return 0;
+    const Keyframe *kf = &ai->keyframes[kf_id];
+    if (!kf->has_image) return 0;
+
+    /* Stage boundaries: Y at three scales → structure / edge / texture. */
+    v23_pack_set(out, slig_codebook_get(&ai->codebook,
+        kf->image_idx[SLIG_LEVEL_COARSE][SLIG_CH_Y]), 0);
+    out->structure_end = out->num_cells;
+
+    v23_pack_set(out, slig_codebook_get(&ai->codebook,
+        kf->image_idx[SLIG_LEVEL_MID][SLIG_CH_Y]), 0);
+    out->edge_end = out->num_cells;
+
+    v23_pack_set(out, slig_codebook_get(&ai->codebook,
+        kf->image_idx[SLIG_LEVEL_FINE][SLIG_CH_Y]), 0);
+    out->texture_end = out->num_cells;
+
+    /* Color: pull Cb / Cr from the COARSE scale (block-average chroma
+     * carries the dominant hue without spending FINE bandwidth) and
+     * tag them so render_adaptive Phase 4 routes to chroma canvases. */
+    v23_pack_set(out, slig_codebook_get(&ai->codebook,
+        kf->image_idx[SLIG_LEVEL_COARSE][SLIG_CH_CB]), /*marker=*/1);
+    v23_pack_set(out, slig_codebook_get(&ai->codebook,
+        kf->image_idx[SLIG_LEVEL_COARSE][SLIG_CH_CR]), /*marker=*/2);
+    out->color_end = out->num_cells;
+
+    /* No event cells in v2.3 codebook — leave [color_end..num_cells)
+     * empty (SligDecomposed treats this as zero events). */
+    out->orig_min  = 0.0f;
+    out->orig_max  = 1.0f;
+    out->orig_mean = 0.5f;
+    out->symmetry  = 0;
+    out->sym_axis_x = 0.5f;
+    out->sym_axis_y = 0.5f;
+    return 1;
+}
+
+int ai_generate_image_v3(SpatialAI*  ai,
+                         const char* prompt_text,
+                         const char* out_path,
+                         float       guidance_scale) {
+    if (!ai || !prompt_text || !out_path) return 0;
+
+    /* Match prompt morphemes against the keyframe store; use the
+     * highest-similarity has_image match as the cell donor. */
+    MorphemeMatch matches[SLIG_MAX_CELLS];
+    uint32_t n = ai_match_morphemes(ai, prompt_text, matches, SLIG_MAX_CELLS);
+    if (n == 0) return 0;
+
+    uint32_t best_kf = UINT32_MAX;
+    float    best_sim = -1.0f;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t id = matches[i].keyframe_id;
+        if (id >= ai->kf_count) continue;
+        if (!ai->keyframes[id].has_image) continue;
+        if (matches[i].similarity > best_sim) {
+            best_sim = matches[i].similarity;
+            best_kf  = id;
+        }
+    }
+    if (best_kf == UINT32_MAX) return 0;
+
+    SligDecomposed dec;
+    if (!v23_to_v3_decomposed(&dec, ai, best_kf)) return 0;
+
+    /* Render through v3's adaptive pipeline. SligImage allocs heap so
+     * we don't blow stack with a 256² × float × 3 RGB buffer. */
+    int N = SLIG_CANVAS_DIM;
+    SligImage *out_img = slig_image_alloc(N, N, 3);
+    if (!out_img) return 0;
+
+    SligRenderConfig rc;
+    slig_render_config_default(&rc);
+    rc.target_width   = N;
+    rc.target_height  = N;
+    rc.guidance_scale = guidance_scale;
+
+    slig_render_adaptive(out_img, &dec, &rc);
+
+    int ok = slig_image_save_ppm(out_path, out_img);
+    slig_image_free(out_img);
+    return ok;
 }
