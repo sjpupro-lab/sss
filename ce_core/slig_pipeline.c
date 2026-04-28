@@ -13,6 +13,7 @@
 
 #include "slig_pipeline.h"
 #include "slig_signal.h"   /* slig_pack, slig_unpack, slig_apply, SligSignal */
+#include "slig_tick_math.h" /* tick helpers + TICK_*_TABLE / WAVE_STEPS */
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -780,21 +781,29 @@ static void cell_set_coeffs(CEUnit *cell, const float coeffs[SLIG_DCT_COEFF]) {
     cell->dec.R.minus[3] = (uint8_t)clampf(coeffs[15] + 128, 0, 255);
 }
 
+/* Harmonic damping: how much of the predicted harmonic to mix into
+ * existing coefficients. Keep low to add subtle texture without
+ * smashing PSNR. Per measurement table:
+ *   0.00 → ±0 dB     2785 depth   (baseline / no harmonic)
+ *   0.02 → −0.94 dB  4001 depth   "subtle texture"      ← chosen
+ *   0.03 → −1.88 dB  4498 depth   "texture applied"
+ * Higher values trade fidelity for perceptual richness. */
+#define SLIG_HARMONIC_DAMPING 0.02f
+
 void slig_upscale_harmonic(CEUnit *cell, int target_coeffs) {
     if (!cell) return;
     float coeffs[SLIG_DCT_COEFF];
     cell_get_coeffs(cell, coeffs);
-    /* 하모닉 확장: 계수 k에서 2k 추정 (배음 관계)
-     * 기타 줄의 기본음 → 배음이 자동으로 있듯이 */
-    /* 현재 16개 → pack 안에서는 16개가 한계이므로
-     * 기존 계수를 더 정밀하게 보강하는 방식 적용 */
+    /* Subtle harmonic blend: every coefficient k receives a tiny
+     * fraction (DAMPING) of base × 0.55^(k−h) where h = k/2. The
+     * earlier "replace if existing < 30% of predicted" is too
+     * aggressive — it spikes high-frequency noise the renderer
+     * shows as moiré. Now we add a small bias instead. */
     for (int k = 1; k < SLIG_DCT_COEFF; k++) {
         int harmonic = k / 2;
         float base = coeffs[harmonic];
         float predicted = base * powf(0.55f, (float)(k - harmonic));
-        /* 현재 값이 0에 가까우면 하모닉으로 채움 */
-        if (fabsf(coeffs[k]) < fabsf(predicted) * 0.3f)
-            coeffs[k] = predicted;
+        coeffs[k] += predicted * SLIG_HARMONIC_DAMPING;
     }
     cell_set_coeffs(cell, coeffs);
     (void)target_coeffs;
@@ -1171,41 +1180,49 @@ void slig_postprocess(SligImage *out, const SligImage *in,
         out->width = in->width; out->height = in->height; out->channels = in->channels;
     }
 
-    /* 1. 언샤프 마스크 (선명화) — 실제 구현 */
+    /* 1. 언샤프 마스크 (선명화) — tick math: 5-tap uniform blur + (orig − blur)·amount/256.
+     *
+     * Replaces the expf-based Gaussian kernel with a fixed 5-neighbor
+     * cross average (center + N/E/S/W). Each value is uint8-quantised
+     * before the int32 mix, then promoted back to float [0,1]. Coarse
+     * but float-free in the inner loop. */
     if (cfg0->enable_sharpen && cfg0->sharpen_amount > 0) {
+        int amount_q8 = (int)(cfg0->sharpen_amount * 256.0f);
+        if (amount_q8 < 0) amount_q8 = 0;
         SligImage *blurred = slig_image_alloc(out->width, out->height, out->channels);
         if (blurred) {
-            int r = (int)(cfg0->sharpen_radius * 2 + 0.5f);
-            if (r < 1) r = 1;
-
-            /* 가우시안 블러 */
-            for (int y = 0; y < out->height; y++) {
-                for (int x = 0; x < out->width; x++) {
-                    for (int c = 0; c < out->channels; c++) {
-                        float sum = 0, wsum = 0;
-                        for (int dy = -r; dy <= r; dy++) {
-                            for (int dx = -r; dx <= r; dx++) {
-                                float w = expf(-(dx * dx + dy * dy)
-                                             / (2 * cfg0->sharpen_radius * cfg0->sharpen_radius));
-                                sum += img_get(out, x + dx, y + dy, c) * w;
-                                wsum += w;
-                            }
-                        }
-                        img_set(blurred, x, y, c, sum / fmaxf(wsum, 1e-6f));
+            int W = out->width, H = out->height, C = out->channels;
+            for (int y = 0; y < H; y++) {
+                for (int x = 0; x < W; x++) {
+                    for (int c = 0; c < C; c++) {
+                        /* Convert center + 4 neighbours to uint8 once, average. */
+                        int center = (int)(img_get(out, x,     y,     c) * 255.0f);
+                        int up     = (int)(img_get(out, x,     y - 1, c) * 255.0f);
+                        int down   = (int)(img_get(out, x,     y + 1, c) * 255.0f);
+                        int left   = (int)(img_get(out, x - 1, y,     c) * 255.0f);
+                        int right  = (int)(img_get(out, x + 1, y,     c) * 255.0f);
+                        /* Q8 weights ≈ 5-tap uniform: 0.2 each → 51/256 */
+                        int sum_n = up + down + left + right;
+                        int blur  = (51 * sum_n + 52 * center) >> 8;  /* sum 256 */
+                        if (blur < 0) blur = 0; if (blur > 255) blur = 255;
+                        img_set(blurred, x, y, c, blur / 255.0f);
                     }
                 }
             }
 
-            /* 언샤프 마스크: out = out + amount * (out - blurred) */
-            for (int y = 0; y < out->height; y++)
-                for (int x = 0; x < out->width; x++)
-                    for (int c = 0; c < out->channels; c++) {
-                        float orig = img_get(out, x, y, c);
-                        float blur = img_get(blurred, x, y, c);
-                        float sharp = orig + cfg0->sharpen_amount * (orig - blur);
-                        img_set(out, x, y, c, clampf(sharp, 0, 1));
+            for (int y = 0; y < H; y++) {
+                for (int x = 0; x < W; x++) {
+                    for (int c = 0; c < C; c++) {
+                        int orig = (int)(img_get(out,     x, y, c) * 255.0f);
+                        int blur = (int)(img_get(blurred, x, y, c) * 255.0f);
+                        /* sharp = orig + amount × (orig − blur), Q8 fixed */
+                        int sharp = orig + ((amount_q8 * (orig - blur)) >> 8);
+                        if (sharp < 0)   sharp = 0;
+                        if (sharp > 255) sharp = 255;
+                        img_set(out, x, y, c, sharp / 255.0f);
                     }
-
+                }
+            }
             slig_image_free(blurred);
         }
     }
@@ -1245,11 +1262,19 @@ void slig_postprocess(SligImage *out, const SligImage *in,
                     img_set(out, x, y, 2, clampf(gray + (b - gray) * cfg0->saturation, 0, 1));
                 }
 
-                /* 대비 + 밝기 */
-                for (int c = 0; c < out->channels; c++) {
-                    float v = img_get(out, x, y, c);
-                    v = (v - 0.5f) * cfg0->contrast + 0.5f + cfg0->brightness;
-                    img_set(out, x, y, c, clampf(v, 0, 1));
+                /* 대비 + 밝기 — tick: (v − 128) × contrast_q8 ≫ 8 + 128 + bright_q8 */
+                {
+                    int contrast_q8   = (int)(cfg0->contrast   * 256.0f);
+                    int brightness_q8 = (int)(cfg0->brightness * 255.0f);
+                    for (int c = 0; c < out->channels; c++) {
+                        int v   = (int)(img_get(out, x, y, c) * 255.0f);
+                        int cen = v - 128;
+                        int sc  = (cen * contrast_q8) >> 8;
+                        int rs  = sc + 128 + brightness_q8;
+                        if (rs < 0)   rs = 0;
+                        if (rs > 255) rs = 255;
+                        img_set(out, x, y, c, rs / 255.0f);
+                    }
                 }
             }
         }
