@@ -104,6 +104,26 @@
 
 공통 분리 사유: 위 항목들은 (1) 새 알고리즘/수학, (2) 새 데이터셋, (3) 시각 회귀 검증, (4) 새 파일 포맷 중 하나 이상 필요. 한 PR에 묶으면 충돌면이 너무 커서 리뷰/롤백 불가.
 
+### 훈련 루프 비교 (`tools/train_loop_bench`)
+
+100 이미지 × 1024 블록 = 102,400 엔트리 합성 데이터셋:
+
+| 변형 | entries | mean\|delta\| | recall | disk |
+|---|---:|---:|---:|---:|
+| **A spatial-prev** (현재 production) | 102,400 | 3.46 | 99% | 14.3 MB |
+| B zero-anchor (delta = fresh) | 102,400 | 74.40 | 99% | 14.3 MB |
+| C dedup eps=50 + spatial-prev | 368 | 15.13 | 33% | 51.5 KB |
+| C dedup eps=200 + spatial-prev | 16 | 43.53 | 7% | 2.3 KB |
+
+**결론:**
+- **A 유지가 정답** (델타가 B의 21× 작음). 현재 .ces가 raw 140B/entry라 disk는 같지만, 델타 압축을 추가하면 A가 압승.
+- **C dedup**은 메모리 제약 시나리오에서 옵션 제공 가치: eps=50으로 278× 압축, 단 recall 1/3.
+- B는 채택 가치 없음.
+
+후속 작업 후보:
+1. `.ces` 델타 압축 (varint 또는 zlib) → A 변형 disk 사이즈 70%↓ 가능
+2. `ce_storage_ingest_rgba_v2(..., uint32_t dedup_eps)` 옵션 인자 추가 (eps=0이면 현재 동작)
+
 ### 학습 스케일
 
 `test_stress_10k` 측정 (CE_TYPE_IMAGE 엔트리, single thread, -O2):

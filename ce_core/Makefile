@@ -36,7 +36,9 @@ TEST_BINS = $(BUILD_DIR)/test_core \
             $(BUILD_DIR)/test_stress_10k \
             $(BUILD_DIR)/test_slig_energy
 
-TOOL_BINS = $(BUILD_DIR)/ce_ingest
+TOOL_BINS = $(BUILD_DIR)/ce_ingest \
+            $(BUILD_DIR)/slig_diag \
+            $(BUILD_DIR)/train_loop_bench
 
 .PHONY: all test tools clean
 all: $(BUILD_DIR) $(TEST_BINS) $(TOOL_BINS)
@@ -95,6 +97,12 @@ $(BUILD_DIR)/test_slig_energy: tests/test_slig_energy.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/ce_ingest: tools/ce_ingest.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/slig_diag: tools/slig_diag.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/train_loop_bench: tools/train_loop_bench.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 test: all
