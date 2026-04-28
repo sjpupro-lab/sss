@@ -128,3 +128,27 @@ void ce_feed_image(CEUnit *u, const uint8_t *rgba_block_8x8) {
         dec_minus[c][3] = (d2 >= 0) ? 0xFF : 0x00;
     }
 }
+
+/* 16x16 -> 4 quadrants of 8x8. Each quadrant is encoded independently with
+ * ce_feed_image, so the output is 4 distinct CEUnits keeping per-quadrant
+ * detail (no cross-quadrant averaging). */
+void ce_feed_image_16(CEUnit out_quadrants[4], const uint8_t *rgba_block_16x16) {
+    for (int i = 0; i < 4; ++i) ce_init(&out_quadrants[i]);
+    if (!rgba_block_16x16) return;
+
+    /* TL=0, TR=1, BL=2, BR=3 */
+    uint8_t tile[CE_IMAGE_BLOCK_BYTES];
+    for (int q = 0; q < 4; ++q) {
+        int qx = (q & 1) * CE_IMAGE_BLOCK_PX; /* 0 or 8 */
+        int qy = (q >> 1) * CE_IMAGE_BLOCK_PX;
+        for (int dy = 0; dy < CE_IMAGE_BLOCK_PX; ++dy) {
+            const uint8_t *src_row = rgba_block_16x16
+                + (size_t)((qy + dy) * CE_IMAGE_BLOCK16_PX + qx) * 4u;
+            uint8_t *dst_row = tile + (size_t)(dy * CE_IMAGE_BLOCK_PX) * 4u;
+            for (int dx = 0; dx < CE_IMAGE_BLOCK_PX * 4; ++dx) {
+                dst_row[dx] = src_row[dx];
+            }
+        }
+        ce_feed_image(&out_quadrants[q], tile);
+    }
+}

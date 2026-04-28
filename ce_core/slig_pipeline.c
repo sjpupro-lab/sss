@@ -303,6 +303,35 @@ void slig_preprocess(SligImage *out, SligDecomposed *meta,
  * ════════════════════════════════════════════════════ */
 
 /* 2-1. 구조 분해: SVD로 전역 rank-1 성분 추출 */
+static uint8_t infer_dir_from_uv(const float *u, const float *v, int dim) {
+    /* Variance of u (rows axis) vs v (cols axis) on the dominant component:
+     *   var(u) >> var(v)  ->  matrix varies along Y (uniform per row)  ->  HORIZONTAL stripes
+     *   var(v) >> var(u)  ->  matrix varies along X (uniform per col)  ->  VERTICAL   stripes
+     *   ratio near 1      ->  diagonal pattern (DIAG_DOWN as a stable default)
+     *
+     * Thresholds picked from slig_diag measurements (horizontal=181,
+     * vertical=0.0058, diagonal=2.46): a 4x band cleanly separates the
+     * three families without misclassifying near-symmetric inputs. */
+    double um = 0, vm = 0;
+    for (int i = 0; i < dim; ++i) { um += u[i]; vm += v[i]; }
+    um /= dim; vm /= dim;
+    double uv_var = 0, vv_var = 0;
+    for (int i = 0; i < dim; ++i) {
+        double du = u[i] - um, dv = v[i] - vm;
+        uv_var += du * du;
+        vv_var += dv * dv;
+    }
+    if (vv_var < 1e-12) return SLIG_DIR_HORIZONTAL;
+    double r = uv_var / vv_var;
+    if (r > 4.0)        return SLIG_DIR_HORIZONTAL;
+    if (r < 0.25)       return SLIG_DIR_VERTICAL;
+    /* Mixed axis. Look at sign correlation to pick down vs up diagonal. */
+    double corr = 0;
+    int n = dim;
+    for (int i = 0; i < n; ++i) corr += (u[i] - um) * (v[i] - vm);
+    return (corr >= 0) ? SLIG_DIR_DIAG_DOWN : SLIG_DIR_DIAG_UP;
+}
+
 void slig_decompose_structure(SligDecomposed *out, const SligImage *img,
                               int max_cells, float energy_target) {
     if (!out || !img) return;
@@ -335,7 +364,7 @@ void slig_decompose_structure(SligDecomposed *out, const SligImage *img,
         /* SligSignal 구성 */
         SligSignal sig;
         memset(&sig, 0, sizeof(sig));
-        sig.dir = SLIG_DIR_HORIZONTAL;
+        sig.dir = infer_dir_from_uv(u, v, dim);
         sig.scale = (k < 2) ? SLIG_SCALE_COARSE
                  : (k < 5) ? SLIG_SCALE_MID
                  : SLIG_SCALE_FINE;
@@ -344,6 +373,27 @@ void slig_decompose_structure(SligDecomposed *out, const SligImage *img,
         sig.origin_x = 128;
         sig.origin_y = 128;
         if (sigma < 0) sig.flags |= SLIG_FLAG_NEGATIVE;
+
+        /* Energy bookkeeping (component-wise + cumulative).
+         * - cond_threshold[0..255] = cumulative energy ratio after this
+         *   component is added. The renderer uses sig.cond_threshold to
+         *   gate apply_global, so writing the cumulative coverage here
+         *   means later (less energetic) components fire only after the
+         *   canvas already carries enough magnitude.
+         * - audio_amps[2][0..255] = THIS component's relative energy
+         *   (sigma^2 / total_energy). This is the per-cell energy_ratio
+         *   the render-time amp modulation will read. */
+        float comp_energy = sigma * sigma;
+        float cumul_after = cumul + comp_energy;
+        float coverage = (total_energy > 0) ? (cumul_after / total_energy) : 0.0f;
+        if (coverage < 0) coverage = 0;
+        if (coverage > 1) coverage = 1;
+        sig.cond_threshold = (uint8_t)(coverage * 255.0f + 0.5f);
+
+        float comp_ratio = (total_energy > 0) ? (comp_energy / total_energy) : 0.0f;
+        if (comp_ratio < 0) comp_ratio = 0;
+        if (comp_ratio > 1) comp_ratio = 1;
+        sig.audio_amps[2] = (uint8_t)(comp_ratio * 255.0f + 0.5f);
 
         /* u, v 신호를 int16으로 변환 */
         for (int i = 0; i < dim && i < SLIG_SIG_LEN; i++) {

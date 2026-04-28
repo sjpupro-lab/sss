@@ -9,6 +9,7 @@
 #include "ce_denoise.h"
 #include "ce_decode.h"
 #include "ce_extend.h"
+#include "ce_type.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,6 +24,22 @@ void ce_generate_image(
     const CEMemoLayer *memo,
     const CEHintLayer *hint,
     const CEAudioTrack *audio);
+
+/* HQ image generation: filters retrieval to a single modality and (when
+ * `wave_refine_iters > 0`) runs ce_image_wave_refine on the decoded canvas
+ * using the top-k retrieved blocks as wave targets. The `type` argument
+ * is normally CE_TYPE_IMAGE — but generation paths that want to retrieve
+ * across modalities can pass CE_TYPE_TEXT/AUDIO.
+ *
+ * Pass `config = NULL` to use ce_gen_config_hq() (50-step preset). */
+void ce_generate_image_typed(
+    CEImage *output,
+    const CEStorage *storage,
+    CEType type,
+    const char *prompt,
+    uint64_t seed,
+    const CEGenConfig *config,
+    uint32_t wave_refine_iters);
 
 void ce_generate_text(
     uint8_t *output, uint32_t *output_len,
