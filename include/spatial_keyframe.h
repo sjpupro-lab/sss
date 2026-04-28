@@ -211,6 +211,27 @@ uint32_t ai_store_grid(SpatialAI* ai,
                        const SpatialGrid* input,
                        const char* label);
 
+/* Joint text + image ingestion (Mat-S3b).
+ *
+ * Encodes `clause_text` into the text grid (same path as ai_store_auto)
+ * and uses `image_grid` (RGB SpatialGrid, e.g. from image_to_grid) as
+ * the visual signal. Match logic mirrors ai_store_auto:
+ *   - similarity ≥ store_threshold → store as DeltaFrame.  In addition
+ *     to the standard text-grid delta we compute
+ *       df->cell_deltas[i] = ce_delta(parent_FINE_Y[i], new_FINE_Y[i])
+ *     so the variant's image is recoverable byte-exactly via ce_apply
+ *     against the parent's stored FINE-Y cells.
+ *   - otherwise → new Keyframe, with the image pyramid decomposed and
+ *     registered in the codebook (full 3×3 image_idx slots).
+ *
+ * Returns the keyframe ID on the new-kf path, or (df_id | 0x80000000)
+ * on the delta path — same encoding as ai_store_auto. UINT32_MAX on
+ * failure. */
+uint32_t ai_store_auto_with_image(SpatialAI* ai,
+                                  const char* clause_text,
+                                  const SpatialGrid* image_grid,
+                                  const char* label);
+
 /* Compute delta between two grids.
    Returns number of changed pixels. entries must be pre-allocated. */
 uint32_t compute_delta(const SpatialGrid* base, const SpatialGrid* target,

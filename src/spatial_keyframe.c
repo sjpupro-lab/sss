@@ -610,6 +610,171 @@ uint32_t ai_force_keyframe(SpatialAI* ai, const char* clause_text, const char* l
     return new_id;
 }
 
+/* Residual pyramid encode shared by ai_store_grid and
+ * ai_store_auto_with_image. Produces 9 SligCellSets indexed
+ * [scale_level][channel]; no codebook side effects. The caller decides
+ * whether to register the cells (new-keyframe path) or use them
+ * transiently (delta path, for cell_delta computation against the
+ * parent's stored cells).
+ *
+ * Returns total cell count across all 9 sets, or 0 when input is empty
+ * (no active RGB) or an internal allocation failed. On failure
+ * out_sets is left zeroed. */
+static uint32_t decompose_image_pyramid(
+    const SpatialGrid *input,
+    SligCellSet out_sets[SLIG_NUM_LEVELS][SLIG_NUM_CHANNELS])
+{
+    memset(out_sets, 0, sizeof(SligCellSet) * SLIG_NUM_LEVELS * SLIG_NUM_CHANNELS);
+
+    uint8_t *plane_y_full  = (uint8_t*)malloc(GRID_TOTAL);
+    uint8_t *plane_cb_full = (uint8_t*)malloc(GRID_TOTAL);
+    uint8_t *plane_cr_full = (uint8_t*)malloc(GRID_TOTAL);
+    if (!plane_y_full || !plane_cb_full || !plane_cr_full) {
+        free(plane_y_full); free(plane_cb_full); free(plane_cr_full);
+        return 0;
+    }
+
+    uint32_t active = 0;
+    for (uint32_t i = 0; i < GRID_TOTAL; i++) {
+        int32_t R = input->R[i];
+        int32_t G = input->G[i];
+        int32_t B = input->B[i];
+        int32_t Y  = ( 9798 * R + 19235 * G +  3735 * B + 16384) >> 15;
+        int32_t Cb = (-5537 * R - 10846 * G + 16384 * B + 16384) >> 15;
+        int32_t Cr = (16384 * R - 13720 * G -  2664 * B + 16384) >> 15;
+        Cb += 128; Cr += 128;
+        if (Y  < 0) Y  = 0; else if (Y  > 255) Y  = 255;
+        if (Cb < 0) Cb = 0; else if (Cb > 255) Cb = 255;
+        if (Cr < 0) Cr = 0; else if (Cr > 255) Cr = 255;
+        plane_y_full [i] = (uint8_t)Y;
+        plane_cb_full[i] = (uint8_t)Cb;
+        plane_cr_full[i] = (uint8_t)Cr;
+        if (R || G || B) active++;
+    }
+
+    uint32_t total = 0;
+    if (active > 0) {
+        uint8_t *full_planes[SLIG_NUM_CHANNELS] = {
+            plane_y_full, plane_cb_full, plane_cr_full
+        };
+        uint8_t channels[SLIG_NUM_CHANNELS] = {
+            SLIG_CH_Y, SLIG_CH_CB, SLIG_CH_CR
+        };
+        uint32_t budgets[SLIG_NUM_CHANNELS] = {
+            SLIG_CELL_BUDGET_Y, SLIG_CELL_BUDGET_CB, SLIG_CELL_BUDGET_CR
+        };
+
+        /* Residual pyramid encode (per-channel chain):
+         *   coarse = decompose(downsample(full, 32))
+         *   recon32 = reconstruct(coarse, 32)
+         *   up128   = upsample(recon32, 128)
+         *   mid     = decompose(downsample(full, 128) − up128 + 128)
+         *   recon_mid_128 = reconstruct(mid, 128) − 128
+         *   pred128 = clamp(up128 + recon_mid_128, 0, 255)
+         *   up256   = upsample(pred128, 256)
+         *   fine    = decompose(full − up256 + 128)
+         * The mid/fine sets store *residuals* shifted to uint8
+         * (offset 128), so reconstruction must undo the shift. */
+        int dim_c = slig_scale_dim(SLIG_LEVEL_COARSE);   /* 32  */
+        int dim_m = slig_scale_dim(SLIG_LEVEL_MID);      /* 128 */
+        int dim_f = slig_scale_dim(SLIG_LEVEL_FINE);     /* 256 */
+        uint8_t *plane_32   = (uint8_t*)malloc((size_t)dim_c * dim_c);
+        uint8_t *plane_128  = (uint8_t*)malloc((size_t)dim_m * dim_m);
+        uint8_t *recon_32   = (uint8_t*)malloc((size_t)dim_c * dim_c);
+        uint8_t *up_128     = (uint8_t*)malloc((size_t)dim_m * dim_m);
+        uint8_t *res_128    = (uint8_t*)malloc((size_t)dim_m * dim_m);
+        uint8_t *recon_mid  = (uint8_t*)malloc((size_t)dim_m * dim_m);
+        uint8_t *pred_128   = (uint8_t*)malloc((size_t)dim_m * dim_m);
+        uint8_t *up_256     = (uint8_t*)malloc((size_t)dim_f * dim_f);
+        uint8_t *res_256    = (uint8_t*)malloc((size_t)dim_f * dim_f);
+        int alloc_ok = plane_32 && plane_128 && recon_32 && up_128 &&
+                       res_128 && recon_mid && pred_128 && up_256 && res_256;
+
+        if (alloc_ok) {
+            for (int ch = 0; ch < SLIG_NUM_CHANNELS; ch++) {
+                const uint8_t *full = full_planes[ch];
+
+                /* Level 0 — coarse base */
+                slig_image_downsample(plane_32, dim_c, full, dim_f);
+                slig_decompose_channel(&out_sets[SLIG_LEVEL_COARSE][ch],
+                                       plane_32, dim_c, dim_c,
+                                       channels[ch], SLIG_LEVEL_COARSE,
+                                       budgets[ch]);
+                total += out_sets[SLIG_LEVEL_COARSE][ch].num_cells;
+
+                /* Reconstruct → upsample → mid residual input */
+                slig_reconstruct_at_dim(recon_32, dim_c,
+                                        &out_sets[SLIG_LEVEL_COARSE][ch]);
+                slig_image_upsample(up_128, dim_m, recon_32, dim_c);
+                slig_image_downsample(plane_128, dim_m, full, dim_f);
+                int n_m = dim_m * dim_m;
+                for (int i = 0; i < n_m; i++) {
+                    int v = (int)plane_128[i] - (int)up_128[i] + 128;
+                    if (v < 0) v = 0; else if (v > 255) v = 255;
+                    res_128[i] = (uint8_t)v;
+                }
+
+                /* Level 1 — mid residual */
+                slig_decompose_channel(&out_sets[SLIG_LEVEL_MID][ch],
+                                       res_128, dim_m, dim_m,
+                                       channels[ch], SLIG_LEVEL_MID,
+                                       budgets[ch]);
+                total += out_sets[SLIG_LEVEL_MID][ch].num_cells;
+
+                /* Predict 128, upsample to 256, compute fine residual */
+                slig_reconstruct_at_dim(recon_mid, dim_m,
+                                        &out_sets[SLIG_LEVEL_MID][ch]);
+                for (int i = 0; i < n_m; i++) {
+                    int v = (int)up_128[i] + (int)recon_mid[i] - 128;
+                    if (v < 0) v = 0; else if (v > 255) v = 255;
+                    pred_128[i] = (uint8_t)v;
+                }
+                slig_image_upsample(up_256, dim_f, pred_128, dim_m);
+                int n_f = dim_f * dim_f;
+                for (int i = 0; i < n_f; i++) {
+                    int v = (int)full[i] - (int)up_256[i] + 128;
+                    if (v < 0) v = 0; else if (v > 255) v = 255;
+                    res_256[i] = (uint8_t)v;
+                }
+
+                /* Level 2 — fine residual */
+                slig_decompose_channel(&out_sets[SLIG_LEVEL_FINE][ch],
+                                       res_256, dim_f, dim_f,
+                                       channels[ch], SLIG_LEVEL_FINE,
+                                       budgets[ch]);
+                total += out_sets[SLIG_LEVEL_FINE][ch].num_cells;
+            }
+        }
+        free(plane_32);  free(plane_128); free(recon_32);
+        free(up_128);    free(res_128);   free(recon_mid);
+        free(pred_128);  free(up_256);    free(res_256);
+    }
+
+    free(plane_y_full); free(plane_cb_full); free(plane_cr_full);
+    return total;
+}
+
+/* Decompose `input` and register the resulting 9 SligCellSets in the
+ * engine codebook, populating kf->image_idx + kf->has_image. */
+static void decompose_image_into_keyframe(SpatialAI *ai, Keyframe *kf,
+                                          const SpatialGrid *input) {
+    memset(kf->image_idx, 0, sizeof(kf->image_idx));
+    kf->has_image = 0;
+
+    SligCellSet sets[SLIG_NUM_LEVELS][SLIG_NUM_CHANNELS];
+    uint32_t total = decompose_image_pyramid(input, sets);
+    if (total == 0) return;
+
+    for (int lvl = 0; lvl < SLIG_NUM_LEVELS; lvl++) {
+        for (int ch = 0; ch < SLIG_NUM_CHANNELS; ch++) {
+            kf->image_idx[lvl][ch] =
+                slig_codebook_add_or_lookup(&ai->codebook, &sets[lvl][ch],
+                                            SLIG_CODEBOOK_DEFAULT_THRESHOLD);
+        }
+    }
+    kf->has_image = 1;
+}
+
 uint32_t ai_store_grid(SpatialAI* ai, const SpatialGrid* input, const char* label) {
     if (!ai || !input) return UINT32_MAX;
     if (!ensure_kf_capacity(ai)) return UINT32_MAX;
@@ -630,145 +795,164 @@ uint32_t ai_store_grid(SpatialAI* ai, const SpatialGrid* input, const char* labe
      * resulting SligCellSet in the engine codebook. The keyframe
      * stores only the byte-sized index — repeated textures across
      * keyframes converge onto a single pattern. */
-    memset(kf->image_idx, 0, sizeof(kf->image_idx));
-    kf->has_image = 0;
-
-    uint8_t *plane_y_full  = (uint8_t*)malloc(GRID_TOTAL);
-    uint8_t *plane_cb_full = (uint8_t*)malloc(GRID_TOTAL);
-    uint8_t *plane_cr_full = (uint8_t*)malloc(GRID_TOTAL);
-    /* Scratch for downsampled scales: max needed = 128² = 16384 B. */
-    uint8_t *scratch       = (uint8_t*)malloc(GRID_TOTAL);
-    if (plane_y_full && plane_cb_full && plane_cr_full && scratch) {
-        uint32_t active = 0;
-        for (uint32_t i = 0; i < GRID_TOTAL; i++) {
-            int32_t R = input->R[i];
-            int32_t G = input->G[i];
-            int32_t B = input->B[i];
-            int32_t Y  = ( 9798 * R + 19235 * G +  3735 * B + 16384) >> 15;
-            int32_t Cb = (-5537 * R - 10846 * G + 16384 * B + 16384) >> 15;
-            int32_t Cr = (16384 * R - 13720 * G -  2664 * B + 16384) >> 15;
-            Cb += 128; Cr += 128;
-            if (Y  < 0) Y  = 0; else if (Y  > 255) Y  = 255;
-            if (Cb < 0) Cb = 0; else if (Cb > 255) Cb = 255;
-            if (Cr < 0) Cr = 0; else if (Cr > 255) Cr = 255;
-            plane_y_full [i] = (uint8_t)Y;
-            plane_cb_full[i] = (uint8_t)Cb;
-            plane_cr_full[i] = (uint8_t)Cr;
-            if (R || G || B) active++;
-        }
-
-        if (active > 0) {
-            uint8_t *full_planes[SLIG_NUM_CHANNELS] = {
-                plane_y_full, plane_cb_full, plane_cr_full
-            };
-            uint8_t channels[SLIG_NUM_CHANNELS] = {
-                SLIG_CH_Y, SLIG_CH_CB, SLIG_CH_CR
-            };
-            uint32_t budgets[SLIG_NUM_CHANNELS] = {
-                SLIG_CELL_BUDGET_Y, SLIG_CELL_BUDGET_CB, SLIG_CELL_BUDGET_CR
-            };
-
-            /* Residual pyramid encode (per-channel chain):
-             *   coarse = decompose(downsample(full, 32))
-             *   recon32 = reconstruct(coarse, 32)
-             *   up128   = upsample(recon32, 128)
-             *   mid     = decompose(downsample(full, 128) − up128 + 128)
-             *   recon_mid_128 = reconstruct(mid, 128) − 128
-             *   pred128 = clamp(up128 + recon_mid_128, 0, 255)
-             *   up256   = upsample(pred128, 256)
-             *   fine    = decompose(full − up256 + 128)
-             * Each set goes into the codebook; the keyframe carries
-             * only the 9 indices. The mid/fine sets store *residuals*
-             * shifted to uint8 (offset 128), so reconstruction must
-             * undo the shift before adding back. */
-            int dim_c = slig_scale_dim(SLIG_LEVEL_COARSE);   /* 32  */
-            int dim_m = slig_scale_dim(SLIG_LEVEL_MID);      /* 128 */
-            int dim_f = slig_scale_dim(SLIG_LEVEL_FINE);     /* 256 */
-            uint8_t *plane_32   = (uint8_t*)malloc((size_t)dim_c * dim_c);
-            uint8_t *plane_128  = (uint8_t*)malloc((size_t)dim_m * dim_m);
-            uint8_t *recon_32   = (uint8_t*)malloc((size_t)dim_c * dim_c);
-            uint8_t *up_128     = (uint8_t*)malloc((size_t)dim_m * dim_m);
-            uint8_t *res_128    = (uint8_t*)malloc((size_t)dim_m * dim_m);
-            uint8_t *recon_mid  = (uint8_t*)malloc((size_t)dim_m * dim_m);
-            uint8_t *pred_128   = (uint8_t*)malloc((size_t)dim_m * dim_m);
-            uint8_t *up_256     = (uint8_t*)malloc((size_t)dim_f * dim_f);
-            uint8_t *res_256    = (uint8_t*)malloc((size_t)dim_f * dim_f);
-            int alloc_ok = plane_32 && plane_128 && recon_32 && up_128 &&
-                           res_128 && recon_mid && pred_128 && up_256 && res_256;
-
-            uint32_t total = 0;
-            SligCellSet probe;
-            if (alloc_ok) {
-                for (int ch = 0; ch < SLIG_NUM_CHANNELS; ch++) {
-                    const uint8_t *full = full_planes[ch];
-
-                    /* Level 0 — coarse base */
-                    slig_image_downsample(plane_32, dim_c, full, dim_f);
-                    slig_decompose_channel(&probe, plane_32, dim_c, dim_c,
-                                           channels[ch], SLIG_LEVEL_COARSE,
-                                           budgets[ch]);
-                    kf->image_idx[SLIG_LEVEL_COARSE][ch] =
-                        slig_codebook_add_or_lookup(&ai->codebook, &probe,
-                                                    SLIG_CODEBOOK_DEFAULT_THRESHOLD);
-                    total += probe.num_cells;
-
-                    /* Reconstruct → upsample → mid residual input */
-                    slig_reconstruct_at_dim(recon_32, dim_c, &probe);
-                    slig_image_upsample(up_128, dim_m, recon_32, dim_c);
-                    slig_image_downsample(plane_128, dim_m, full, dim_f);
-                    int n_m = dim_m * dim_m;
-                    for (int i = 0; i < n_m; i++) {
-                        int v = (int)plane_128[i] - (int)up_128[i] + 128;
-                        if (v < 0) v = 0; else if (v > 255) v = 255;
-                        res_128[i] = (uint8_t)v;
-                    }
-
-                    /* Level 1 — mid residual */
-                    slig_decompose_channel(&probe, res_128, dim_m, dim_m,
-                                           channels[ch], SLIG_LEVEL_MID,
-                                           budgets[ch]);
-                    kf->image_idx[SLIG_LEVEL_MID][ch] =
-                        slig_codebook_add_or_lookup(&ai->codebook, &probe,
-                                                    SLIG_CODEBOOK_DEFAULT_THRESHOLD);
-                    total += probe.num_cells;
-
-                    /* Predict 128, upsample to 256, compute fine residual */
-                    slig_reconstruct_at_dim(recon_mid, dim_m, &probe);
-                    for (int i = 0; i < n_m; i++) {
-                        int v = (int)up_128[i] + (int)recon_mid[i] - 128;
-                        if (v < 0) v = 0; else if (v > 255) v = 255;
-                        pred_128[i] = (uint8_t)v;
-                    }
-                    slig_image_upsample(up_256, dim_f, pred_128, dim_m);
-                    int n_f = dim_f * dim_f;
-                    for (int i = 0; i < n_f; i++) {
-                        int v = (int)full[i] - (int)up_256[i] + 128;
-                        if (v < 0) v = 0; else if (v > 255) v = 255;
-                        res_256[i] = (uint8_t)v;
-                    }
-
-                    /* Level 2 — fine residual */
-                    slig_decompose_channel(&probe, res_256, dim_f, dim_f,
-                                           channels[ch], SLIG_LEVEL_FINE,
-                                           budgets[ch]);
-                    kf->image_idx[SLIG_LEVEL_FINE][ch] =
-                        slig_codebook_add_or_lookup(&ai->codebook, &probe,
-                                                    SLIG_CODEBOOK_DEFAULT_THRESHOLD);
-                    total += probe.num_cells;
-                }
-            }
-            kf->has_image = (total > 0) ? 1 : 0;
-            free(plane_32);  free(plane_128); free(recon_32);
-            free(up_128);    free(res_128);   free(recon_mid);
-            free(pred_128);  free(up_256);    free(res_256);
-        }
-    }
-    free(plane_y_full); free(plane_cb_full); free(plane_cr_full); free(scratch);
+    decompose_image_into_keyframe(ai, kf, input);
 
     ai->kf_count++;
     bucket_index_add(&ai->bucket_idx, input, new_id);
     ema_update(ai, input);
     return new_id;
+}
+
+uint32_t ai_store_auto_with_image(SpatialAI* ai,
+                                  const char* clause_text,
+                                  const SpatialGrid* image_grid,
+                                  const char* label) {
+    if (!ai || !clause_text || !image_grid) return UINT32_MAX;
+
+    SpatialGrid* input = grid_create();
+    if (!input) return UINT32_MAX;
+
+    layers_encode_clause(clause_text, NULL, input);
+    update_rgb_directional(input);
+    apply_ema_to_grid(ai, input);
+
+    uint32_t topic = resolve_topic(clause_text, label);
+
+    /* First-keyframe shortcut */
+    if (ai->kf_count == 0) {
+        if (!ensure_kf_capacity(ai)) { grid_destroy(input); return UINT32_MAX; }
+
+        Keyframe* kf = &ai->keyframes[0];
+        kf->id = 0;
+        if (label) strncpy(kf->label, label, 63);
+        kf->label[63] = '\0';
+        kf->text_byte_count = (uint32_t)strlen(clause_text);
+        kf->topic_hash      = topic;
+        kf->seq_in_topic    = topic ? 1 : 0;
+        keyframe_alloc_grid(kf, input);
+        decompose_image_into_keyframe(ai, kf, image_grid);
+
+        ai->kf_count = 1;
+        bucket_index_add(&ai->bucket_idx, input, 0);
+        ema_update(ai, input);
+        grid_destroy(input);
+        return 0;
+    }
+
+    /* Match against existing keyframes (mirrors ai_store_auto). */
+    float    best_sim = 0.0f;
+    uint32_t best_id  = UINT32_MAX;
+    uint32_t bucket_best = topic_bucket_best_match(ai, input, topic, &best_sim);
+    if (bucket_best != UINT32_MAX) best_id = bucket_best;
+
+    if (best_sim < g_store_threshold) {
+        MatchContext ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.bucket_idx = &ai->bucket_idx;
+        MatchResult mr = spatial_match(ai, input, MATCH_SEARCH, &ctx);
+        if (mr.best_score > best_sim) {
+            best_sim = mr.best_score;
+            best_id  = mr.best_id;
+        }
+    }
+
+    if (best_sim >= g_store_threshold && best_id < ai->kf_count) {
+        /* Delta path */
+        if (!ensure_df_capacity(ai)) { grid_destroy(input); return UINT32_MAX; }
+
+        DeltaEntry* entries = (DeltaEntry*)malloc(GRID_TOTAL * sizeof(DeltaEntry));
+        if (!entries) { grid_destroy(input); return UINT32_MAX; }
+
+        uint32_t delta_count = compute_delta(&ai->keyframes[best_id].grid, input,
+                                             entries, GRID_TOTAL);
+
+        DeltaFrame* df = &ai->deltas[ai->df_count];
+        df->id = ai->df_count;
+        df->parent_id = best_id;
+        if (label) strncpy(df->label, label, 63);
+        df->label[63] = '\0';
+        df->count = delta_count;
+        if (delta_count > 0) {
+            DeltaEntry* shrunk = (DeltaEntry*)realloc(entries,
+                                   delta_count * sizeof(DeltaEntry));
+            df->entries = shrunk ? shrunk : entries;
+        } else {
+            free(entries);
+            df->entries = NULL;
+        }
+        uint32_t active = grid_active_count(input);
+        df->change_ratio = active ? (float)delta_count / (float)active : 0.0f;
+
+        /* Mat-S3: cell_deltas vs parent's FINE-Y cells. */
+        memset(df->cell_deltas, 0, sizeof(df->cell_deltas));
+        df->cell_delta_count = 0;
+        Keyframe* parent = &ai->keyframes[best_id];
+        if (parent->has_image) {
+            SligCellSet sets[SLIG_NUM_LEVELS][SLIG_NUM_CHANNELS];
+            if (decompose_image_pyramid(image_grid, sets) > 0) {
+                const SligCellSet* parent_set = slig_codebook_get(
+                    &ai->codebook,
+                    parent->image_idx[SLIG_LEVEL_FINE][SLIG_CH_Y]);
+                const SligCellSet* probe_set = &sets[SLIG_LEVEL_FINE][SLIG_CH_Y];
+                if (parent_set) {
+                    uint32_t n = parent_set->num_cells < probe_set->num_cells
+                               ? parent_set->num_cells : probe_set->num_cells;
+                    if (n > SLIG_MAX_CELLS) n = SLIG_MAX_CELLS;
+                    for (uint32_t i = 0; i < n; i++) {
+                        ce_delta(&df->cell_deltas[i],
+                                 &parent_set->cells[i],
+                                 &probe_set->cells[i]);
+                    }
+                    df->cell_delta_count = n;
+                }
+            }
+        }
+
+        /* Adaptive feedback: good structural match → boost the channel
+         * that most contributed. */
+        {
+            SpatialGrid* parent_grid = &ai->keyframes[best_id].grid;
+            float sA = channel_sim_A(input, parent_grid);
+            float sR = channel_sim_R(input, parent_grid);
+            float sG = channel_sim_G(input, parent_grid);
+            float sB = channel_sim_B(input, parent_grid);
+            weight_update(&ai->global_weights, sA, sR, sG, sB);
+        }
+
+        ai->df_count++;
+        ema_update(ai, input);
+        grid_destroy(input);
+        return df->id | 0x80000000u;
+    } else {
+        /* New keyframe — ingest text grid + image. */
+        if (!ensure_kf_capacity(ai)) { grid_destroy(input); return UINT32_MAX; }
+
+        uint32_t new_id = ai->kf_count;
+        Keyframe* kf = &ai->keyframes[new_id];
+        kf->id = new_id;
+        if (label) strncpy(kf->label, label, 63);
+        kf->label[63] = '\0';
+        kf->text_byte_count = (uint32_t)strlen(clause_text);
+        kf->topic_hash      = topic;
+        kf->seq_in_topic    = next_seq_in_topic(ai, topic);
+        keyframe_alloc_grid(kf, input);
+        decompose_image_into_keyframe(ai, kf, image_grid);
+
+        if (best_id < ai->kf_count - 1) {
+            SpatialGrid* nearest = &ai->keyframes[best_id].grid;
+            float sA = 1.0f - channel_sim_A(input, nearest);
+            float sR = 1.0f - channel_sim_R(input, nearest);
+            float sG = 1.0f - channel_sim_G(input, nearest);
+            float sB = 1.0f - channel_sim_B(input, nearest);
+            weight_update(&ai->global_weights, sA, sR, sG, sB);
+        }
+
+        ai->kf_count++;
+        bucket_index_add(&ai->bucket_idx, input, new_id);
+        ema_update(ai, input);
+        grid_destroy(input);
+        return new_id;
+    }
 }
 
 uint32_t ai_predict(SpatialAI* ai, const char* input_text, float* out_similarity) {
