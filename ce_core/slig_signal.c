@@ -5,6 +5,7 @@
  */
 
 #include "slig_signal.h"
+#include "slig_material_harmonic.h"   /* SligMaterialTick + auto-analyzer */
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -276,6 +277,24 @@ void slig_decompose_channel(SligCellSet *out,
      * 0 = default canvas dim (no resample); else literal source_dim. */
     uint8_t source_dim_tag = (uint8_t)((dim < SLIG_CANVAS_DIM) ? dim : 0);
 
+    /* Mat-2: auto-extract material parameters from the centre 8×8 block
+     * of the input image once. Each Y-channel cell receives a copy via
+     * slig_mat_to_cell (after slig_pack), so downstream renderers can
+     * read texture descriptors without re-analysing the image. Skipped
+     * on Cb/Cr — chroma cells need dec.A intact for marker dispatch. */
+    SligMaterialTick mat_tick;
+    int have_mat = 0;
+    if (channel == SLIG_CH_Y && dim >= 8) {
+        int bx = dim / 2 - 4;
+        int by = dim / 2 - 4;
+        if (bx < 0)            bx = 0;
+        if (by < 0)            by = 0;
+        if (bx + 8 > dim)      bx = dim - 8;
+        if (by + 8 > dim)      by = dim - 8;
+        slig_mat_analyze_block(&mat_tick, &image[by * dim + bx], dim);
+        have_mat = 1;
+    }
+
     /* float 변환 + 중앙값 빼기 */
     float *mat = (float*)malloc(dim * dim * sizeof(float));
     float mean = 0;
@@ -322,6 +341,7 @@ void slig_decompose_channel(SligCellSet *out,
 
         /* CE Cell에 싸기 */
         slig_pack(&out->cells[out->num_cells], &sig);
+        if (have_mat) slig_mat_to_cell(&out->cells[out->num_cells], &mat_tick);
         out->num_cells++;
     }
 
@@ -358,6 +378,7 @@ void slig_decompose_channel(SligCellSet *out,
             sig.v[i] = (int16_t)(v_f[i] * 10000.0f);
         }
         slig_pack(&out->cells[out->num_cells], &sig);
+        if (have_mat) slig_mat_to_cell(&out->cells[out->num_cells], &mat_tick);
         out->num_cells++;
     }
 
@@ -398,6 +419,7 @@ void slig_decompose_channel(SligCellSet *out,
             sig.v[i] = (int16_t)(v_f[i] * 10000.0f);
         }
         slig_pack(&out->cells[out->num_cells], &sig);
+        if (have_mat) slig_mat_to_cell(&out->cells[out->num_cells], &mat_tick);
         out->num_cells++;
     }
     free(up_mat);
@@ -441,6 +463,7 @@ void slig_decompose_channel(SligCellSet *out,
             sig.v[i] = (int16_t)(v_f[i] * 10000.0f);
         }
         slig_pack(&out->cells[out->num_cells], &sig);
+        if (have_mat) slig_mat_to_cell(&out->cells[out->num_cells], &mat_tick);
         out->num_cells++;
     }
     free(zig_mat);
@@ -469,6 +492,7 @@ void slig_decompose_channel(SligCellSet *out,
         /* u/v는 방사형이라 DCT 불필요, 메타데이터로 충분 */
         sig.u[0] = (int16_t)(mean * 10000);
         slig_pack(&out->cells[out->num_cells], &sig);
+        if (have_mat) slig_mat_to_cell(&out->cells[out->num_cells], &mat_tick);
         out->num_cells++;
     }
 
@@ -800,11 +824,19 @@ void slig_spectrum_weight(uint8_t *out_weights, int num_cells,
         slig_unpack(&sig, &cells[i]);
 
         uint32_t overlap = 0;
-        for (int b = 0; b < 4; b++) {
-            uint8_t bin = sig.audio_bins[b];
-            uint8_t amp = sig.audio_amps[b];
-            if (amp > 0)
-                overlap += spectrum[bin] * (uint32_t)amp;
+        /* Mat-3: cells whose dec.A holds an auto-extracted material
+         * descriptor (HAS_MATERIAL flag) keep their audio_bins/amps
+         * fields unmaintained — interpreting those bytes as audio
+         * indices would produce arbitrary spectrum lookups. Skip the
+         * audio overlap and let the dir-based fallback supply weight. */
+        int has_mat = (sig.flags & SLIG_FLAG_HAS_MATERIAL) ? 1 : 0;
+        if (!has_mat) {
+            for (int b = 0; b < 4; b++) {
+                uint8_t bin = sig.audio_bins[b];
+                uint8_t amp = sig.audio_amps[b];
+                if (amp > 0)
+                    overlap += spectrum[bin] * (uint32_t)amp;
+            }
         }
         /* 전역 신호는 기본 가중치 */
         if (sig.dir < SLIG_DIR_RIPPLE && overlap == 0)

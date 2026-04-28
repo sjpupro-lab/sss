@@ -40,13 +40,14 @@ CE_CORE_SRCS = $(CE_CORE_DIR)/ce_core.c \
                $(CE_CORE_DIR)/slig_signal.c \
                $(CE_CORE_DIR)/slig_codebook.c \
                $(CE_CORE_DIR)/slig_pipeline.c \
-               $(CE_CORE_DIR)/slig_tick_math.c
+               $(CE_CORE_DIR)/slig_tick_math.c \
+               $(CE_CORE_DIR)/slig_material_harmonic.c
 
 CE_CORE_OBJS = $(patsubst $(CE_CORE_DIR)/%.c,$(BUILD_DIR)/ce_core_%.o,$(CE_CORE_SRCS))
 
 OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS)) $(CE_CORE_OBJS)
 
-TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_recluster test_refine test_image_roundtrip test_image_gen test_tick_math
+TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_recluster test_refine test_image_roundtrip test_image_gen test_tick_math test_material
 
 .PHONY: all clean test gpu_train_help probe_task_a bench_context bench_refine image_tools
 
@@ -130,6 +131,9 @@ $(BUILD_DIR)/test_image_gen: $(TEST_DIR)/test_image_gen.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/test_tick_math: $(TEST_DIR)/test_tick_math.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_material: $(TEST_DIR)/test_material.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/bench_v3: tools/bench_v3.c $(OBJS) | $(BUILD_DIR)
