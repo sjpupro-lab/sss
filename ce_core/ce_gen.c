@@ -96,11 +96,16 @@ void ce_generate_image(
 }
 
 /* Build a single CEImageLink64 whose 256x256 target is the 8x8-tiled decode
- * of one CEStorage entry's keyframe + delta (so the whole image plane is
- * reconstructed from the retrieved entry, not from a single block). The
- * 64x64 semantic plane is left zeroed — it is reserved for future
- * morpheme/canvas embedding cross-talk and not exercised by the wave loop
- * itself, which only consumes `target` and `score`. */
+ * of one CEStorage entry's keyframe. The 64x64 semantic plane is left
+ * zeroed — it is reserved for future morpheme/canvas embedding cross-talk
+ * and not exercised by the wave loop itself, which only consumes `target`
+ * and `score`.
+ *
+ * Decoding only `e->keyframe` (not `keyframe + delta`) is intentional:
+ * ce_storage_ingest_rgba and ce_ingest_file both compute `delta` against
+ * the *previous* block in raster order, so `e->keyframe + e->delta`
+ * combines two unrelated blocks and yields a meaningless target. The
+ * keyframe alone holds the per-block colour the wave-refine path wants. */
 static void link_from_entry(CEImageLink64 *link,
                             const CEStorageEntry *e,
                             float score) {
@@ -108,13 +113,8 @@ static void link_from_entry(CEImageLink64 *link,
     link->score = score;
     memset(link->semantic, 0, sizeof(link->semantic));
 
-    /* Apply the entry's delta on top of its keyframe before decoding so the
-     * stored signal is round-trippable. */
-    CEUnit recon;
-    ce_apply(&recon, &e->keyframe, &e->delta);
-
     uint8_t block[CE_BLOCK * CE_BLOCK * 4];
-    ce_decode_image_block(block, &recon);
+    ce_decode_image_block(block, &e->keyframe);
 
     /* Tile the single 8x8 reconstruction across the 256x256 target plane.
      * The wave-refine loop blends the top-k targets into the canvas, so

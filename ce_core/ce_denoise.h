@@ -41,7 +41,8 @@ typedef struct {
 CEGenConfig ce_gen_config_default(void);
 
 /* High-quality preset: 50 steps, larger conv radius, stronger attention.
- * Used by ce_image_generate's quality path. */
+ * ce_generate_image_typed picks this up automatically when called with
+ * config == NULL. */
 CEGenConfig ce_gen_config_hq(void);
 
 /* Step 14 — full denoising loop. `prompt_cells` may be NULL with

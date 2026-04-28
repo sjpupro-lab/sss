@@ -580,10 +580,16 @@ static void apply_global(SligCanvas *c, const SligSignal *sig) {
      * components contribute proportionally less, matching what the
      * decomposer actually saw.
      *
-     * Backward compat: amp[2] == 0 is treated as "unmeasured" and
-     * leaves the original sigma-only amplitude unchanged (legacy .spai
-     * files trained before this field was populated). */
-    if (sig->audio_amps[2] != 0) {
+     * Backward compat: a cell is treated as "unmeasured" only when
+     * BOTH audio_amps[2] == 0 AND cond_threshold == 0. The decomposer
+     * always sets these two together (cumulative coverage and per-
+     * component ratio), so a measured component with a tiny ratio that
+     * quantises to amp[2]==0 will still have a non-zero cond_threshold
+     * (cumulative coverage ≥ 1) and correctly scale amp to 0. Pre-
+     * change .spai files have both fields zeroed and keep the legacy
+     * sigma-only amplitude. */
+    int measured = (sig->audio_amps[2] != 0) || (sig->cond_threshold != 0);
+    if (measured) {
         amp = (int32_t)(((int64_t)amp * (int32_t)sig->audio_amps[2]) / 255);
     }
 
