@@ -97,6 +97,18 @@ static SpaiStatus write_delta_record(FILE* fp, const DeltaFrame* df) {
         if (fwrite(&e->diff_G, sizeof(int8_t),   1, fp) != 1) return SPAI_ERR_WRITE;
         if (fwrite(&e->diff_B, sizeof(int8_t),   1, fp) != 1) return SPAI_ERR_WRITE;
     }
+
+    /* v6: cell_delta_count (u32) + CEUnit × cell_delta_count.
+     * count = 0 means "no image deltas" (e.g. parent has no image).
+     * v5 readers stop after the diff entries; the trailing bytes
+     * are ignored when re-loading via an old binary. */
+    uint32_t cdc = df->cell_delta_count;
+    if (cdc > SLIG_MAX_CELLS) cdc = SLIG_MAX_CELLS;
+    if (fwrite(&cdc, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+    if (cdc > 0 &&
+        fwrite(df->cell_deltas, sizeof(CEUnit), cdc, fp) != cdc) {
+        return SPAI_ERR_WRITE;
+    }
     return SPAI_OK;
 }
 
@@ -167,6 +179,19 @@ static SpaiStatus read_delta_body(FILE* fp, uint32_t version, DeltaFrame* df) {
             } else {
                 e->diff_B = 0;
             }
+        }
+    }
+
+    /* v6: trailing cell_delta_count + CEUnit × N. v5 files stop here;
+     * df was memset to 0 at entry so cell_delta_count stays 0. */
+    if (version >= 6) {
+        uint32_t cdc = 0;
+        if (fread(&cdc, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+        if (cdc > SLIG_MAX_CELLS) return SPAI_ERR_CORRUPT;
+        df->cell_delta_count = cdc;
+        if (cdc > 0 &&
+            fread(df->cell_deltas, sizeof(CEUnit), cdc, fp) != cdc) {
+            return SPAI_ERR_READ;
         }
     }
     return SPAI_OK;

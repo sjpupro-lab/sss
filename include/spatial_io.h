@@ -44,7 +44,7 @@
  */
 
 #define SPAI_MAGIC    "SPAI"
-#define SPAI_VERSION  5u       /* v5 adds Keyframe.topic_hash + seq_in_topic (v3/v4 kept readable) */
+#define SPAI_VERSION  6u       /* v6 adds DeltaFrame.cell_deltas (Mat-S3); v5 readable. */
 
 #define SPAI_TAG_KEYFRAME    0x01
 #define SPAI_TAG_DELTA       0x02

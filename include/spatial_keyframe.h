@@ -72,6 +72,19 @@ typedef struct {
     uint32_t     count;
     DeltaEntry*  entries;
     float        change_ratio;
+
+    /* Mat-S3: per-keyframe-delta CE Cell deltas — text-image co-class.
+     * When a clause is similar enough to land in this delta (text grid
+     * delta path) AND the parent keyframe has has_image=1, we ALSO
+     * compute ce_delta(parent_cell, this_cell) for up to N cells and
+     * store them here. The parent's image_y[FINE].cells are the anchor.
+     * On retrieval, ce_apply(parent_cell, cell_deltas[i]) recovers
+     * the variant's cell exactly (mod 256).
+     *
+     * Total inline: 32 × 64 B = 2 KB per delta when populated. Skipped
+     * (cell_delta_count = 0) when the parent has no image. */
+    CEUnit       cell_deltas[SLIG_MAX_CELLS];
+    uint32_t     cell_delta_count;
 } DeltaFrame;
 
 /* Main AI engine structure.

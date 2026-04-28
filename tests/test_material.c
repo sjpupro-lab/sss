@@ -3,8 +3,12 @@
 #include "slig_material_harmonic.h"
 #include "slig_signal.h"
 #include "ce_core.h"
+#include "spatial_keyframe.h"  /* SpatialAI + DeltaFrame.cell_deltas */
+#include "spatial_io.h"        /* ai_save / ai_load (.spai v6) */
+#include "spatial_grid.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 static int pass = 0, fail = 0;
 static void check(const char *name, int cond) {
@@ -157,6 +161,118 @@ int main(void) {
               cb_with_mat == 0);
         check("Cr cells skip material",
               cr_with_mat == 0);
+    }
+
+    /* Mat-S3: cell_delta roundtrip — ce_delta(parent, current) packed
+     * into DeltaFrame.cell_deltas[], save → load via .spai v6, verify
+     * ce_apply(parent, delta) reconstructs current exactly. */
+    {
+        SpatialAI *ai = spatial_ai_create();
+        if (!ai) {
+            check("spatial_ai_create (Mat-S3)", 0);
+        } else {
+            /* Build two fixture grids and ingest as keyframe + delta. */
+            SpatialGrid *g_parent = grid_create();
+            SpatialGrid *g_child  = grid_create();
+            if (g_parent && g_child) {
+                /* Parent: gradient. Child: gradient + slight perturb so
+                 * the text grid match still falls within the delta
+                 * threshold but the image cells are detectably different. */
+                for (uint32_t i = 0; i < GRID_TOTAL; i++) {
+                    g_parent->A[i] = (uint16_t)((i & 0xFF));
+                    g_parent->R[i] = (uint8_t) ((i >> 4) & 0xFF);
+                    g_parent->G[i] = (uint8_t) ( i       & 0xFF);
+                    g_parent->B[i] = (uint8_t) ((i >> 2) & 0xFF);
+                    g_child->A[i]  = (uint16_t)((i & 0xFF) + 5);
+                    g_child->R[i]  = (uint8_t) ((i >> 4) & 0xFE);
+                    g_child->G[i]  = (uint8_t) ( i       & 0xFE);
+                    g_child->B[i]  = (uint8_t) ((i >> 2) & 0xFE);
+                }
+                uint32_t kf_id = ai_store_grid(ai, g_parent, "parent");
+                check("Mat-S3 parent stored", kf_id != UINT32_MAX);
+
+                /* Synthetic delta — mirror the parent's CE Cells with a
+                 * known perturbation so we can verify ce_apply roundtrip
+                 * after save/load. Make sure the engine has a delta. */
+                if (ai->df_count == 0 && ai->kf_count > 0 &&
+                    ai->keyframes[kf_id].has_image) {
+                    /* Append a delta ourselves */
+                    if (ai->df_count >= ai->df_capacity) {
+                        uint32_t new_cap = ai->df_capacity * 2;
+                        DeltaFrame *new_df = (DeltaFrame*)realloc(
+                            ai->deltas, new_cap * sizeof(DeltaFrame));
+                        if (new_df) {
+                            memset(&new_df[ai->df_capacity], 0,
+                                   (new_cap - ai->df_capacity) * sizeof(DeltaFrame));
+                            ai->deltas = new_df;
+                            ai->df_capacity = new_cap;
+                        }
+                    }
+                    DeltaFrame *df = &ai->deltas[ai->df_count];
+                    memset(df, 0, sizeof(*df));
+                    df->id = ai->df_count;
+                    df->parent_id = kf_id;
+                    strncpy(df->label, "child-delta", 63);
+                    df->count = 0;
+                    df->entries = NULL;
+
+                    /* Take parent's FINE-Y cells as anchor, perturb
+                     * each by a known offset, store ce_delta(anchor,
+                     * perturbed). After load, ce_apply must recover
+                     * the perturbed cells. */
+                    const SligCellSet *anchor = slig_codebook_get(
+                        &ai->codebook,
+                        ai->keyframes[kf_id].image_idx[SLIG_LEVEL_FINE][SLIG_CH_Y]);
+                    if (anchor && anchor->num_cells > 0) {
+                        CEUnit perturbed[4];
+                        uint32_t n = anchor->num_cells < 4 ? anchor->num_cells : 4;
+                        for (uint32_t i = 0; i < n; i++) {
+                            perturbed[i] = anchor->cells[i];
+                            ce_bytes(&perturbed[i])[0]
+                                = (uint8_t)(ce_cbytes(&anchor->cells[i])[0] + 7);
+                            ce_delta(&df->cell_deltas[i],
+                                     &anchor->cells[i],
+                                     &perturbed[i]);
+                        }
+                        df->cell_delta_count = n;
+                        ai->df_count++;
+
+                        /* Roundtrip via .spai v6 */
+                        SpaiStatus s = ai_save(ai, "/tmp/mat_s3.spai");
+                        check("Mat-S3 ai_save (v6)", s == SPAI_OK);
+                        SpaiStatus ls;
+                        SpatialAI *loaded = ai_load("/tmp/mat_s3.spai", &ls);
+                        check("Mat-S3 ai_load",
+                              loaded != NULL && ls == SPAI_OK);
+                        if (loaded) {
+                            check("Mat-S3 df_count survives",
+                                  loaded->df_count == 1);
+                            if (loaded->df_count == 1) {
+                                DeltaFrame *ldf = &loaded->deltas[0];
+                                check("Mat-S3 cell_delta_count survives",
+                                      ldf->cell_delta_count == n);
+
+                                /* Verify ce_apply recovers perturbed */
+                                int recovered = 1;
+                                for (uint32_t i = 0; i < n; i++) {
+                                    CEUnit r;
+                                    ce_apply(&r, &anchor->cells[i],
+                                             &ldf->cell_deltas[i]);
+                                    if (ce_distance(&r, &perturbed[i]) != 0)
+                                        recovered = 0;
+                                }
+                                check("Mat-S3 ce_apply recovers perturbed",
+                                      recovered);
+                            }
+                            spatial_ai_destroy(loaded);
+                        }
+                    }
+                }
+                grid_destroy(g_parent);
+                grid_destroy(g_child);
+            }
+            spatial_ai_destroy(ai);
+        }
     }
 
     printf("=== %d PASS / %d FAIL ===\n", pass, fail);
