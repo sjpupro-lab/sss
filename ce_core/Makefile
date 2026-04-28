@@ -7,7 +7,8 @@ LDFLAGS = -lm
 SRCS = ce_core.c ce_storage.c ce_search.c ce_engine.c \
        ce_denoise.c ce_decode.c ce_extend.c ce_gen.c \
        ce_storage_io.c ce_feed_image.c ce_image_wave_refine.c \
-       slig_signal.c slig_material_harmonic.c
+       slig_signal.c slig_material_harmonic.c \
+       slig_pipeline.c slig_codebook.c slig_tick_math.c
 
 # Ingest unit pulls in stb_image.h (vendored, public domain). We compile
 # it with reduced warnings — stb_image is third-party and contains many
@@ -32,7 +33,8 @@ TEST_BINS = $(BUILD_DIR)/test_core \
             $(BUILD_DIR)/test_image_wave_refine \
             $(BUILD_DIR)/test_slig_signal \
             $(BUILD_DIR)/test_pipeline \
-            $(BUILD_DIR)/test_stress_10k
+            $(BUILD_DIR)/test_stress_10k \
+            $(BUILD_DIR)/test_slig_energy
 
 TOOL_BINS = $(BUILD_DIR)/ce_ingest
 
@@ -87,6 +89,9 @@ $(BUILD_DIR)/test_pipeline: tests/test_pipeline.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/test_stress_10k: tests/test_stress_10k.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_slig_energy: tests/test_slig_energy.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/ce_ingest: tools/ce_ingest.c $(OBJS) | $(BUILD_DIR)

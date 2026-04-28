@@ -573,6 +573,20 @@ static void apply_global(SligCanvas *c, const SligSignal *sig) {
     int32_t amp = (int32_t)sig->sigma;
     if (sig->flags & SLIG_FLAG_NEGATIVE) amp = -amp;
 
+    /* dec.A audio_amps[2] carries the per-component energy ratio that
+     * slig_decompose_structure measured at training time:
+     *   amp[2]/255  ==  sigma^2 / total_energy
+     * Scale the rendered magnitude by that ratio so low-energy SVD
+     * components contribute proportionally less, matching what the
+     * decomposer actually saw.
+     *
+     * Backward compat: amp[2] == 0 is treated as "unmeasured" and
+     * leaves the original sigma-only amplitude unchanged (legacy .spai
+     * files trained before this field was populated). */
+    if (sig->audio_amps[2] != 0) {
+        amp = (int32_t)(((int64_t)amp * (int32_t)sig->audio_amps[2]) / 255);
+    }
+
     /* Conditional gating (cond_type=1, brightness): only contribute
      * where the canvas already has |value| ≥ cond_threshold scaled
      * into canvas units. Threshold byte 0..255 maps to canvas
