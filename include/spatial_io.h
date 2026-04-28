@@ -46,13 +46,23 @@
 #define SPAI_MAGIC    "SPAI"
 #define SPAI_VERSION  5u       /* v5 adds Keyframe.topic_hash + seq_in_topic (v3/v4 kept readable) */
 
-#define SPAI_TAG_KEYFRAME  0x01
-#define SPAI_TAG_DELTA     0x02
-#define SPAI_TAG_WEIGHTS   0x03   /* ChannelWeight block: 4 × float */
-#define SPAI_TAG_CANVAS    0x04   /* One SpatialCanvas (v3) */
-#define SPAI_TAG_SUBTITLE  0x05   /* SubtitleTrack (v3) */
-#define SPAI_TAG_EMA       0x06   /* SpatialAI EMA tables (v4+): 4 × GRID_TOTAL × float */
-#define SPAI_TAG_SEQMETA   0x07   /* v4 Task B: per-slot sequence_id + timestamp_us (optional trailing) */
+#define SPAI_TAG_KEYFRAME    0x01
+#define SPAI_TAG_DELTA       0x02
+#define SPAI_TAG_WEIGHTS     0x03   /* ChannelWeight block: 4 × float */
+#define SPAI_TAG_CANVAS      0x04   /* One SpatialCanvas (v3) */
+#define SPAI_TAG_SUBTITLE    0x05   /* SubtitleTrack (v3) */
+#define SPAI_TAG_EMA         0x06   /* SpatialAI EMA tables (v4+): 4 × GRID_TOTAL × float */
+#define SPAI_TAG_SEQMETA     0x07   /* v4 Task B: per-slot sequence_id + timestamp_us (optional trailing) */
+#define SPAI_TAG_IMAGE_CELLS   0x49 /* SLIG v2.2 legacy: per-(kf,channel,scale) inline cells.
+                                     * No longer written by v2.3+; loader skips with CORRUPT.
+                                     * Reserved so the tag value can't be reused by mistake. */
+#define SPAI_TAG_CODEBOOK      0x4A /* SLIG v2.3: engine-wide pattern dictionary ('J').
+                                     * Body: uint32 pattern_count
+                                     *       for each: uint8 channel, uint8 scale_level,
+                                     *                 uint16 reserved, uint32 num_cells,
+                                     *                 CEUnit × num_cells. */
+#define SPAI_TAG_IMAGE_INDICES 0x4B /* SLIG v2.3: per-keyframe codebook indices ('K').
+                                     * Body: uint32 kf_id, uint8 idx[SLIG_NUM_LEVELS][SLIG_NUM_CHANNELS]. */
 
 typedef enum {
     SPAI_OK = 0,

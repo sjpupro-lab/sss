@@ -2,6 +2,8 @@
 #define SPATIAL_MATCH_H
 
 #include "spatial_grid.h"
+#include "spatial_morpheme.h"   /* Morpheme, PartOfSpeech */
+#include "slig_signal.h"        /* CEUnit, SLIG_MAX_CELLS */
 #include <math.h>
 
 /* Directional RGB update parameters */
@@ -274,5 +276,41 @@ MatchResult spatial_match(SpatialAI* ai,
                           const SpatialGrid* input,
                           MatchMode mode,
                           const MatchContext* ctx);
+
+/* ── SLIG v2: morpheme-level matching ─────────────────────────
+ *
+ * A morpheme-by-morpheme decomposition of a clause that pulls the
+ * matched keyframe's image_cells out for downstream rendering. Each
+ * MorphemeMatch carries:
+ *
+ *   morpheme       — the analysed token (token + POS)
+ *   keyframe_id    — best keyframe with has_image == 1, or UINT32_MAX
+ *                    if no image-bearing keyframe matched
+ *   similarity     — A-only cosine of the morpheme's mini-grid against
+ *                    the matched keyframe (0..1)
+ *   cell_count     — count of valid CEUnits copied into cells[]
+ *   cells[]        — copy of the matched keyframe's image_cells
+ *   render_order   — POS-driven AR order: NOUN < ADJ < VERB < PARTICLE
+ *                    (smaller = earlier in slig_render_sequential)
+ *   render_weight  — 0..255 strength scaled from similarity; tuned
+ *                    further by slig_spectrum_weight in the v2 path
+ */
+typedef struct {
+    Morpheme morpheme;
+    uint32_t keyframe_id;     /* ai->keyframes[keyframe_id] holds the cells */
+    float    similarity;
+    uint8_t  render_order;
+    uint8_t  render_weight;
+} MorphemeMatch;
+
+/* Tokenise `clause` into morphemes, match each one against the engine,
+ * and fill `results` (capacity = max_results). Morphemes whose POS is
+ * pure-syntactic (PARTICLE, ENDING, PUNCT) get render_weight=0 so the
+ * sequential renderer can skip them; we still record them for shape /
+ * order analysis. Returns the number of MorphemeMatch entries written. */
+uint32_t ai_match_morphemes(SpatialAI* ai,
+                            const char*    clause,
+                            MorphemeMatch* results,
+                            uint32_t       max_results);
 
 #endif /* SPATIAL_MATCH_H */

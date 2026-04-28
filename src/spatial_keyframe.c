@@ -1,8 +1,11 @@
 #include "spatial_keyframe.h"
 #include "spatial_layers.h"
 #include "spatial_subtitle.h"   /* SpatialCanvasPool for ai_get_canvas_pool */
+#include "slig_signal.h"        /* SLIG v2: slig_decompose for image cells */
+#include "slig_codebook.h"      /* SLIG v2.3: codebook lookup */
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define INITIAL_CAPACITY 64
 #define SIMILARITY_THRESHOLD 0.3f
@@ -219,6 +222,10 @@ SpatialAI* spatial_ai_create(void) {
     memset(ai->ema_G,     0, sizeof(ai->ema_G));
     memset(ai->ema_B,     0, sizeof(ai->ema_B));
     memset(ai->ema_count, 0, sizeof(ai->ema_count));
+
+    /* SLIG v2.3: empty codebook. Populated lazily as ai_store_grid
+     * decomposes images and registers their pattern sets. */
+    slig_codebook_init(&ai->codebook);
 
     if (!ai->keyframes || !ai->deltas) {
         spatial_ai_destroy(ai);
@@ -616,6 +623,147 @@ uint32_t ai_store_grid(SpatialAI* ai, const SpatialGrid* input, const char* labe
     kf->topic_hash      = ai_resolve_topic(NULL, label);
     kf->seq_in_topic    = next_seq_in_topic(ai, kf->topic_hash);
     keyframe_alloc_grid(kf, input);
+
+    /* SLIG v2.3 (codebook): split RGB → YCbCr at native 256², build
+     * a 3-level image pyramid (32 / 128 / 256) for each plane,
+     * decompose each (level, channel) slot, then register the
+     * resulting SligCellSet in the engine codebook. The keyframe
+     * stores only the byte-sized index — repeated textures across
+     * keyframes converge onto a single pattern. */
+    memset(kf->image_idx, 0, sizeof(kf->image_idx));
+    kf->has_image = 0;
+
+    uint8_t *plane_y_full  = (uint8_t*)malloc(GRID_TOTAL);
+    uint8_t *plane_cb_full = (uint8_t*)malloc(GRID_TOTAL);
+    uint8_t *plane_cr_full = (uint8_t*)malloc(GRID_TOTAL);
+    /* Scratch for downsampled scales: max needed = 128² = 16384 B. */
+    uint8_t *scratch       = (uint8_t*)malloc(GRID_TOTAL);
+    if (plane_y_full && plane_cb_full && plane_cr_full && scratch) {
+        uint32_t active = 0;
+        for (uint32_t i = 0; i < GRID_TOTAL; i++) {
+            int32_t R = input->R[i];
+            int32_t G = input->G[i];
+            int32_t B = input->B[i];
+            int32_t Y  = ( 9798 * R + 19235 * G +  3735 * B + 16384) >> 15;
+            int32_t Cb = (-5537 * R - 10846 * G + 16384 * B + 16384) >> 15;
+            int32_t Cr = (16384 * R - 13720 * G -  2664 * B + 16384) >> 15;
+            Cb += 128; Cr += 128;
+            if (Y  < 0) Y  = 0; else if (Y  > 255) Y  = 255;
+            if (Cb < 0) Cb = 0; else if (Cb > 255) Cb = 255;
+            if (Cr < 0) Cr = 0; else if (Cr > 255) Cr = 255;
+            plane_y_full [i] = (uint8_t)Y;
+            plane_cb_full[i] = (uint8_t)Cb;
+            plane_cr_full[i] = (uint8_t)Cr;
+            if (R || G || B) active++;
+        }
+
+        if (active > 0) {
+            uint8_t *full_planes[SLIG_NUM_CHANNELS] = {
+                plane_y_full, plane_cb_full, plane_cr_full
+            };
+            uint8_t channels[SLIG_NUM_CHANNELS] = {
+                SLIG_CH_Y, SLIG_CH_CB, SLIG_CH_CR
+            };
+            uint32_t budgets[SLIG_NUM_CHANNELS] = {
+                SLIG_CELL_BUDGET_Y, SLIG_CELL_BUDGET_CB, SLIG_CELL_BUDGET_CR
+            };
+
+            /* Residual pyramid encode (per-channel chain):
+             *   coarse = decompose(downsample(full, 32))
+             *   recon32 = reconstruct(coarse, 32)
+             *   up128   = upsample(recon32, 128)
+             *   mid     = decompose(downsample(full, 128) − up128 + 128)
+             *   recon_mid_128 = reconstruct(mid, 128) − 128
+             *   pred128 = clamp(up128 + recon_mid_128, 0, 255)
+             *   up256   = upsample(pred128, 256)
+             *   fine    = decompose(full − up256 + 128)
+             * Each set goes into the codebook; the keyframe carries
+             * only the 9 indices. The mid/fine sets store *residuals*
+             * shifted to uint8 (offset 128), so reconstruction must
+             * undo the shift before adding back. */
+            int dim_c = slig_scale_dim(SLIG_LEVEL_COARSE);   /* 32  */
+            int dim_m = slig_scale_dim(SLIG_LEVEL_MID);      /* 128 */
+            int dim_f = slig_scale_dim(SLIG_LEVEL_FINE);     /* 256 */
+            uint8_t *plane_32   = (uint8_t*)malloc((size_t)dim_c * dim_c);
+            uint8_t *plane_128  = (uint8_t*)malloc((size_t)dim_m * dim_m);
+            uint8_t *recon_32   = (uint8_t*)malloc((size_t)dim_c * dim_c);
+            uint8_t *up_128     = (uint8_t*)malloc((size_t)dim_m * dim_m);
+            uint8_t *res_128    = (uint8_t*)malloc((size_t)dim_m * dim_m);
+            uint8_t *recon_mid  = (uint8_t*)malloc((size_t)dim_m * dim_m);
+            uint8_t *pred_128   = (uint8_t*)malloc((size_t)dim_m * dim_m);
+            uint8_t *up_256     = (uint8_t*)malloc((size_t)dim_f * dim_f);
+            uint8_t *res_256    = (uint8_t*)malloc((size_t)dim_f * dim_f);
+            int alloc_ok = plane_32 && plane_128 && recon_32 && up_128 &&
+                           res_128 && recon_mid && pred_128 && up_256 && res_256;
+
+            uint32_t total = 0;
+            SligCellSet probe;
+            if (alloc_ok) {
+                for (int ch = 0; ch < SLIG_NUM_CHANNELS; ch++) {
+                    const uint8_t *full = full_planes[ch];
+
+                    /* Level 0 — coarse base */
+                    slig_image_downsample(plane_32, dim_c, full, dim_f);
+                    slig_decompose_channel(&probe, plane_32, dim_c, dim_c,
+                                           channels[ch], SLIG_LEVEL_COARSE,
+                                           budgets[ch]);
+                    kf->image_idx[SLIG_LEVEL_COARSE][ch] =
+                        slig_codebook_add_or_lookup(&ai->codebook, &probe,
+                                                    SLIG_CODEBOOK_DEFAULT_THRESHOLD);
+                    total += probe.num_cells;
+
+                    /* Reconstruct → upsample → mid residual input */
+                    slig_reconstruct_at_dim(recon_32, dim_c, &probe);
+                    slig_image_upsample(up_128, dim_m, recon_32, dim_c);
+                    slig_image_downsample(plane_128, dim_m, full, dim_f);
+                    int n_m = dim_m * dim_m;
+                    for (int i = 0; i < n_m; i++) {
+                        int v = (int)plane_128[i] - (int)up_128[i] + 128;
+                        if (v < 0) v = 0; else if (v > 255) v = 255;
+                        res_128[i] = (uint8_t)v;
+                    }
+
+                    /* Level 1 — mid residual */
+                    slig_decompose_channel(&probe, res_128, dim_m, dim_m,
+                                           channels[ch], SLIG_LEVEL_MID,
+                                           budgets[ch]);
+                    kf->image_idx[SLIG_LEVEL_MID][ch] =
+                        slig_codebook_add_or_lookup(&ai->codebook, &probe,
+                                                    SLIG_CODEBOOK_DEFAULT_THRESHOLD);
+                    total += probe.num_cells;
+
+                    /* Predict 128, upsample to 256, compute fine residual */
+                    slig_reconstruct_at_dim(recon_mid, dim_m, &probe);
+                    for (int i = 0; i < n_m; i++) {
+                        int v = (int)up_128[i] + (int)recon_mid[i] - 128;
+                        if (v < 0) v = 0; else if (v > 255) v = 255;
+                        pred_128[i] = (uint8_t)v;
+                    }
+                    slig_image_upsample(up_256, dim_f, pred_128, dim_m);
+                    int n_f = dim_f * dim_f;
+                    for (int i = 0; i < n_f; i++) {
+                        int v = (int)full[i] - (int)up_256[i] + 128;
+                        if (v < 0) v = 0; else if (v > 255) v = 255;
+                        res_256[i] = (uint8_t)v;
+                    }
+
+                    /* Level 2 — fine residual */
+                    slig_decompose_channel(&probe, res_256, dim_f, dim_f,
+                                           channels[ch], SLIG_LEVEL_FINE,
+                                           budgets[ch]);
+                    kf->image_idx[SLIG_LEVEL_FINE][ch] =
+                        slig_codebook_add_or_lookup(&ai->codebook, &probe,
+                                                    SLIG_CODEBOOK_DEFAULT_THRESHOLD);
+                    total += probe.num_cells;
+                }
+            }
+            kf->has_image = (total > 0) ? 1 : 0;
+            free(plane_32);  free(plane_128); free(recon_32);
+            free(up_128);    free(res_128);   free(recon_mid);
+            free(pred_128);  free(up_256);    free(res_256);
+        }
+    }
+    free(plane_y_full); free(plane_cb_full); free(plane_cr_full); free(scratch);
 
     ai->kf_count++;
     bucket_index_add(&ai->bucket_idx, input, new_id);

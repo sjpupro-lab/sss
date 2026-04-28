@@ -1,11 +1,12 @@
 CC      = gcc
-CFLAGS  = -Wall -Wextra -O2 -Iinclude -std=c11
+CFLAGS  = -Wall -Wextra -O2 -Iinclude -Ice_core -std=c11
 LDFLAGS = -lm
 
-SRC_DIR   = src
-INC_DIR   = include
-TEST_DIR  = tests
-BUILD_DIR = build
+SRC_DIR     = src
+INC_DIR     = include
+TEST_DIR    = tests
+BUILD_DIR   = build
+CE_CORE_DIR = ce_core
 
 SRCS = $(SRC_DIR)/spatial_grid.c \
        $(SRC_DIR)/spatial_morpheme.c \
@@ -18,11 +19,33 @@ SRCS = $(SRC_DIR)/spatial_grid.c \
        $(SRC_DIR)/spatial_canvas.c \
        $(SRC_DIR)/spatial_subtitle.c \
        $(SRC_DIR)/spatial_recluster.c \
-       $(SRC_DIR)/spatial_image.c
+       $(SRC_DIR)/spatial_image.c \
+       $(SRC_DIR)/spatial_image_gen.c
 
-OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
+# ce_core library — CEUnit base + slig_signal v2.
+# ce_ingest.c is intentionally excluded (depends on a vendored
+# third_party/stb_image.h that ships separately and is not needed
+# by the SSS integration path; SSS uses its own PPM reader).
+CE_CORE_SRCS = $(CE_CORE_DIR)/ce_core.c \
+               $(CE_CORE_DIR)/ce_storage.c \
+               $(CE_CORE_DIR)/ce_search.c \
+               $(CE_CORE_DIR)/ce_engine.c \
+               $(CE_CORE_DIR)/ce_denoise.c \
+               $(CE_CORE_DIR)/ce_decode.c \
+               $(CE_CORE_DIR)/ce_extend.c \
+               $(CE_CORE_DIR)/ce_gen.c \
+               $(CE_CORE_DIR)/ce_storage_io.c \
+               $(CE_CORE_DIR)/ce_feed_image.c \
+               $(CE_CORE_DIR)/ce_image_wave_refine.c \
+               $(CE_CORE_DIR)/slig_signal.c \
+               $(CE_CORE_DIR)/slig_codebook.c \
+               $(CE_CORE_DIR)/slig_pipeline.c
 
-TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_recluster test_refine test_image_roundtrip
+CE_CORE_OBJS = $(patsubst $(CE_CORE_DIR)/%.c,$(BUILD_DIR)/ce_core_%.o,$(CE_CORE_SRCS))
+
+OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS)) $(CE_CORE_OBJS)
+
+TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_recluster test_refine test_image_roundtrip test_image_gen
 
 .PHONY: all clean test gpu_train_help probe_task_a bench_context bench_refine image_tools
 
@@ -33,6 +56,12 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# ce_core objects are prefixed (ce_core_NAME.o) so they cannot collide
+# with anything in src/. Includes both -Iinclude and -Ice_core so cross-
+# module references compile cleanly.
+$(BUILD_DIR)/ce_core_%.o: $(CE_CORE_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Test targets
@@ -95,6 +124,15 @@ $(BUILD_DIR)/bench_refine: $(TEST_DIR)/bench_refine.c $(OBJS) | $(BUILD_DIR)
 
 $(BUILD_DIR)/test_image_roundtrip: $(TEST_DIR)/test_image_roundtrip.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_image_gen: $(TEST_DIR)/test_image_gen.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/bench_v3: tools/bench_v3.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+bench_v3: $(BUILD_DIR)/bench_v3
+	@./$(BUILD_DIR)/bench_v3
 
 $(BUILD_DIR)/img2grid: tools/img2grid.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)

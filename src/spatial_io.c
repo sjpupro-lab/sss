@@ -369,6 +369,102 @@ static SpaiStatus read_subtitle_body(FILE* fp, SubtitleTrack* t) {
     return SPAI_OK;
 }
 
+/* ── SLIG v2.3: SPAI_TAG_CODEBOOK + SPAI_TAG_IMAGE_INDICES ─────
+ *
+ *   SPAI_TAG_CODEBOOK = 0x4A
+ *     uint32 pattern_count                      (≤ SLIG_CODEBOOK_MAX)
+ *     for each pattern i in [0, pattern_count):
+ *       uint8  channel
+ *       uint8  scale_level
+ *       uint16 reserved (=0)
+ *       uint32 num_cells                        (≤ SLIG_MAX_CELLS)
+ *       CEUnit cells[num_cells]                 (64 B each)
+ *
+ *   SPAI_TAG_IMAGE_INDICES = 0x4B (one per has_image keyframe)
+ *     uint32 kf_id
+ *     uint8  idx[SLIG_NUM_LEVELS][SLIG_NUM_CHANNELS]   (= 9 bytes)
+ *
+ * The codebook record is written exactly once before any IMAGE_INDICES
+ * records, so the loader can resolve indices in one pass. Older loaders
+ * (no v2.3 awareness) hit the unknown tag and stop cleanly — the model
+ * loses its image payload but stays text-correct. */
+
+static SpaiStatus write_codebook_record(FILE* fp, const SligCodebook* book) {
+    if (!book || book->pattern_count == 0) return SPAI_OK;
+    uint8_t tag = SPAI_TAG_CODEBOOK;
+    if (fwrite(&tag,                1,                1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(&book->pattern_count, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+    for (uint32_t i = 0; i < book->pattern_count; i++) {
+        const SligCellSet* set = &book->patterns[i];
+        uint8_t  channel  = set->channel;
+        uint8_t  scale    = set->scale_level;
+        uint16_t reserved = 0;
+        uint32_t count    = set->num_cells;
+        if (fwrite(&channel,  1,                1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&scale,    1,                1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&reserved, sizeof(uint16_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+        if (fwrite(&count,    sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+        if (count > 0 &&
+            fwrite(set->cells, sizeof(CEUnit), count, fp) != count) {
+            return SPAI_ERR_WRITE;
+        }
+    }
+    return SPAI_OK;
+}
+
+static SpaiStatus read_codebook_body(FILE* fp, SligCodebook* book) {
+    uint32_t pattern_count = 0;
+    if (fread(&pattern_count, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+    if (pattern_count > SLIG_CODEBOOK_MAX) return SPAI_ERR_CORRUPT;
+    slig_codebook_init(book);
+    for (uint32_t i = 0; i < pattern_count; i++) {
+        SligCellSet* set = &book->patterns[i];
+        uint8_t  channel = 0, scale = 0;
+        uint16_t reserved = 0;
+        uint32_t count = 0;
+        if (fread(&channel,  1,                1, fp) != 1) return SPAI_ERR_READ;
+        if (fread(&scale,    1,                1, fp) != 1) return SPAI_ERR_READ;
+        if (fread(&reserved, sizeof(uint16_t), 1, fp) != 1) return SPAI_ERR_READ;
+        if (fread(&count,    sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+        if (count > SLIG_MAX_CELLS)        return SPAI_ERR_CORRUPT;
+        if (channel >= SLIG_NUM_CHANNELS)  return SPAI_ERR_CORRUPT;
+        if (scale   >= SLIG_NUM_LEVELS)    return SPAI_ERR_CORRUPT;
+        memset(set, 0, sizeof(*set));
+        set->channel     = channel;
+        set->scale_level = scale;
+        set->num_cells   = count;
+        if (count > 0 &&
+            fread(set->cells, sizeof(CEUnit), count, fp) != count) {
+            return SPAI_ERR_READ;
+        }
+    }
+    book->pattern_count = pattern_count;
+    return SPAI_OK;
+}
+
+static SpaiStatus write_image_indices_record(FILE* fp, const Keyframe* kf) {
+    if (!kf->has_image) return SPAI_OK;
+    uint8_t tag = SPAI_TAG_IMAGE_INDICES;
+    if (fwrite(&tag,           1,                1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(&kf->id,        sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_WRITE;
+    if (fwrite(kf->image_idx,  1,
+               (size_t)SLIG_NUM_LEVELS * SLIG_NUM_CHANNELS, fp)
+        != (size_t)SLIG_NUM_LEVELS * SLIG_NUM_CHANNELS) return SPAI_ERR_WRITE;
+    return SPAI_OK;
+}
+
+static SpaiStatus read_image_indices_body(FILE* fp, SpatialAI* ai) {
+    uint32_t kf_id = 0;
+    if (fread(&kf_id, sizeof(uint32_t), 1, fp) != 1) return SPAI_ERR_READ;
+    if (kf_id >= ai->kf_count) return SPAI_ERR_CORRUPT;
+    Keyframe* kf = &ai->keyframes[kf_id];
+    if (fread(kf->image_idx, 1,
+              (size_t)SLIG_NUM_LEVELS * SLIG_NUM_CHANNELS, fp)
+        != (size_t)SLIG_NUM_LEVELS * SLIG_NUM_CHANNELS) return SPAI_ERR_READ;
+    kf->has_image = 1;
+    return SPAI_OK;
+}
+
 /* ── v4 Task B: SPAI_TAG_SEQMETA trailing record ─────────────
  *   tag(u8)
  *   uint32 canvas_count
@@ -471,6 +567,18 @@ SpaiStatus ai_save(const SpatialAI* ai, const char* path) {
             s = write_seqmeta_record(fp, ai->canvas_pool);
             if (s != SPAI_OK) { fclose(fp); return s; }
         }
+    }
+
+    /* SLIG v2.3 — codebook then per-keyframe indices. Both go last
+     * so any older loader that doesn't understand the v2.3 tags
+     * still reads everything before this section; an old loader
+     * stops cleanly when it hits SPAI_TAG_CODEBOOK. */
+    s = write_codebook_record(fp, &ai->codebook);
+    if (s != SPAI_OK) { fclose(fp); return s; }
+    for (uint32_t i = 0; i < ai->kf_count; i++) {
+        if (!ai->keyframes[i].has_image) continue;
+        s = write_image_indices_record(fp, &ai->keyframes[i]);
+        if (s != SPAI_OK) { fclose(fp); return s; }
     }
 
     if (fclose(fp) != 0) return SPAI_ERR_WRITE;
@@ -630,6 +738,24 @@ SpatialAI* ai_load(const char* path, SpaiStatus* out_status) {
                 return NULL;
             }
             s = read_seqmeta_body(fp, pool);
+            if (s != SPAI_OK) {
+                fclose(fp); spatial_ai_destroy(ai);
+                if (out_status) *out_status = s;
+                return NULL;
+            }
+        } else if (tag == SPAI_TAG_CODEBOOK) {
+            /* SLIG v2.3 — engine-wide pattern dictionary. Must arrive
+             * before any SPAI_TAG_IMAGE_INDICES record in the file. */
+            s = read_codebook_body(fp, &ai->codebook);
+            if (s != SPAI_OK) {
+                fclose(fp); spatial_ai_destroy(ai);
+                if (out_status) *out_status = s;
+                return NULL;
+            }
+        } else if (tag == SPAI_TAG_IMAGE_INDICES) {
+            /* SLIG v2.3 — per-keyframe codebook indices. Resolved at
+             * render time via slig_codebook_get(&ai->codebook, idx). */
+            s = read_image_indices_body(fp, ai);
             if (s != SPAI_OK) {
                 fclose(fp); spatial_ai_destroy(ai);
                 if (out_status) *out_status = s;

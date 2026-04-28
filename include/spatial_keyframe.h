@@ -3,6 +3,8 @@
 
 #include "spatial_grid.h"
 #include "spatial_match.h"
+#include "slig_signal.h"     /* CEUnit, SligCellSet, scale/channel enums */
+#include "slig_codebook.h"   /* SligCodebook — texture pattern dictionary */
 
 /* Keyframe (I-Frame): full snapshot.
  * topic_hash + seq_in_topic drive the topic-aware "next frame"
@@ -10,7 +12,16 @@
  * ai_force_keyframe derive topic_hash from the label (djb2) and
  * assign the next seq within the same topic. Legacy v3 files
  * load with topic_hash=0 / seq_in_topic=0 and still work via the
- * id+1 fallback path. */
+ * id+1 fallback path.
+ *
+ * SLIG v2.3 (codebook): the per-keyframe payload now holds only
+ * indices into the engine-wide SligCodebook. Each (scale, channel)
+ * slot is one byte — 9 bytes total per keyframe, regardless of how
+ * many cells live in the underlying pattern.
+ *
+ * Resolve indices via ai->codebook.patterns[image_idx[lvl][ch]] (or
+ * slig_codebook_get) to recover the original SligCellSet.
+ * has_image still gates whether any of the 9 slots are valid. */
 typedef struct {
     uint32_t    id;
     char        label[64];
@@ -18,7 +29,21 @@ typedef struct {
     uint32_t    text_byte_count;
     uint32_t    topic_hash;
     uint32_t    seq_in_topic;
+
+    uint8_t     image_idx[SLIG_NUM_LEVELS][SLIG_NUM_CHANNELS];
+    uint8_t     has_image;
 } Keyframe;
+
+/* Native pixel dim for each scale level. Keep in sync with
+ * SLIG_NUM_LEVELS / pyramid render code in spatial_image_gen.c. */
+static inline int slig_scale_dim(int level) {
+    switch (level) {
+        case SLIG_LEVEL_COARSE: return 32;
+        case SLIG_LEVEL_MID:    return 128;
+        case SLIG_LEVEL_FINE:   return 256;
+        default:                return 256;
+    }
+}
 
 /* Delta entry: sparse format (SPEC-ENGINE Phase D).
  * Bumped to 9 logical bytes with diff_B. On-disk is written field-by-
@@ -101,6 +126,12 @@ typedef struct SpatialAI_ {
      * without mutating the long-term store. Not serialized to .spai
      * by default — see ai_save_with_context for the opt-in path. */
     struct SpatialCanvasPool_* context_pool;
+
+    /* SLIG v2.3 — engine-wide texture pattern dictionary. Each
+     * Keyframe's image_idx points into codebook.patterns; sharing
+     * across keyframes is the storage win. Always allocated (zeroed)
+     * on spatial_ai_create; populated lazily by ai_store_grid. */
+    SligCodebook codebook;
 } SpatialAI;
 
 /* Blend EMA into a newly-encoded grid. Called right after

@@ -698,3 +698,140 @@ uint32_t match_cascade_topk(SpatialAI* ai, SpatialGrid* input,
     return n;
 }
 
+
+/* ══════════════════════════════════════════════════════════════
+ *  SLIG v2 — morpheme-level matching
+ *
+ *  For each morpheme in `clause`, encode its token through the
+ *  same 3-layer pipeline used by ai_predict, run spatial_match
+ *  in MATCH_PREDICT mode, and walk the top-K to pick the highest-
+ *  similarity keyframe with has_image == 1. The matched keyframe's
+ *  image_cells are copied into the result so the renderer can
+ *  apply them without another lookup.
+ *
+ *  Render order is POS-driven (NOUN → ADJ → VERB → PARTICLE/...):
+ *  the spatial generator wants nouns to lay down the gross shape
+ *  before adjectives modulate intensity and verbs add events.
+ *
+ *  Pure-syntactic morphemes (PARTICLE, ENDING, PUNCT, UNKNOWN with
+ *  no image hit) get render_weight = 0 so the sequential renderer
+ *  can skip them while still preserving their order metadata.
+ * ══════════════════════════════════════════════════════════════ */
+
+#include "spatial_layers.h"   /* layers_encode_clause */
+
+static uint8_t pos_render_order(PartOfSpeech p) {
+    switch (p) {
+        case POS_NOUN:     return 0;
+        case POS_ADJ:      return 1;
+        case POS_VERB:     return 2;
+        case POS_PARTICLE: return 3;
+        case POS_ENDING:   return 4;
+        default:           return 5;
+    }
+}
+
+static uint8_t pos_carries_signal(PartOfSpeech p) {
+    return (p == POS_NOUN || p == POS_ADJ || p == POS_VERB) ? 1 : 0;
+}
+
+uint32_t ai_match_morphemes(SpatialAI* ai,
+                            const char*    clause,
+                            MorphemeMatch* results,
+                            uint32_t       max_results) {
+    if (!ai || !clause || !results || max_results == 0) return 0;
+
+    /* Tokenise the clause; cap at the result capacity. */
+    Morpheme tokens[64];
+    uint32_t cap = max_results < 64 ? max_results : 64;
+    uint32_t n = morpheme_tokenize_clause(clause, tokens, cap);
+    if (n == 0) return 0;
+
+    SpatialGrid* mini = grid_create();
+    if (!mini) return 0;
+
+    MatchContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.bucket_idx = &ai->bucket_idx;
+
+    uint32_t out_count = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        MorphemeMatch* m = &results[out_count];
+        memset(m, 0, sizeof(*m));
+        m->morpheme     = tokens[i];
+        m->keyframe_id  = UINT32_MAX;
+        m->similarity   = 0.0f;
+        m->render_order = pos_render_order(tokens[i].pos);
+        m->render_weight = 0;
+
+        /* Skip syntactic-only morphemes — they keep order but cast no signal. */
+        if (!pos_carries_signal(tokens[i].pos)) {
+            out_count++;
+            continue;
+        }
+
+        /* Encode just this morpheme's token through the same pipeline
+         * as ai_predict. We intentionally pass the token only (no
+         * surrounding clause) so each match is per-morpheme. */
+        grid_clear(mini);
+        layers_encode_clause(tokens[i].token, NULL, mini);
+        update_rgb_directional(mini);
+        apply_ema_to_grid(ai, mini);
+
+        if (ai->kf_count == 0) { out_count++; continue; }
+
+        /* Label-first lookup for image-bearing keyframes: image grids
+         * carry only luminance, not text byte counts, so cosine on the
+         * morpheme's mini-grid won't surface them. We treat the label
+         * as the canonical name of the image and match by substring,
+         * which mirrors how callers tag images via ai_learn_image. */
+        uint32_t picked   = UINT32_MAX;
+        float    pick_sim = 0.0f;
+        for (uint32_t k = 0; k < ai->kf_count; k++) {
+            if (!ai->keyframes[k].has_image) continue;
+            if (ai->keyframes[k].label[0] == '\0') continue;
+            if (strstr(ai->keyframes[k].label, tokens[i].token) != NULL ||
+                strstr(tokens[i].token, ai->keyframes[k].label) != NULL) {
+                picked   = k;
+                pick_sim = 1.0f;
+                break;
+            }
+        }
+
+        /* Fall back to grid matching when no label hit. Walk top-K
+         * (best first) and prefer the first has_image keyframe; else
+         * top-1 regardless of has_image. */
+        if (picked == UINT32_MAX) {
+            MatchResult r = spatial_match(ai, mini, MATCH_PREDICT, &ctx);
+            for (uint32_t k = 0; k < r.topk_count; k++) {
+                uint32_t id = r.topk[k].id;
+                if (id < ai->kf_count && ai->keyframes[id].has_image) {
+                    picked   = id;
+                    pick_sim = r.topk[k].score;
+                    break;
+                }
+            }
+            if (picked == UINT32_MAX && r.best_id < ai->kf_count) {
+                picked   = r.best_id;
+                pick_sim = r.best_score;
+            }
+        }
+
+        if (picked < ai->kf_count) {
+            m->keyframe_id = picked;
+            m->similarity  = pick_sim;
+            /* Renderer reads ai->keyframes[keyframe_id].image_sets
+             * directly; no need to copy ~18 KB of CellSets per match. */
+
+            /* Map similarity (0..1) into a 0..255 strength. We clamp
+             * to leave room for downstream spectrum-based rescaling. */
+            float w = pick_sim < 0.0f ? 0.0f : pick_sim;
+            if (w > 1.0f) w = 1.0f;
+            m->render_weight = (uint8_t)(w * 255.0f);
+        }
+        out_count++;
+    }
+
+    grid_destroy(mini);
+    return out_count;
+}

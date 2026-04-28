@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local extracted content (zip already tracked)
+sss_prompt_extracted/
+
+# Local model / data dumps
+*.spai
+*.ces
+build/models/
+build/gpu_models/
+
+# Test scratch outputs
+/tmp/sss_v2_*
+/tmp/bench_*

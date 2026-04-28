@@ -31,6 +31,7 @@
   - [4. Matching cascade](#4-matching-cascade)
   - [5. Canvas Pool (subtitle routing)](#5-canvas-pool-subtitle-routing)
   - [6. Image modality (Task F — feasibility prototype)](#6-image-modality-task-f--feasibility-prototype)
+  - [7. SLIG v2/v3 — signal-latent image generation](#7-slig-v2v3--signal-latent-image-generation)
 - [Current verified results](#current-verified-results)
 - [Build & run](#build--run)
 - [Image training](#image-training)
@@ -239,6 +240,144 @@ and cascade apply unchanged. The per-cell EMA store is updated too.
 Scope reminder (per Task F spec): this is an ingestion + refine-based
 render prototype, **not** a diffusion-style generator. PNG and baseline
 JPEG inputs are ingested via the tools below (the core stays PPM-only).
+
+---
+
+### 7. SLIG v2/v3 — signal-latent image generation
+
+Beyond the Task F refine prototype, the engine ships a CE-Cell-based
+image stack that **decomposes images into ≤32-cell signal sets** and
+**reconstructs them by additive rendering**. Built on 64-byte `CEUnit`s
+from `ce_core/`.
+
+```
+ PPM image         CE Cell (64B)         SligCanvas (256×256 i32)
+ ┌──────┐    SVD   ┌────────────┐  apply ┌──────────────────────┐
+ │ 256² │ ─────►   │ inc.R meta │ ─────► │ ∑ σᵢ · uᵢ ⊗ vᵢ        │
+ │ RGB  │ DCT-16   │ inc.GB DCT │        │ + ripple/beam events │
+ └──────┘          │ inc.A nrg  │        └──────────────────────┘
+                   │ dec.R DCT+ │              │
+                   │ dec.B trig │              ▼ canvas_to_u8
+                   │ dec.A audio│         ┌──────────┐
+                   └────────────┘         │ uint8 PPM│
+                                          └──────────┘
+```
+
+#### 7.1 v2 baseline — signal cells + canvas
+
+`slig_decompose(image)` extracts up to 25 cells per channel:
+12 horizontal SVD layers (sigma ≥ 0.003), 4 diagonal-down SVD,
+4 diagonal-up SVD, 4 zigzag SVD, 1 ripple event. Each cell stores
+16 DCT coefficients per signal axis (u, v) plus metadata (sigma,
+direction, origin, decay, audio bins). Render is the additive
+`slig_apply` of each cell's u⊗v outer product into a 256×256
+`SligCanvas`; canvas → PPM via min-max normalize.
+
+#### 7.2 v2.1 — color (YCbCr split)
+
+RGB image → BT.601 YCbCr planes. Y carries shape (≈20-cell budget),
+Cb / Cr carry chroma (≈6 cells each). `slig_decompose_channel` runs
+per-plane and tags each `SligCellSet` with channel + scale_level.
+Render maintains 3 canvases and composes back to RGB at output.
+
+#### 7.3 v2.2 — multi-scale pyramid
+
+Per channel, decompose at 3 scales: **COARSE** (32×32) / **MID** (128)
+/ **FINE** (256). 3 levels × 3 channels = **9 cell sets per keyframe**.
+Render upsamples coarse/mid panels to 256 and combines per-scale.
+
+#### 7.4 v2.3 — texture codebook
+
+Repeated textures share patterns via an engine-wide **`SligCodebook`**
+(≤256 entries). Each keyframe stores 9 byte-sized indices instead of
+9 × 2 KB inline sets. Online clustering: novel patterns append; near
+matches reuse existing indices; full codebook falls back to nearest.
+Storage drops from 18 KB → **9 B per keyframe**.
+
+#### 7.5 Residual pyramid (encode / decode chain)
+
+Each pyramid level stores a residual against the upsampled lower level:
+
+```
+encode  : coarse  = decompose(downsample(image, 32))
+          mid     = decompose((image_128 − upsample(coarse_recon, 128)) + 128)
+          fine    = decompose((image     − upsample(mid_recon,    256)) + 128)
+decode  : pred128 = clamp(upsample(coarse_recon, 128) + (mid_recon  − 128), 0, 255)
+          final   = clamp(upsample(pred128, 256)      + (fine_recon − 128), 0, 255)
+```
+
+The +128 offset preserves signed residuals through uint8. Inner-loop
+arithmetic is integer-only; SVD/DCT happen at encode time only.
+
+#### 7.6 Conditional + spatial + guidance
+
+- **`cond_type=1`** (brightness gating): `slig_apply` honors
+  `cond_threshold` — a cell only contributes where the canvas already
+  has |value| ≥ threshold. Enables layered effects.
+- **Spatial masks** (`slig_make_mask_left/right/top/bottom`): per-item
+  256×256 mask applied during render. Direction keywords in prompts
+  ("왼쪽 산", "오른쪽 바다") tag the matching morpheme with a half-plane
+  mask via `ai_generate_image_v2_guided`.
+- **Classifier-free guidance**: `out = clamp(128 + scale × (cond − 128))`.
+  scale=1 → identity, scale=2 → emphasized, scale=3 → caricatured.
+  Pure-integer Q8 inner loop.
+
+#### 7.7 Animation — frame sequences
+
+```c
+uint32_t frames = ai_generate_animation(ai, "사과 먹", "/tmp/anim/", 16);
+/* writes frame_000.ppm .. frame_015.ppm with cumulative event ticks */
+```
+
+EVENT-stage cells (POS_VERB morphemes → `SLIG_RENDER_EVENT`) propagate
+cumulatively over `event_max_tick`, producing natural ripple/beam
+evolution across frames. Prompts without verbs render identical
+frames (no event cells fire).
+
+#### 7.8 v3 standalone pipeline (`ce_core/slig_pipeline.{c,h}`)
+
+A 5-stage SSS-independent image roundtripper:
+
+```
+preprocess  : histogram normalize + bilateral filter + symmetry detect
+decompose   : structure (SVD) → edge (Sobel) → texture (block variance)
+              → color (YCbCr block) → event (brightness centroid + beam)
+              residual chain between stages — recon = ∑σuv + img_mean
+upscale     : harmonic / SBR / Wiener / optional compressed-sensing
+              on DCT coefficients (audio bandwidth-extension techniques)
+render      : Atmos-style adaptive rendering with 3-canvas YCbCr,
+              audio_bins[0] dispatches Cb/Cr, progressive callback
+              per phase
+postprocess : unsharp mask + debanding + saturation/contrast +
+              optional histogram match (preprocess inverse)
+```
+
+```c
+#include "slig_pipeline.h"
+
+SligDecomposed dec;
+slig_learn_image(&dec, rgb_pixels, w, h, 3);
+uint8_t *out = malloc(w*h*3);
+slig_generate_image(out, w, h, &dec, /*guidance_scale=*/1.0f);
+/* save out as PPM... */
+```
+
+Progressive streaming: pass `on_progress` in `SligRenderConfig` to
+receive partial frames after each of 5 phases — wires to HTTP SSE,
+WebSocket, or shared-memory UI consumers without further glue.
+
+```c
+SligRenderConfig rc;
+slig_render_config_default(&rc);
+rc.progressive  = 1;
+rc.on_progress  = my_consumer;
+rc.progress_ctx = my_ctx;       /* gets pushed phase 1..5 */
+slig_render_adaptive(out_image, &dec, &rc);
+```
+
+`make bench_v3` runs the full v2.3 / v3 / v3-progressive comparison and
+writes 8 PPMs + `SUMMARY.txt` (timing / PSNR / RSS / cell distribution)
+to `/sdcard/Download/sss_bench/`.
 
 ---
 
@@ -499,6 +638,10 @@ Binary format `.spai` — `SPAI` magic, current version **5**. Versions
                          changed_ratio, classified, SlotMeta[32], A + R + G + B
     tag 0x05  Subtitle:  count + (type, topic_hash, canvas_id, slot_id, byte_length)[]
     tag 0x06  EMA:       R[65536] + G[65536] + B[65536] + count[65536]  (float each, 1 MB)
+    tag 0x07  SeqMeta:   per-canvas slot sequence_id + timestamp_us (Task B)
+    tag 0x49  ImageCells (legacy v2.0): no longer written — reserved
+    tag 0x4A  Codebook:  pattern_count + (channel + scale_level + cells[])* (SLIG v2.3)
+    tag 0x4B  ImageIdx:  kf_id + idx[SLIG_NUM_LEVELS][SLIG_NUM_CHANNELS] (9 B/keyframe)
 ```
 
 Version bumps:
@@ -541,18 +684,33 @@ Guarantees validated by `test_io`:
 │   ├── spatial_layers.h      # 3-layer summation (base / morpheme / word)
 │   ├── spatial_morpheme.h    # Korean morpheme analyzer (longest-match)
 │   ├── spatial_keyframe.h    # Keyframe / delta / SpatialAI engine
-│   ├── spatial_match.h       # Cosine, cascade modes, adaptive weights
+│   ├── spatial_match.h       # Cosine, cascade modes, adaptive weights,
+│   │                         #   MorphemeMatch (SLIG v2.x)
 │   ├── spatial_context.h     # Context frames + LRU cache
 │   ├── spatial_canvas.h      # 2048×1024 canvas with 32 slots
 │   ├── spatial_subtitle.h    # SubtitleTrack + SpatialCanvasPool
 │   ├── spatial_generate.h    # Next-clause generation
-│   └── spatial_io.h          # .spai binary format (v3)
+│   ├── spatial_image.h       # ai_learn_image / ai_generate_image_v2 /
+│   │                         #   ai_generate_image_v2_guided / animation
+│   └── spatial_io.h          # .spai binary format (v5 + v2.3 codebook)
 ├── src/                      # Implementations (one per header)
+│   └── spatial_image_gen.c    # SLIG v2.3 generator (color × multi-scale × residual)
+├── ce_core/                  # CE Cell library (vendored)
+│   ├── ce_core.{c,h}         # 64-byte CEUnit, ce_pack/unpack/distance
+│   ├── ce_storage.{c,h}      # CE-Cell storage / search / engine helpers
+│   ├── slig_signal.{c,h}     # SligSignal / decompose / render / canvas / masks /
+│   │                         #   guidance / animation tick / pyramid helpers
+│   ├── slig_codebook.{c,h}   # SligCodebook — texture pattern dictionary
+│   └── slig_pipeline.{c,h}   # v3 standalone 5-stage pipeline
 ├── dict/                     # Korean dictionaries (nouns/verbs/adj/particles/endings)
-├── tests/                    # 12 test binaries, 69 tests total
+├── tests/                    # 13+ test binaries, 60+ tests total
+│   └── test_image_gen.c       # SLIG v2.3 integration suite (59 cases)
 ├── data/                     # Sample corpora + download scripts
 ├── tools/
 │   ├── stream_train.c         # Line-by-line streaming trainer (C binary)
+│   ├── bench_v3.c             # v2.3 vs v3 pipeline benchmark + PPM dump
+│   ├── img2grid.c / grid2img.c  # PPM ↔ grid roundtrip (Task F)
+│   ├── chat.c                 # Interactive REPL
 │   ├── run_practical_test.sh  # Build + train + verify wrapper
 │   ├── visualize_training.py  # .spai → PNG frames + MP4 video
 │   └── kaggle_gpu_train.py    # Optional CUDA training helper

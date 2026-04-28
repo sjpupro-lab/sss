@@ -48,4 +48,52 @@ int ai_generate_image(SpatialAI* ai,
                       const char* out_path,
                       const RefineConfig* cfg);
 
+/* ── SLIG v2 image API ───────────────────────────────────────
+ *
+ *  v2 keeps ai_generate_image (above) for the legacy refine-based
+ *  prototype and adds the integrated pipeline below:
+ *
+ *    ai_learn_image  — load a PPM, decompose into a CEUnit set
+ *                      (multi-direction SVD + ripple), and store it
+ *                      as a keyframe with has_image=1 and
+ *                      image_cells populated.
+ *
+ *    ai_generate_image_v2  — text prompt → 256² grid → per-morpheme
+ *                            keyframe match → CEUnit pull → grid-
+ *                            spectrum weighting → POS-ordered
+ *                            sequential render → PPM.
+ *
+ *  Both return 0 on failure, non-zero on success. ai_learn_image
+ *  returns the new keyframe id (or UINT32_MAX). */
+
+uint32_t ai_learn_image(SpatialAI*  ai,
+                        const char* image_path,
+                        const char* label);
+
+int ai_generate_image_v2(SpatialAI*  ai,
+                         const char* prompt_text,
+                         const char* out_path);
+
+/* Variant with classifier-free guidance.
+ *   guidance_scale = 1.0 → identical to ai_generate_image_v2
+ *   guidance_scale > 1.0 → push pixels further from achromatic 128
+ *                          (intensifies prompt-driven deviation)
+ *   guidance_scale < 1.0 → soften prompt (rarely useful)
+ * Same return convention (1 success, 0 failure). */
+int ai_generate_image_v2_guided(SpatialAI*  ai,
+                                const char* prompt_text,
+                                const char* out_path,
+                                float       guidance_scale);
+
+/* Generate `num_frames` PPMs into `output_dir/frame_NNN.ppm`. Each
+ * frame is a render at event_max_tick = (frame index), so cells with
+ * tick-driven evolution (RIPPLE / BEAM / CROSS / CASCADE) build up
+ * cumulatively across frames — frame 0 shows the initial state,
+ * frame N shows the full evolution after N ticks of accumulation.
+ * Returns the number of frames successfully written (0 on failure). */
+uint32_t ai_generate_animation(SpatialAI*  ai,
+                               const char* prompt_text,
+                               const char* output_dir,
+                               uint32_t    num_frames);
+
 #endif /* SPATIAL_IMAGE_H */
