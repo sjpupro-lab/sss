@@ -57,10 +57,20 @@ extern "C" {
 #define CE_IMAGE_BLOCK_PX    8
 #define CE_IMAGE_BLOCK_BYTES (CE_IMAGE_BLOCK_PX * CE_IMAGE_BLOCK_PX * 4) /* 256 */
 
+#define CE_IMAGE_BLOCK16_PX    16
+#define CE_IMAGE_BLOCK16_BYTES (CE_IMAGE_BLOCK16_PX * CE_IMAGE_BLOCK16_PX * 4) /* 1024 */
+
 /* Encode an 8x8 RGBA block (256 bytes, row-major) into a CEUnit.
  * The input is read via [r,g,b,a, r,g,b,a, ...] across 64 pixels.
  * The CEUnit is reset before encoding. */
 void ce_feed_image(CEUnit *u, const uint8_t *rgba_block_8x8);
+
+/* Encode a 16x16 RGBA block (1024 bytes, row-major) into FOUR CEUnits — one
+ * per 8x8 quadrant in TL, TR, BL, BR order. This preserves richer spatial
+ * detail than a single CEUnit per 16x16 (which would average out fine
+ * structure inside the block). Each quadrant CEUnit follows the same
+ * layout as ce_feed_image. All four out cells are reset before encoding. */
+void ce_feed_image_16(CEUnit out_quadrants[4], const uint8_t *rgba_block_16x16);
 
 #ifdef __cplusplus
 }

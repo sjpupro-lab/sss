@@ -1,4 +1,5 @@
 #include "ce_storage.h"
+#include "ce_feed_image.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -73,4 +74,56 @@ int32_t ce_storage_find(const CEStorage *s, uint32_t canvas_id,
             return (int32_t)i;
     }
     return -1;
+}
+
+uint32_t ce_storage_ingest_rgba(CEStorage *s,
+                                uint32_t canvas_id,
+                                const uint8_t *rgba, int width, int height) {
+    if (!s || !rgba || width <= 0 || height <= 0) return 0;
+
+    int blocks_x = (width  + CE_IMAGE_BLOCK_PX - 1) / CE_IMAGE_BLOCK_PX;
+    int blocks_y = (height + CE_IMAGE_BLOCK_PX - 1) / CE_IMAGE_BLOCK_PX;
+
+    uint8_t block[CE_IMAGE_BLOCK_BYTES];
+    CEUnit prev; ce_init(&prev);
+
+    uint32_t added = 0;
+    for (int by = 0; by < blocks_y; ++by) {
+        for (int bx = 0; bx < blocks_x; ++bx) {
+            memset(block, 0, sizeof(block));
+            int x0 = bx * CE_IMAGE_BLOCK_PX;
+            int y0 = by * CE_IMAGE_BLOCK_PX;
+            for (int dy = 0; dy < CE_IMAGE_BLOCK_PX; ++dy) {
+                int y = y0 + dy;
+                if (y >= height) break;
+                for (int dx = 0; dx < CE_IMAGE_BLOCK_PX; ++dx) {
+                    int x = x0 + dx;
+                    if (x >= width) break;
+                    const uint8_t *src = rgba + ((size_t)y * (size_t)width + (size_t)x) * 4u;
+                    uint8_t *dst = block + ((size_t)dy * CE_IMAGE_BLOCK_PX + (size_t)dx) * 4u;
+                    dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3];
+                }
+            }
+
+            CEUnit fresh;
+            ce_feed_image(&fresh, block);
+
+            CEUnit delta;
+            if (added == 0) {
+                CEUnit zero; ce_init(&zero);
+                ce_delta(&delta, &zero, &fresh);
+            } else {
+                ce_delta(&delta, &prev, &fresh);
+            }
+
+            ce_storage_add_typed(s, canvas_id,
+                                 (uint16_t)(by & 0xFFFF),
+                                 (uint16_t)(bx & 0xFFFF),
+                                 CE_TYPE_IMAGE,
+                                 &fresh, &delta);
+            prev = fresh;
+            ++added;
+        }
+    }
+    return added;
 }

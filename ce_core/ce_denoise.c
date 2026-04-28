@@ -22,6 +22,18 @@ CEGenConfig ce_gen_config_default(void) {
     return c;
 }
 
+CEGenConfig ce_gen_config_hq(void) {
+    CEGenConfig c = ce_gen_config_default();
+    c.total_steps = 50;
+    c.cfg_scale = 2.0f;
+    c.conv_radius = 2;
+    c.attn_topk = 8;
+    c.residual_weight = 0.6f;
+    c.skip_weight = 0.5f;
+    c.sampler_mode = CE_SAMPLE_ADAPTIVE;
+    return c;
+}
+
 void ce_denoise_loop(CELatentGrid *z,
                      const CEStorage *storage,
                      const CEUnit *prompt_cells, int prompt_count,

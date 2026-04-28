@@ -60,6 +60,20 @@ void ce_storage_ingest(CEStorage *s, uint32_t canvas_id, uint16_t slot,
 int32_t ce_storage_find(const CEStorage *s, uint32_t canvas_id,
                         uint16_t slot, uint16_t block_idx);
 
+/* Ingest a raw RGBA pixel buffer into CEStorage using ce_feed_image's
+ * 8x8-block encoder. The image is split into ceil(w/8) x ceil(h/8)
+ * blocks; right/bottom edges are zero-padded. Each block is stored as
+ * a (keyframe, delta) entry tagged CE_TYPE_IMAGE, with `slot` = block-
+ * row and `block_idx` = block-column.
+ *
+ * Unlike ce_ingest_file (which uses stb_image and pulls in the
+ * third_party header), this entry point operates on an in-memory
+ * buffer the caller already decoded — keeping the SSS integration
+ * path free of stb_image. Returns the number of blocks added. */
+uint32_t ce_storage_ingest_rgba(CEStorage *s,
+                                uint32_t canvas_id,
+                                const uint8_t *rgba, int width, int height);
+
 #ifdef __cplusplus
 }
 #endif

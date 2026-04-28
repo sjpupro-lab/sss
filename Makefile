@@ -148,6 +148,20 @@ $(BUILD_DIR)/img2grid: tools/img2grid.c $(OBJS) | $(BUILD_DIR)
 $(BUILD_DIR)/grid2img: tools/grid2img.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
+$(BUILD_DIR)/train_images_ce: tools/train_images_ce.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/gen_image_ce: tools/gen_image_ce.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+train_images_ce: $(BUILD_DIR)/train_images_ce
+	@echo "Built train_images_ce. Example:"
+	@echo "  ./build/train_images_ce build/models/demo  data/img/*.ppm"
+
+gen_image_ce: $(BUILD_DIR)/gen_image_ce
+	@echo "Built gen_image_ce. Example:"
+	@echo "  ./build/gen_image_ce build/synth/demo.ces \"red apple\" out.ppm 0 50 200"
+
 image_tools: $(BUILD_DIR)/img2grid $(BUILD_DIR)/grid2img
 	@echo "Built image prototype tools. Examples:"
 	@echo "  ./build/img2grid  in.ppm  out.ppm"

@@ -1,4 +1,5 @@
 #include "ce_gen.h"
+#include "ce_image_wave_refine.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -90,6 +91,142 @@ void ce_generate_image(
     ce_denoise_loop(&z, storage, prompt_cells, prompt_count, audio, &cfg);
 
     ce_decode_image(output, &z);
+
+    free(prompt_cells);
+}
+
+/* Build a single CEImageLink64 whose 256x256 target is the 8x8-tiled decode
+ * of one CEStorage entry's keyframe + delta (so the whole image plane is
+ * reconstructed from the retrieved entry, not from a single block). The
+ * 64x64 semantic plane is left zeroed — it is reserved for future
+ * morpheme/canvas embedding cross-talk and not exercised by the wave loop
+ * itself, which only consumes `target` and `score`. */
+static void link_from_entry(CEImageLink64 *link,
+                            const CEStorageEntry *e,
+                            float score) {
+    if (!link) return;
+    link->score = score;
+    memset(link->semantic, 0, sizeof(link->semantic));
+
+    /* Apply the entry's delta on top of its keyframe before decoding so the
+     * stored signal is round-trippable. */
+    CEUnit recon;
+    ce_apply(&recon, &e->keyframe, &e->delta);
+
+    uint8_t block[CE_BLOCK * CE_BLOCK * 4];
+    ce_decode_image_block(block, &recon);
+
+    /* Tile the single 8x8 reconstruction across the 256x256 target plane.
+     * The wave-refine loop blends the top-k targets into the canvas, so
+     * tiling yields a uniform color contribution from this entry. */
+    for (int y = 0; y < CE_WAVE_IMG_H; ++y) {
+        for (int x = 0; x < CE_WAVE_IMG_W; ++x) {
+            int bx = x % CE_BLOCK;
+            int by = y % CE_BLOCK;
+            const uint8_t *p = block + (size_t)(by * CE_BLOCK + bx) * 4u;
+            CEPixelF *d = &link->target[(size_t)y * CE_WAVE_IMG_W + (size_t)x];
+            d->r = (float)p[0];
+            d->g = (float)p[1];
+            d->b = (float)p[2];
+            d->a = (float)p[3];
+        }
+    }
+}
+
+/* Convert CEImage (uint8 RGBA) <-> CEImageCanvas (float RGBA). */
+static void image_to_canvas(CEImageCanvas *out, const CEImage *img) {
+    for (int i = 0; i < CE_WAVE_IMG_W * CE_WAVE_IMG_H; ++i) {
+        out->px[i].r = (float)img->pixels[i].r;
+        out->px[i].g = (float)img->pixels[i].g;
+        out->px[i].b = (float)img->pixels[i].b;
+        out->px[i].a = (float)img->pixels[i].a;
+    }
+}
+
+static uint8_t f_to_u8(float v) {
+    if (v < 0.0f)   v = 0.0f;
+    if (v > 255.0f) v = 255.0f;
+    return (uint8_t)(v + 0.5f);
+}
+
+static void canvas_to_image(CEImage *out, const CEImageCanvas *c) {
+    for (int i = 0; i < CE_WAVE_IMG_W * CE_WAVE_IMG_H; ++i) {
+        out->pixels[i].r = f_to_u8(c->px[i].r);
+        out->pixels[i].g = f_to_u8(c->px[i].g);
+        out->pixels[i].b = f_to_u8(c->px[i].b);
+        out->pixels[i].a = f_to_u8(c->px[i].a);
+    }
+    out->width = CE_IMAGE_W;
+    out->height = CE_IMAGE_H;
+}
+
+void ce_generate_image_typed(
+    CEImage *output,
+    const CEStorage *storage,
+    CEType type,
+    const char *prompt,
+    uint64_t seed,
+    const CEGenConfig *config,
+    uint32_t wave_refine_iters) {
+
+    CEGenConfig cfg = config ? *config : ce_gen_config_hq();
+
+    int prompt_count = 0;
+    CEUnit *prompt_cells = prompt_to_cells(prompt, &prompt_count);
+
+    /* Initial latent — same construction as ce_generate_image, but seeded
+     * by a typed top-1 search so the anchor cell is from the requested
+     * modality. */
+    CEUnit noise; ce_noise_init(&noise, seed);
+    CEUnit kf, dl;
+    ce_init(&kf);
+    ce_init(&dl);
+    if (storage && storage->count > 0) {
+        CESearchResult r;
+        int n = ce_search_by_type(storage, &noise, type, 1, &r);
+        if (n > 0) {
+            kf = storage->entries[r.entry_idx].keyframe;
+            dl = storage->entries[r.entry_idx].delta;
+        }
+    }
+    CEUnit prompt_avg; ce_init(&prompt_avg);
+    if (prompt_count > 0 && prompt_cells) {
+        prompt_avg = prompt_cells[prompt_count - 1];
+    }
+    float w[5] = { 0.30f, 0.25f, 0.20f, 0.25f, 0.0f };
+    CELatentGrid z;
+    ce_latent_init(&z, &noise, &kf, &dl,
+                   (prompt_count > 0) ? &prompt_avg : NULL,
+                   NULL, w);
+
+    ce_denoise_loop(&z, storage, prompt_cells, prompt_count, NULL, &cfg);
+    ce_decode_image(output, &z);
+
+    /* Wave-refine pass: pull the top-CE_WAVE_TOPK typed entries (using the
+     * whole-prompt cell when available, else the noise seed as the query)
+     * and blend them into the decoded canvas. */
+    if (wave_refine_iters > 0 && storage && storage->count > 0) {
+        const CEUnit *query = (prompt_count > 0) ? &prompt_avg : &noise;
+        CESearchResult sres[CE_WAVE_TOPK];
+        int found = ce_search_by_type(storage, query, type, CE_WAVE_TOPK, sres);
+        if (found > 0) {
+            CEImageLink64 *links = (CEImageLink64 *)calloc((size_t)found, sizeof(CEImageLink64));
+            CEImageLink64 *top3[CE_WAVE_TOPK] = { NULL, NULL, NULL };
+            for (int i = 0; i < found; ++i) {
+                /* Convert ascending distance into a positive score (closer
+                 * entries get larger weight). +1 keeps zero-distance hits
+                 * from collapsing the score to zero. */
+                float score = 1.0f / (1.0f + (float)sres[i].distance);
+                link_from_entry(&links[i], &storage->entries[sres[i].entry_idx], score);
+                top3[i] = &links[i];
+            }
+            CEImageCanvas canvas;
+            image_to_canvas(&canvas, output);
+            ce_image_wave_refine(&canvas, top3, wave_refine_iters);
+            canvas_to_image(output, &canvas);
+            free(links);
+        }
+    }
 
     free(prompt_cells);
 }

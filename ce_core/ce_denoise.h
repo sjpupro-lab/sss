@@ -37,8 +37,12 @@ typedef struct {
     float total_loss;
 } CELoss;
 
-/* Default config tuned for 4..50 step inference. */
+/* Default config tuned for 4..50 step inference (8 steps, fast preset). */
 CEGenConfig ce_gen_config_default(void);
+
+/* High-quality preset: 50 steps, larger conv radius, stronger attention.
+ * Used by ce_image_generate's quality path. */
+CEGenConfig ce_gen_config_hq(void);
 
 /* Step 14 — full denoising loop. `prompt_cells` may be NULL with
  * prompt_count = 0. `audio_cells` likewise optional. */
