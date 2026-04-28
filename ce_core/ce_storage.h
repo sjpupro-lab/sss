@@ -74,6 +74,20 @@ uint32_t ce_storage_ingest_rgba(CEStorage *s,
                                 uint32_t canvas_id,
                                 const uint8_t *rgba, int width, int height);
 
+/* 16x16 group ingest. Splits the image into ceil(w/16) x ceil(h/16)
+ * 16x16 blocks (right/bottom edges zero-padded), then encodes each
+ * block via ce_feed_image_16 into 4 quadrant CEUnits (TL=0, TR=1,
+ * BL=2, BR=3). All four quadrants of a block share the same `slot`
+ * (block-row index) and use `block_idx = (block_col << 2) | quadrant`,
+ * so retrieval can recover the 4 quadrants of a logical 16x16 patch
+ * by looking up `slot` and matching block_idx >> 2. Tagged
+ * CE_TYPE_IMAGE. delta of the very first quadrant is taken against the
+ * zero CEUnit; subsequent quadrants chain the previous quadrant's
+ * keyframe (raster order). Returns total entries added (= 4 * blocks). */
+uint32_t ce_storage_ingest_rgba_16(CEStorage *s,
+                                   uint32_t canvas_id,
+                                   const uint8_t *rgba, int width, int height);
+
 #ifdef __cplusplus
 }
 #endif

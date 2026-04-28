@@ -34,7 +34,9 @@ TEST_BINS = $(BUILD_DIR)/test_core \
             $(BUILD_DIR)/test_slig_signal \
             $(BUILD_DIR)/test_pipeline \
             $(BUILD_DIR)/test_stress_10k \
-            $(BUILD_DIR)/test_slig_energy
+            $(BUILD_DIR)/test_slig_energy \
+            $(BUILD_DIR)/test_storage_ingest16 \
+            $(BUILD_DIR)/test_decode16
 
 TOOL_BINS = $(BUILD_DIR)/ce_ingest \
             $(BUILD_DIR)/slig_diag \
@@ -94,6 +96,12 @@ $(BUILD_DIR)/test_stress_10k: tests/test_stress_10k.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/test_slig_energy: tests/test_slig_energy.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_storage_ingest16: tests/test_storage_ingest16.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_decode16: tests/test_decode16.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/ce_ingest: tools/ce_ingest.c $(OBJS) | $(BUILD_DIR)

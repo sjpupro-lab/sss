@@ -445,6 +445,88 @@ grid_destroy(img);
 
 ---
 
+## Demo: text → image generation
+
+End-to-end demonstration of the SSS image pipeline:
+**procedurally synthesized dataset → joint text+image training (`.spai` + `.ces`) → morpheme-routed denoise + 16×16 atomic wave-refine → 256×256 PPM**.
+Total training set: **10,240 image entries (16×16 atomic blocks via
+`ce_feed_image_16`) + 38 per-morpheme TEXT bridges = 10,278 CEStorage
+entries** — above the 10K minimum exercised by `test_stress_10k`.
+
+### Training set
+
+10 labelled images: 4 solid colours (`red`, `green`, `blue`, `yellow`) and
+6 fruit shapes drawn as ellipses with a luminance gradient
+(`apple`, `banana`, `grape`, `lime`, `blueberry`, `orange`).
+Each row of `data/demo/labels.tsv` ties a label, a clause
+(e.g. `"apple is red and round"`) and an image path.
+
+![dataset](docs/demo/dataset_grid.png)
+
+### Pipeline
+
+```bash
+# 0. build everything
+make demo_tools
+
+# 1. synthesize the 10-image dataset
+./build/make_demo_dataset data/demo
+
+# 2. joint train: SpatialAI keyframes (text+image) +
+#    CEStorage 16×16 atomic IMAGE blocks via ce_feed_image_16 +
+#    one CE_TYPE_TEXT entry per morpheme of the clause
+./build/train_demo data/demo build/models/demo
+# -> build/models/demo.spai
+# -> build/models/demo.ces  (10,240 IMAGE + 38 TEXT entries, all sharing
+#                            canvas_id with their paired image)
+
+# 3. generate. The CLI tokenises the prompt with morpheme_tokenize_clause,
+#    looks up each morpheme via ce_search_by_type(CE_TYPE_TEXT, ...),
+#    votes a winning canvas_id (weight = 1/(1+distance)), and calls
+#    ce_generate_image_canvas_routed which restricts wave-refine targets
+#    to the routed canvas_id and decodes 16×16 atomic patches via
+#    ce_decode_image_block_16.
+./build/gen_image_ce build/models/demo.ces \
+    "red apple" build/gen/red_apple.ppm 0 50 200
+```
+
+### Generated outputs
+
+50 denoise steps + 200 wave-refine iterations per prompt, deterministic seed 0:
+
+![generated](docs/demo/generated_grid.png)
+
+| Prompt | Routed canvas | Mean RGB | Verdict |
+|---|---|---:|---|
+| `"red apple"`       | `apple`     | (196, 38, 38)  | **red** ✓ |
+| `"yellow banana"`   | `banana`    | (213, 195, 46) | **yellow** ✓ |
+| `"purple grape"`    | `grape`     | (118, 42, 146) | **purple** ✓ |
+| `"green lime"`      | `lime`      | (38, 195, 38)  | **green** ✓ |
+| `"blue blueberry"`  | `blueberry` | (38, 39, 196)  | **blue** ✓ |
+| `"orange fruit"`    | `orange`    | (220, 140, 41) | **orange** ✓ |
+
+**6/6** prompts route to the correct dataset row and decode to the
+matching colour. Routing works even when the prompt contains a non-label
+word (`"fruit"` is unknown to the dataset; the morpheme vote still picks
+`"orange"` as the dominant signal because `1/(1+distance)` falls off
+sharply for unrelated tokens).
+
+### What the textures show
+
+The generated images are colour-correct but visibly textured rather than
+smooth: this is the wave-refine loop tiling the top-K retrieved **16×16
+atomic patches** into a 256×256 canvas, ridden over by the residual
+noise of a 50-step denoise. Each patch comes from 4 quadrant CEUnits
+emitted by `ce_feed_image_16` (TL/TR/BL/BR) and decoded back via
+`ce_decode_image_block_16`. The block-level encoding preserves per-
+channel sums and 4-direction gradients; the high-frequency carry-chain
+pattern is the integer denoise asserting itself before averaging. With
+more diverse training data (real photographs rather than solid fills +
+ellipses) the CE retrieval has more useful neighbours to blend, which
+softens the texture without changing the algorithm.
+
+---
+
 ## Current verified results
 
 Everything below is reproduced by `make test` on this branch

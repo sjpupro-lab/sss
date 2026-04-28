@@ -41,6 +41,13 @@ void ce_decode_text(uint8_t *out, uint32_t *out_len,
  */
 void ce_decode_image_block(uint8_t *out_rgba_8x8, const CEUnit *u);
 
+/* Decode 4 quadrant CEUnits (TL=0, TR=1, BL=2, BR=3) into a 16x16 RGBA
+ * patch (1024 bytes, row-major). Each quadrant is decoded via
+ * ce_decode_image_block (8x8) and pasted into its sub-region of the
+ * 16x16 output. Inverse of ce_feed_image_16 for uniform-colour input. */
+void ce_decode_image_block_16(uint8_t *out_rgba_16x16,
+                              const CEUnit q[4]);
+
 #ifdef __cplusplus
 }
 #endif

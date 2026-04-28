@@ -7,7 +7,7 @@
 | Text Tokenizer | morpheme_tokenize_clause | spatial_morpheme.c | OK |
 | Text Embedding | ce_feed(token) → CEUnit | ce_core.c | OK |
 | Text→Image Cross Attn | ce_cross_attention | ce_engine.c | TODO CEStorage 미연결 |
-| VAE Encode (이미지→latent) | ce_feed_image 8×8→CEUnit | ce_feed_image.c | WARN 블록 작음 |
+| VAE Encode (이미지→latent) | ce_feed_image_16 16×16→4 CEUnit (atomic) | ce_feed_image.c | OK production via ce_storage_ingest_rgba_16 |
 | VAE Decode (latent→이미지) | ce_decode_image_block | ce_decode.c | OK |
 | Latent μ/σ 공간 | dec.A audio_amps[0..3] | slig_signal.c | TODO 렌더러 미사용 |
 | Diffusion Noise | ce_noise_init(seed) | ce_core.c | OK |
@@ -31,7 +31,7 @@
 | Audio Sync | ce_audio_load + ce_audio_energy_at | ce_extend.c | TODO 데드코드 |
 | Keyframe/Delta 저장 | ai_store_auto_with_image | spatial_keyframe.c | OK |
 | CEStorage 훈련 | ce_storage_add_typed | ce_storage.c | OK ce_storage_ingest_rgba / train_images_ce |
-| 형태소→이미지 검색 | ce_search_by_type(CE_TYPE_IMAGE) | ce_search.c | OK ce_generate_image_typed에 연결됨 |
+| 형태소→이미지 검색 | morpheme_tokenize_clause + ce_search_by_type(CE_TYPE_TEXT) → canvas_id 투표 → ce_generate_image_canvas_routed | ce_search.c, ce_gen.c | OK production (gen_image_ce 기본 경로) |
 
 ## CE Block 크기 문제
 
@@ -98,6 +98,16 @@
 - [x] `apply_global` 렌더 시 amp[2]로 진폭 변조 (하위호환 sentinel)
 - [x] 회귀 테스트 `test_slig_energy` 9/9 통과 + 시각 회귀 0건
 
+**16×16 atomic + per-morpheme CE refactor (이번 PR)**
+- [x] `ce_storage_ingest_rgba_16`: 16×16 블록 → `ce_feed_image_16` → 4 quadrant CEUnits/block, 1024 entries per 256² 이미지
+- [x] `ce_decode_image_block_16`: 4 quadrant → 16×16 RGBA round-trip
+- [x] `ce_generate_image_canvas_routed`: caller가 결정한 canvas_id로 wave-refine 타겟 필터, 16×16 atomic 패치 단위로 디코드+타일
+- [x] `train_demo`: 16×16 image 인제스트 + per-morpheme TEXT 브릿지 (canvas_id 공유)
+- [x] `gen_image_ce`: morpheme_tokenize_clause + 가중 투표 → canvas_routed
+- [x] byte-level `ce_generate_image_label_routed` 삭제
+- [x] 시각 검증: 6/6 prompts → 정확히 매칭된 색상 (이전 5/6에서 향상)
+- [x] 단위 테스트: `test_storage_ingest16`, `test_decode16`, `test_gen_routed`
+
 ### 후속 작업으로 분리
 
 | 항목 | 분리 사유 |
@@ -105,7 +115,7 @@
 | `LoRA (ce_memo) 스타일 파인튜닝` | 사용자 지시: 신규 자세/이미지 학습 시 형태소 관계·품사·RGBA 중요도에 따라 CE cell이 자동 추가됨 — 별도 API 불필요. 데드코드 `ce_memo` 정리 검토만 |
 | `ControlNet (ce_hint) edge/depth/pose/color` | 사용자 지시: depth/edge map을 audio track 인프라로 전송하는 통합 설계로 검토 (별도 PR) |
 | `Audio track: 음악 → 이미지` | 동영상 생성 경로용 (별도 PR). WAV 로더 + 스펙트럼 + 영상 페어 데이터셋 필요 |
-| **Cross-modal 텍스트↔이미지 정렬** | E2E에서 발견 — "blue" 프롬프트가 blue KF로 안 옴. CLIP-style joint training 또는 라벨 키 인덱스 필요 |
+| `cfg_scale 자동 도출` (POS 분포) | 현재 hardcoded preset 사용. 형태소 배열의 ADJ/NOUN 비율 → cfg_scale 매핑은 별도 작업 |
 | `.ces 델타 압축 (varint/zlib)` | `train_loop_bench` 결과: spatial-prev 델타가 21× 작음 → 압축 시 disk 70%↓ |
 | `ce_storage_ingest_rgba(..., dedup_eps)` 옵션 | 메모리 제약 시나리오 (eps=50 → 278× 압축, recall 1/3 비용) |
 

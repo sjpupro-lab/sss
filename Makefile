@@ -47,7 +47,7 @@ CE_CORE_OBJS = $(patsubst $(CE_CORE_DIR)/%.c,$(BUILD_DIR)/ce_core_%.o,$(CE_CORE_
 
 OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS)) $(CE_CORE_OBJS)
 
-TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_recluster test_refine test_image_roundtrip test_image_gen test_tick_math test_material
+TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_recluster test_refine test_image_roundtrip test_image_gen test_tick_math test_material test_gen_routed
 
 .PHONY: all clean test gpu_train_help probe_task_a bench_context bench_refine image_tools
 
@@ -136,6 +136,9 @@ $(BUILD_DIR)/test_tick_math: $(TEST_DIR)/test_tick_math.c $(OBJS) | $(BUILD_DIR)
 $(BUILD_DIR)/test_material: $(TEST_DIR)/test_material.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
+$(BUILD_DIR)/test_gen_routed: $(TEST_DIR)/test_gen_routed.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
 $(BUILD_DIR)/bench_v3: tools/bench_v3.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
@@ -153,6 +156,18 @@ $(BUILD_DIR)/train_images_ce: tools/train_images_ce.c $(OBJS) | $(BUILD_DIR)
 
 $(BUILD_DIR)/gen_image_ce: tools/gen_image_ce.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/make_demo_dataset: tools/make_demo_dataset.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< -o $@
+
+$(BUILD_DIR)/train_demo: tools/train_demo.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+demo_tools: $(BUILD_DIR)/make_demo_dataset $(BUILD_DIR)/train_demo $(BUILD_DIR)/gen_image_ce
+	@echo "Built demo tools. Pipeline:"
+	@echo "  ./build/make_demo_dataset data/demo"
+	@echo "  ./build/train_demo data/demo build/models/demo"
+	@echo "  ./build/gen_image_ce build/models/demo.ces \"red apple\" out.ppm 0 50 200"
 
 train_images_ce: $(BUILD_DIR)/train_images_ce
 	@echo "Built train_images_ce. Example:"
