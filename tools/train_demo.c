@@ -127,24 +127,100 @@ static char *trim(char *s) {
     return s;
 }
 
+static int parse_mask_strategy(const char *s, MaskStrategy *out) {
+    if (!s || !out) return 0;
+    if (strcmp(s, "correction") == 0) { *out = MASK_CORRECTION_ONLY; return 1; }
+    if (strcmp(s, "residual"  ) == 0) { *out = MASK_RESIDUAL_UP;     return 1; }
+    if (strcmp(s, "random"    ) == 0) { *out = MASK_RANDOM_HALF;     return 1; }
+    if (strcmp(s, "progressive") == 0){ *out = MASK_PROGRESSIVE;     return 1; }
+    return 0;
+}
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+            "usage: %s <dataset_dir> <out_base> [options]\n"
+            "  Masked-train control (forwarded to MaskedTrainConfig):\n"
+            "    --masked-epochs N         epoch budget per image (default 0 = off)\n"
+            "    --target-loss F           early stop when best loss <= F (default 8.0)\n"
+            "    --loss-patience N         stop after N epochs with no improvement (default 3)\n"
+            "    --denoise-steps N         denoise steps per epoch (default 8)\n"
+            "    --mask-strategy NAME      correction|residual|random|progressive (default progressive)\n"
+            "    --mask-seed U64           PRNG seed for random strategy (default 42)\n"
+            "    --residual-codebook       reduce correction cells to codebook descriptors\n"
+            "  Segment loss weights (all 0 = legacy mean loss):\n"
+            "    --loss-w-struct F         structure (basis) loss weight\n"
+            "    --loss-w-texture F        texture (edge+texture) loss weight\n"
+            "    --loss-w-color F          color (color+event) loss weight\n",
+            prog);
+}
+
 int main(int argc, char **argv) {
+    /* --help works even without positional args, so users can discover
+     * the new flags without first having to supply a dataset path. */
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            usage(argv[0]);
+            return 0;
+        }
+    }
     if (argc < 3) {
-        fprintf(stderr,
-                "usage: %s <dataset_dir> <out_base> [--masked-epochs N]"
-                " [--residual-codebook]\n",
-                argv[0]);
+        usage(argv[0]);
         return 2;
     }
     const char *dir = argv[1];
     const char *out = argv[2];
-    int masked_epochs   = 0;
-    int use_residual_cb = 0;
+
+    /* Defaults match masked_train_config_default — we only overwrite
+     * fields the user passes on the CLI. */
+    int       masked_epochs   = 0;
+    int       use_residual_cb = 0;
+    float     cli_target_loss = -1.0f;     /* sentinel: unset */
+    int       cli_patience    = -1;
+    int       cli_denoise     = -1;
+    MaskStrategy cli_strategy = MASK_PROGRESSIVE;
+    int       have_strategy   = 0;
+    uint64_t  cli_seed        = 0;
+    int       have_seed       = 0;
+    float     cli_w_struct    = 0.0f;
+    float     cli_w_texture   = 0.0f;
+    float     cli_w_color     = 0.0f;
+
     for (int i = 3; i < argc; ++i) {
         if (strcmp(argv[i], "--masked-epochs") == 0 && i + 1 < argc) {
             masked_epochs = atoi(argv[++i]);
             if (masked_epochs < 0) masked_epochs = 0;
+        } else if (strcmp(argv[i], "--target-loss") == 0 && i + 1 < argc) {
+            cli_target_loss = strtof(argv[++i], NULL);
+        } else if (strcmp(argv[i], "--loss-patience") == 0 && i + 1 < argc) {
+            cli_patience = atoi(argv[++i]);
+            if (cli_patience < 0) cli_patience = 0;
+        } else if (strcmp(argv[i], "--denoise-steps") == 0 && i + 1 < argc) {
+            cli_denoise = atoi(argv[++i]);
+            if (cli_denoise < 1) cli_denoise = 1;
+        } else if (strcmp(argv[i], "--mask-strategy") == 0 && i + 1 < argc) {
+            if (!parse_mask_strategy(argv[++i], &cli_strategy)) {
+                fprintf(stderr,
+                        "[train_demo] unknown mask strategy '%s'"
+                        " (expected correction|residual|random|progressive)\n",
+                        argv[i]);
+                return 2;
+            }
+            have_strategy = 1;
+        } else if (strcmp(argv[i], "--mask-seed") == 0 && i + 1 < argc) {
+            cli_seed = strtoull(argv[++i], NULL, 0);
+            have_seed = 1;
+        } else if (strcmp(argv[i], "--loss-w-struct") == 0 && i + 1 < argc) {
+            cli_w_struct  = strtof(argv[++i], NULL);
+        } else if (strcmp(argv[i], "--loss-w-texture") == 0 && i + 1 < argc) {
+            cli_w_texture = strtof(argv[++i], NULL);
+        } else if (strcmp(argv[i], "--loss-w-color") == 0 && i + 1 < argc) {
+            cli_w_color   = strtof(argv[++i], NULL);
         } else if (strcmp(argv[i], "--residual-codebook") == 0) {
             use_residual_cb = 1;
+        } else if (strcmp(argv[i], "--help") == 0 ||
+                   strcmp(argv[i], "-h"    ) == 0) {
+            usage(argv[0]);
+            return 0;
         } else {
             fprintf(stderr, "[train_demo] ignoring unknown arg: %s\n", argv[i]);
         }
@@ -240,6 +316,14 @@ int main(int argc, char **argv) {
                 MaskedTrainConfig mcfg;
                 masked_train_config_default(&mcfg);
                 mcfg.epochs = masked_epochs;
+                if (cli_target_loss >= 0)  mcfg.target_loss   = cli_target_loss;
+                if (cli_patience    >= 0)  mcfg.loss_patience = (float)cli_patience;
+                if (cli_denoise     >= 1)  mcfg.denoise_steps = cli_denoise;
+                if (have_strategy)         mcfg.strategy      = cli_strategy;
+                if (have_seed)             mcfg.mask_seed     = cli_seed;
+                mcfg.loss_w_structure      = cli_w_struct;
+                mcfg.loss_w_texture        = cli_w_texture;
+                mcfg.loss_w_color          = cli_w_color;
                 if (use_residual_cb) {
                     mcfg.residual_book = &residual_cb;
                 }
@@ -249,9 +333,11 @@ int main(int argc, char **argv) {
                 total_residual_descriptors += mres.residual_cells;
                 if (mres.converged) ++masked_converged;
                 fprintf(stderr,
-                        "[train_demo]  +MSK epochs_run=%d loss=%.2f converged=%d "
+                        "[train_demo]  +MSK epochs_run=%d loss=%.2f "
+                        "(struct=%.2f tex=%.2f color=%.2f) converged=%d "
                         "cells_stored=%u residuals=%u\n",
                         mres.epochs_run, mres.final_loss,
+                        mres.loss_structure, mres.loss_texture, mres.loss_color,
                         mres.converged, mres.cells_stored, mres.residual_cells);
             }
 

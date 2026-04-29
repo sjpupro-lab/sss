@@ -82,6 +82,17 @@ typedef struct {
     CEResidualCodebook *residual_book;
     uint32_t            residual_threshold; /* 0이면 CE_RESIDUAL_DEFAULT_THRESHOLD */
 
+    /* Segment loss weights — total = w_struct * L_struct
+     *                             + w_texture * L_texture
+     *                             + w_color   * L_color
+     * Segments map to SligDecomposed buckets: structure = basis cells,
+     * texture = edge + texture cells, color = color + event cells.
+     * If all three weights are 0 the legacy mean loss is used (so
+     * masked_train_config_default keeps the pre-Step-5 behaviour). */
+    float    loss_w_structure;   /* default 0 (= legacy mean loss) */
+    float    loss_w_texture;     /* default 0 */
+    float    loss_w_color;       /* default 0 */
+
     /* 콜백 (NULL이면 무시) */
     void (*on_epoch)(int epoch, float loss, void *ctx);
     void *cb_ctx;
@@ -94,11 +105,19 @@ void masked_train_config_default(MaskedTrainConfig *cfg);
  * ════════════════════════════════════════════════════════ */
 
 typedef struct {
-    float    final_loss;       /* 최종 loss */
+    float    final_loss;       /* 최종 loss (weighted total when seg weights set) */
     int      epochs_run;       /* 실제 실행된 epoch 수 */
     int      converged;        /* 1이면 target_loss 이하에 도달 */
     uint32_t cells_stored;     /* CEStorage에 저장된 셀 수 (raw + descriptor) */
     uint32_t residual_cells;   /* 그 중 CE_TYPE_RESIDUAL descriptor 개수 */
+
+    /* Per-segment mean loss at the best epoch (zero when the segment
+     * had no masked cells). Always populated, regardless of whether
+     * weighted aggregation was active — useful for diagnosing which
+     * segment dominates total loss. */
+    float    loss_structure;
+    float    loss_texture;
+    float    loss_color;
 
     /* 수렴된 CE Cell 세트 (correction 추론 결과 포함) */
     SligDecomposed learned;

@@ -32,6 +32,11 @@ void masked_train_config_default(MaskedTrainConfig *cfg) {
     cfg->store_on_converge = 1;
     cfg->residual_book     = NULL;
     cfg->residual_threshold = 0;
+    /* Segment weights default to 0 → use legacy mean loss. Callers who
+     * want the structure/texture/color split set positive weights. */
+    cfg->loss_w_structure  = 0.0f;
+    cfg->loss_w_texture    = 0.0f;
+    cfg->loss_w_color      = 0.0f;
     cfg->on_epoch          = NULL;
     cfg->cb_ctx            = NULL;
 }
@@ -298,12 +303,24 @@ static void build_mask(uint8_t *mask, uint32_t num_cells,
  *  denoise loop을 돌려서 예측합니다.
  * ══════════════════════════════════════════════════════ */
 
+/* Output struct mirroring SligDecomposed's natural segments:
+ *   structure = cells[0 .. structure_end)
+ *   texture   = cells[structure_end .. texture_end)
+ *   color     = cells[texture_end .. num_cells)         */
+typedef struct {
+    float total;        /* mean over all masked cells (legacy) */
+    float structure;    /* mean over masked structure cells   */
+    float texture;      /* mean over masked texture cells     */
+    float color;        /* mean over masked color cells       */
+} SegLosses;
+
 static float predict_and_measure(SligDecomposed *predicted,
                                  const SligDecomposed *original,
                                  const uint8_t *mask,
                                  uint32_t canvas_id,
                                  const CEGenConfig *gen_cfg,
-                                 uint64_t seed) {
+                                 uint64_t seed,
+                                 SegLosses *out_seg) {
     /* 임시 storage: 마스크되지 않은 셀만 넣음 */
     CEStorage tmp_storage;
     ce_storage_init(&tmp_storage, 128);
@@ -359,20 +376,36 @@ static float predict_and_measure(SligDecomposed *predicted,
         }
     }
 
-    /* loss 계산: 마스크된 셀만 비교 */
-    float total_loss = 0.0f;
-    int masked_count = 0;
+    /* loss 계산: 마스크된 셀을 segment별로 누적
+     *   structure = cells[0..structure_end)
+     *   texture   = cells[structure_end..texture_end)  (edge + texture)
+     *   color     = cells[texture_end..num_cells)      (color + event)
+     * 각 segment 별 평균을 따로 반환해서 호출자가 가중치를 줄 수 있게 한다. */
+    float sum_struct = 0, sum_tex = 0, sum_col = 0;
+    int   n_struct   = 0, n_tex   = 0, n_col   = 0;
     for (uint32_t i = 0; i < original->num_cells; i++) {
         if (!mask[i]) continue;
         CELoss cell_loss;
         ce_compute_loss(&cell_loss, &predicted->cells[i], &original->cells[i]);
-        total_loss += cell_loss.total_loss;
-        masked_count++;
+        if      (i < original->structure_end) { sum_struct += cell_loss.total_loss; n_struct++; }
+        else if (i < original->texture_end  ) { sum_tex    += cell_loss.total_loss; n_tex++;    }
+        else                                  { sum_col    += cell_loss.total_loss; n_col++;    }
     }
 
     ce_storage_free(&tmp_storage);
 
-    return (masked_count > 0) ? (total_loss / (float)masked_count) : 0.0f;
+    SegLosses seg = {0};
+    seg.structure = (n_struct > 0) ? (sum_struct / (float)n_struct) : 0.0f;
+    seg.texture   = (n_tex    > 0) ? (sum_tex    / (float)n_tex   ) : 0.0f;
+    seg.color     = (n_col    > 0) ? (sum_col    / (float)n_col   ) : 0.0f;
+
+    int total_count = n_struct + n_tex + n_col;
+    seg.total = (total_count > 0)
+              ? ((sum_struct + sum_tex + sum_col) / (float)total_count)
+              : 0.0f;
+
+    if (out_seg) *out_seg = seg;
+    return seg.total;
 }
 
 /* ══════════════════════════════════════════════════════
@@ -421,10 +454,18 @@ void masked_train_image(MaskedTrainResult      *result,
     CEGenConfig gen_cfg = ce_gen_config_default();
     gen_cfg.total_steps = c.denoise_steps;
 
+    /* If the caller set any segment weight, switch into weighted-loss
+     * mode. Otherwise keep the legacy mean-of-all-masked behaviour so
+     * existing callers see the same numbers. */
+    int weighted = (c.loss_w_structure > 0.0f) ||
+                   (c.loss_w_texture   > 0.0f) ||
+                   (c.loss_w_color     > 0.0f);
+
     float best_loss = 1e9f;
     int patience_counter = 0;
     SligDecomposed best_predicted;
     memset(&best_predicted, 0, sizeof(best_predicted));
+    SegLosses best_seg = {0};
 
     for (int epoch = 0; epoch < c.epochs; epoch++) {
         /* 마스크 생성 */
@@ -437,11 +478,23 @@ void masked_train_image(MaskedTrainResult      *result,
             if (mask[i]) masked_count++;
         if (masked_count == 0) continue;  /* 가릴 게 없으면 스킵 */
 
-        /* 예측 + loss 측정 */
+        /* 예측 + loss 측정 (segment-aware) */
         SligDecomposed predicted;
         uint64_t epoch_seed = c.mask_seed ^ ((uint64_t)(epoch + 1) * 0xDEADBEEFULL);
-        float loss = predict_and_measure(&predicted, &original, mask,
-                                          canvas_id, &gen_cfg, epoch_seed);
+        SegLosses seg;
+        float mean_loss = predict_and_measure(&predicted, &original, mask,
+                                              canvas_id, &gen_cfg, epoch_seed,
+                                              &seg);
+
+        /* Aggregate: weighted sum if any segment weight set, else mean. */
+        float loss;
+        if (weighted) {
+            loss = c.loss_w_structure * seg.structure
+                 + c.loss_w_texture   * seg.texture
+                 + c.loss_w_color     * seg.color;
+        } else {
+            loss = mean_loss;
+        }
 
         /* 콜백 */
         if (c.on_epoch)
@@ -451,6 +504,7 @@ void masked_train_image(MaskedTrainResult      *result,
         if (loss < best_loss) {
             best_loss = loss;
             best_predicted = predicted;
+            best_seg = seg;
             patience_counter = 0;
         } else {
             patience_counter++;
@@ -473,9 +527,12 @@ void masked_train_image(MaskedTrainResult      *result,
     }
 
     /* ── Step 3: 결과 기록 ───────────────────────────── */
-    result->final_loss = best_loss;
-    result->converged = (best_loss <= c.target_loss) ? 1 : 0;
-    result->learned = best_predicted;
+    result->final_loss     = best_loss;
+    result->converged      = (best_loss <= c.target_loss) ? 1 : 0;
+    result->learned        = best_predicted;
+    result->loss_structure = best_seg.structure;
+    result->loss_texture   = best_seg.texture;
+    result->loss_color     = best_seg.color;
 
     /* ── Step 4: 수렴된 셀을 CEStorage에 저장 ────────── */
     if (c.store_on_converge && best_predicted.num_cells > 0) {

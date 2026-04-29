@@ -173,6 +173,18 @@ verify_hybrid: $(BUILD_DIR)/verify_hybrid
 	@echo "Built verify_hybrid. Example:"
 	@echo "  ./build/verify_hybrid data/demo/img/*.ppm"
 
+# Single-cell wave residual visualizer — drops one CE Cell on an empty
+# canvas and writes a PPM. Used to eyeball wave shape before trusting
+# it inside the masked-train loop.
+$(BUILD_DIR)/wave_debug: tools/wave_debug.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+wave_debug: $(BUILD_DIR)/wave_debug
+	@echo "Built wave_debug. Examples:"
+	@echo "  ./build/wave_debug ripple.ppm --dir 6 --freq 16 --speed 4 --tick 30"
+	@echo "  ./build/wave_debug beam.ppm   --dir 7 --sigma 8000 --tick 40"
+	@echo "  ./build/wave_debug horiz.ppm  --dir 0 --sigma 4000"
+
 demo_tools: $(BUILD_DIR)/make_demo_dataset $(BUILD_DIR)/train_demo $(BUILD_DIR)/gen_image_ce $(BUILD_DIR)/verify_hybrid
 	@echo "Built demo tools. Pipeline:"
 	@echo "  ./build/make_demo_dataset data/demo"
