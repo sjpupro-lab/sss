@@ -14,10 +14,11 @@ Branch: `claude/validate-ai-framework-dbyUb`  Date: 2026-04-29
 
 ## 2. End-to-end pipeline
 
-`train_demo data/demo build/models/demo_cb --masked-epochs 50 --residual-codebook` →
-10 rows, 21 419 entries, 96 RESIDUAL descriptors (codebook size = 5 patterns).
+`./build/train_demo data/demo build/models/demo_cb --masked-epochs 50 --residual-codebook` →
+10 rows, 21,419 entries, 96 RESIDUAL descriptors (codebook size = 5 patterns).
 
-`gen_image_ce demo_cb.ces "red apple" out.ppm 0 50 200 --hybrid` runs and writes a 256×256 PPM.
+`./build/gen_image_ce build/models/demo_cb.ces "red apple" out.ppm 0 50 200 --hybrid`
+runs and writes a 256×256 PPM.
 
 ## 3. The four user-stated quality checks
 
@@ -46,10 +47,23 @@ Multi-morpheme prompts collapse to the single highest-voting morpheme's cid. The
 
 ## 4. Concrete gaps to close
 
-1. **Persist residual codebook**: extend `ce_storage_save/load` to serialize `CEResidualCodebook`, and have `gen_image_ce` set `hcfg.residual_book = &loaded_book`.
-2. **Wire masked-train output into decode**: either store the converged best_predicted as canonical CE_TYPE_SLIG entries that `ce_storage_load_slig_sets` actually picks up (slot/block_idx encoding currently doesn't match the encoder's `(scale, channel)` layout), or read masked cells directly in `hybrid_decode_detail_only`.
-3. **Bypass early stopping for the loss trajectory test**: expose `loss_patience` as a CLI arg, or add a sweep tool that captures loss per epoch via the `on_epoch` callback.
-4. **Compositional voting**: `vote_canvas_id` currently winner-takes-all. To compose "red" + "apple" you need either multi-cid blending in `hybrid_vae_decode`, or a TEXT→token cross-attention into the codebook rather than a single cid lookup.
+1. ~~**Persist residual codebook**~~ → **DONE.** `.ces` file format bumped to v3 with a trailing `RCBK` section. `ce_storage_save_with_codebook` / `ce_storage_load_with_codebook` round-trip the codebook byte-for-byte (test_residual_codebook adds a roundtrip case). `train_demo` writes the codebook on `--residual-codebook`, `gen_image_ce` reads it and wires `hcfg.residual_book` through `--hybrid`. Old v1/v2 files still load.
+2. ~~**Wire masked-train output into decode**~~ → **DONE.** `ce_storage_append_slig_set` / `ce_storage_slig_bucket_count` let the masked-train pipeline distribute its converged cells across the same `(scale_level, channel)` grid the encoder uses, stacking BEHIND the encoder's cells instead of overwriting them. `apple` now loads 119 SLIG cells (vs. 96 before); decode mean RGB shifts (165.7, 141.5, 147.9) → (143.5, 126.7, 135.9) when masked-train is disabled.
+3. **Bypass early stopping for the loss trajectory test**: expose `loss_patience` as a CLI arg, or add a sweep tool that captures loss per epoch via the `on_epoch` callback. Still pending — `epochs_run` caps at 5–11 because `loss_patience = 3` halts before the 50-epoch budget is used.
+4. ~~**Compositional voting**~~ → **PARTIAL.** Added `--blend K` to `gen_image_ce`; `vote_canvas_ids_topk` returns the top-K cids by accumulated morpheme weight, and `hybrid_decode_blended` decodes each into its own RGB plane and linearly blends by normalised weight. `red apple --blend 2` now mixes cid 0x731e137f (red) + 0xa366baaf (apple) — mean RGB jumps (0.1, 24.1, 0.0) → (83.2, 83.1, 74.3). True token-level cross-attention into the codebook is still future work.
+
+## 4b. After-fix re-validation
+
+| check                                                 | before   | after                         |
+|-------------------------------------------------------|----------|-------------------------------|
+| `test_residual_codebook`                              | 28 PASS  | 36 PASS (+ codebook roundtrip)|
+| `cb_apple` vs `e0_apple` PPM bytes                    | identical| **DIFFER** (165.7 vs 143.5 R) |
+| `red apple --blend 2` SLIG cells loaded               | 23 (red) | 23 + 119 (red + apple)        |
+| `red apple --blend 2` mean RGB                        | (0.1, 24.1, 0.0) | (83.2, 83.1, 74.3)    |
+| residual codebook patterns persisted to .ces          | 0        | 5                             |
+| ce_core unit tests                                    | 33/34*   | 33/34* (no regression)        |
+
+\* the one remaining failure (`test_slig_signal` "Beam: along path > off path") pre-dates this branch and is unrelated to the masked-train / codebook plumbing.
 
 ## 5. What works (don't lose this)
 

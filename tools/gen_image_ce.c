@@ -36,6 +36,7 @@
 #include "ce_denoise.h"
 #include "ce_type.h"
 #include "ce_hybrid_vae.h"
+#include "ce_residual_codebook.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,14 +59,19 @@ static int write_ppm(const char *path, const CEImage *img) {
     return 1;
 }
 
-/* Vote canvas_id by per-morpheme TEXT search. Each morpheme contributes
+/* Vote canvas_ids by per-morpheme TEXT search and return the top-K
+ * sorted by accumulated weight. Each morpheme contributes
  * weight 1/(1+distance) to the canvas_id of its nearest TEXT entry.
- * Returns winning canvas_id and sets *found = 1 on success. */
-static uint32_t vote_canvas_id(const CEStorage *storage,
-                               const Morpheme *morphs, uint32_t n,
-                               int *found) {
-    *found = 0;
-    if (!storage || storage->count == 0 || n == 0) return 0;
+ *
+ * `out_cids[]` and `out_weights[]` must hold at least `k_max` slots.
+ * Returns the actual number of distinct cids written (0..k_max). The
+ * weights are NOT normalised — callers can divide by the sum if a
+ * mixing fraction is wanted. */
+static int vote_canvas_ids_topk(const CEStorage *storage,
+                                const Morpheme *morphs, uint32_t n,
+                                uint32_t *out_cids, double *out_weights,
+                                int k_max) {
+    if (!storage || storage->count == 0 || n == 0 || k_max <= 0) return 0;
 
     struct { uint32_t cid; double weight; } votes[MAX_VOTES];
     int vote_count = 0;
@@ -100,19 +106,92 @@ static uint32_t vote_canvas_id(const CEStorage *storage,
 
     if (vote_count == 0) return 0;
 
-    int best = 0;
-    for (int v = 1; v < vote_count; ++v) {
-        if (votes[v].weight > votes[best].weight) best = v;
+    /* Selection sort the top-K (small N, no need for qsort). */
+    int picked = 0;
+    int taken[MAX_VOTES] = {0};
+    while (picked < k_max && picked < vote_count) {
+        int best = -1;
+        for (int v = 0; v < vote_count; ++v) {
+            if (taken[v]) continue;
+            if (best < 0 || votes[v].weight > votes[best].weight) best = v;
+        }
+        if (best < 0) break;
+        out_cids[picked]    = votes[best].cid;
+        out_weights[picked] = votes[best].weight;
+        taken[best] = 1;
+        ++picked;
     }
+    return picked;
+}
+
+/* Backwards-compatible single-cid vote (kept for the canvas_routed
+ * non-hybrid path). */
+static uint32_t vote_canvas_id(const CEStorage *storage,
+                               const Morpheme *morphs, uint32_t n,
+                               int *found) {
+    *found = 0;
+    uint32_t cids[1];
+    double   ws[1];
+    int got = vote_canvas_ids_topk(storage, morphs, n, cids, ws, 1);
+    if (got <= 0) return 0;
     *found = 1;
-    return votes[best].cid;
+    return cids[0];
+}
+
+/* Multi-cid blend for the --hybrid path. Decode each cid into its own
+ * RGB plane via hybrid_vae_decode, then linearly blend by normalised
+ * weight. Single-cid case (n_cids == 1) reproduces the old behaviour
+ * exactly. */
+static void hybrid_decode_blended(uint8_t        *out_rgb,
+                                  const CEStorage *storage,
+                                  const uint32_t  *cids,
+                                  const double    *weights,
+                                  int              n_cids,
+                                  const HybridVAEConfig *cfg) {
+    int n_pixels = 256 * 256;
+    if (n_cids <= 0) {
+        memset(out_rgb, 0, (size_t)n_pixels * 3);
+        return;
+    }
+
+    double w_sum = 0.0;
+    for (int k = 0; k < n_cids; ++k) w_sum += weights[k];
+    if (w_sum <= 0.0) w_sum = 1.0;
+
+    double *acc = (double *)calloc((size_t)n_pixels * 3, sizeof(double));
+    uint8_t *tmp = (uint8_t *)malloc((size_t)n_pixels * 3);
+    if (!acc || !tmp) { free(acc); free(tmp); return; }
+
+    for (int k = 0; k < n_cids; ++k) {
+        SligCellSet sets[SLIG_NUM_LEVELS][SLIG_NUM_CHANNELS];
+        uint32_t loaded = ce_storage_load_slig_sets(
+            storage, cids[k], (struct SligCellSet *)sets);
+        fprintf(stderr,
+                "[gen_image_ce] --hybrid: cid=0x%08x weight=%.3f slig_cells=%u\n",
+                cids[k], weights[k], loaded);
+
+        hybrid_vae_decode(tmp, storage, cids[k], sets, cfg);
+
+        double w = weights[k] / w_sum;
+        for (int i = 0; i < n_pixels * 3; ++i) {
+            acc[i] += w * (double)tmp[i];
+        }
+    }
+
+    for (int i = 0; i < n_pixels * 3; ++i) {
+        int v = (int)(acc[i] + 0.5);
+        if (v < 0) v = 0; else if (v > 255) v = 255;
+        out_rgb[i] = (uint8_t)v;
+    }
+    free(acc);
+    free(tmp);
 }
 
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr,
                 "usage: %s <model.ces> <prompt> <out.ppm> [seed] [steps] [wave_iters]"
-                " [--hybrid] [--guidance N.N]\n",
+                " [--hybrid] [--guidance N.N] [--blend K]\n",
                 argv[0]);
         return 2;
     }
@@ -125,6 +204,7 @@ int main(int argc, char **argv) {
     uint32_t wave_iters = 200u;
     int      hybrid     = 0;
     float    guidance   = 1.5f;
+    int      blend_topk = 1;     /* --blend N: mix top-N cids in --hybrid */
 
     /* Positional: seed, steps, wave_iters (each optional). Stops at the
      * first '--' flag. */
@@ -145,17 +225,24 @@ int main(int argc, char **argv) {
             hybrid = 1;
         } else if (strcmp(argv[i], "--guidance") == 0 && i + 1 < argc) {
             guidance = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--blend") == 0 && i + 1 < argc) {
+            blend_topk = atoi(argv[++i]);
+            if (blend_topk < 1) blend_topk = 1;
+            if (blend_topk > MAX_VOTES) blend_topk = MAX_VOTES;
         } else {
             fprintf(stderr, "[gen_image_ce] ignoring unknown arg: %s\n", argv[i]);
         }
     }
 
     CEStorage S;
-    if (!ce_storage_load(&S, ces_path)) {
+    CEResidualCodebook book;
+    if (!ce_storage_load_with_codebook(&S, &book, ces_path)) {
         fprintf(stderr, "[gen_image_ce] load %s failed\n", ces_path);
         return 1;
     }
-    fprintf(stderr, "[gen_image_ce] loaded %s (%u entries)\n", ces_path, S.count);
+    fprintf(stderr,
+            "[gen_image_ce] loaded %s (%u entries, residual codebook = %u patterns)\n",
+            ces_path, S.count, book.count);
 
     morpheme_init();
 
@@ -179,7 +266,12 @@ int main(int argc, char **argv) {
     fputc('\n', stderr);
 
     int routed = 0;
-    uint32_t cid = vote_canvas_id(&S, morphs, n_morph, &routed);
+    uint32_t top_cids[MAX_VOTES];
+    double   top_weights[MAX_VOTES];
+    int      n_top = vote_canvas_ids_topk(&S, morphs, n_morph,
+                                          top_cids, top_weights, blend_topk);
+    uint32_t cid = (n_top > 0) ? top_cids[0] : 0;
+    routed = (n_top > 0);
 
     if (hybrid) {
         if (!routed) {
@@ -188,7 +280,10 @@ int main(int argc, char **argv) {
                     "first IMAGE canvas_id\n");
             for (uint32_t k = 0; k < S.count; ++k) {
                 if (S.entries[k].type == CE_TYPE_IMAGE) {
-                    cid = S.entries[k].canvas_id;
+                    top_cids[0]    = S.entries[k].canvas_id;
+                    top_weights[0] = 1.0;
+                    n_top  = 1;
+                    cid    = top_cids[0];
                     routed = 1;
                     break;
                 }
@@ -202,23 +297,20 @@ int main(int argc, char **argv) {
                                     prompt, seed, &cfg, wave_iters);
         } else {
             fprintf(stderr,
-                    "[gen_image_ce] --hybrid: cid=0x%08x guidance=%.2f\n",
-                    cid, guidance);
+                    "[gen_image_ce] --hybrid: top%d cid blend, guidance=%.2f\n",
+                    n_top, guidance);
             HybridVAEConfig hcfg;
             hybrid_vae_config_default(&hcfg);
             hcfg.guidance_scale = guidance;
             hcfg.wave_iterations = wave_iters;
-            /* SLIG sets are now persisted in CEStorage (CE_TYPE_SLIG).
-             * Reassemble the 3×3 grid from entries matching cid; sets
-             * with no entries fall back to silent residuals. */
-            SligCellSet sets[SLIG_NUM_LEVELS][SLIG_NUM_CHANNELS];
-            uint32_t loaded = ce_storage_load_slig_sets(
-                &S, cid, (struct SligCellSet *)sets);
-            fprintf(stderr,
-                    "[gen_image_ce] --hybrid: loaded %u SLIG cells from storage\n",
-                    loaded);
+            /* Wire the loaded codebook so hybrid_vae_decode's residual
+             * stamping path is no longer a no-op. NULL when the .ces
+             * was saved without --residual-codebook. */
+            hcfg.residual_book = (book.count > 0) ? &book : NULL;
+
             uint8_t out_rgb[256 * 256 * 3];
-            hybrid_vae_decode(out_rgb, &S, cid, sets, &hcfg);
+            hybrid_decode_blended(out_rgb, &S,
+                                  top_cids, top_weights, n_top, &hcfg);
 
             img->width  = 256;
             img->height = 256;

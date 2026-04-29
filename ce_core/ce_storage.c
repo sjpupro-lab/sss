@@ -184,9 +184,10 @@ uint32_t ce_storage_ingest_rgba(CEStorage *s,
     return added;
 }
 
-uint32_t ce_storage_persist_slig_set(CEStorage *s,
-                                     uint32_t canvas_id,
-                                     const struct SligCellSet *set) {
+uint32_t ce_storage_append_slig_set(CEStorage *s,
+                                    uint32_t canvas_id,
+                                    const struct SligCellSet *set,
+                                    uint32_t base_idx) {
     if (!s || !set || set->num_cells == 0) return 0;
     if (set->scale_level >= SLIG_NUM_LEVELS ||
         set->channel >= SLIG_NUM_CHANNELS) return 0;
@@ -197,6 +198,10 @@ uint32_t ce_storage_persist_slig_set(CEStorage *s,
     int has_prev = 0;
     uint32_t added = 0;
     for (uint32_t i = 0; i < set->num_cells; ++i) {
+        uint32_t idx = base_idx + i;
+        if (idx > 0xFFFFu) break;     /* slot index is uint16_t */
+        if (idx >= SLIG_MAX_CELLS) break; /* loader caps reads at this */
+
         const CEUnit *kf = &set->cells[i];
         CEUnit delta;
         if (!has_prev) {
@@ -205,13 +210,38 @@ uint32_t ce_storage_persist_slig_set(CEStorage *s,
         } else {
             ce_delta(&delta, &prev, kf);
         }
-        ce_storage_add_typed(s, canvas_id, slot, (uint16_t)(i & 0xFFFF),
+        ce_storage_add_typed(s, canvas_id, slot, (uint16_t)idx,
                              CE_TYPE_SLIG, kf, &delta);
         prev = *kf;
         has_prev = 1;
         ++added;
     }
     return added;
+}
+
+uint32_t ce_storage_persist_slig_set(CEStorage *s,
+                                     uint32_t canvas_id,
+                                     const struct SligCellSet *set) {
+    return ce_storage_append_slig_set(s, canvas_id, set, 0);
+}
+
+uint32_t ce_storage_slig_bucket_count(const CEStorage *s,
+                                      uint32_t canvas_id,
+                                      uint8_t  scale_level,
+                                      uint8_t  channel) {
+    if (!s) return 0;
+    if (scale_level >= SLIG_NUM_LEVELS || channel >= SLIG_NUM_CHANNELS) return 0;
+    uint16_t slot = (uint16_t)(scale_level * SLIG_NUM_CHANNELS + channel);
+    uint32_t max_idx_plus_one = 0;
+    for (uint32_t i = 0; i < s->count; ++i) {
+        const CEStorageEntry *e = &s->entries[i];
+        if (e->type != CE_TYPE_SLIG)   continue;
+        if (e->canvas_id != canvas_id) continue;
+        if (e->slot != slot)           continue;
+        uint32_t idx_p1 = (uint32_t)e->block_idx + 1u;
+        if (idx_p1 > max_idx_plus_one) max_idx_plus_one = idx_p1;
+    }
+    return max_idx_plus_one;
 }
 
 uint32_t ce_storage_load_slig_sets(const CEStorage *s,

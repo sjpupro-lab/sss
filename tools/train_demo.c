@@ -289,7 +289,12 @@ int main(int argc, char **argv) {
 
     char ces_path[1024];
     snprintf(ces_path, sizeof(ces_path), "%s.ces", out);
-    if (!ce_storage_save(&ces, ces_path)) {
+    /* Always write v3 — codebook is empty when --residual-codebook is
+     * off, populated when on. The trailer adds 8 bytes (magic + count)
+     * even with zero codes, which is negligible. */
+    if (!ce_storage_save_with_codebook(&ces,
+                                       use_residual_cb ? &residual_cb : NULL,
+                                       ces_path)) {
         fprintf(stderr, "[train_demo] ce_storage_save failed\n");
         ce_storage_free(&ces);
         spatial_ai_destroy(ai);
