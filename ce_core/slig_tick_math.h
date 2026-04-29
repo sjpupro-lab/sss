@@ -126,10 +126,10 @@ extern const uint8_t TICK_COS_TABLE[256];
 /* exp(−x²/2) at x = i/64 → [0, 255]. Decays from 255 at i=0 to 0 at i=255. */
 extern const uint8_t TICK_GAUSS_TABLE[256];
 
-/* Wave-step amplitude cycle (1, 3, 10, 30, 10, 3, 1) — same shape
- * as ce_image_wave_refine's 0.01→0.1→1→3→1→0.1→0.01 but in tick
- * units. Used by the harmonic upscaler and unsharp mask. */
-extern const uint8_t WAVE_STEPS[7];
+/* WAVE_STEPS — see ce_wave_steps.h. Re-exported here so callers that
+ * already pull in slig_tick_math.h (slig_signal.c, slig_pipeline.c)
+ * don't need a second include. */
+#include "ce_wave_steps.h"
 
 #ifdef __cplusplus
 }

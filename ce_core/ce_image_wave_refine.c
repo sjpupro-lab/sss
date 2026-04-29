@@ -1,5 +1,7 @@
 /* ce_image_wave_refine.c — see ce_image_wave_refine.h. */
 #include "ce_image_wave_refine.h"
+#include "ce_wave_steps.h"   /* WAVE_STEPS only — keeps this TU free of
+                                CEUnit/ingest deps per the header note. */
 
 #include <stdlib.h>
 #include <string.h>
@@ -15,16 +17,9 @@ static float absf2(float v) {
 }
 
 float ce_wave_step_value(uint32_t iter) {
-    static const float wave[7] = {
-        0.01f,
-        0.1f,
-        1.0f,
-        3.0f,
-        1.0f,
-        0.1f,
-        0.01f
-    };
-    return wave[iter % 7];
+    /* WAVE_STEPS lives in tick units (×100 of the float-domain values
+     * documented in the header: 0.01 → 0.1 → 1 → 3 → 1 → 0.1 → 0.01). */
+    return (float)WAVE_STEPS[iter % 7] / 100.0f;
 }
 
 void ce_wave_build_target_from_top3(CEPixelF *out_target,

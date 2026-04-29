@@ -124,4 +124,4 @@ const uint8_t TICK_GAUSS_TABLE[256] = {
 };
 
 
-const uint8_t WAVE_STEPS[7] = { 1, 3, 10, 30, 10, 3, 1 };
+const uint16_t WAVE_STEPS[7] = { 1, 10, 100, 300, 100, 10, 1 };
