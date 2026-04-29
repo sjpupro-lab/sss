@@ -1,6 +1,7 @@
 /* ce_image_wave_refine.c — see ce_image_wave_refine.h. */
 #include "ce_image_wave_refine.h"
-#include "slig_tick_math.h"   /* WAVE_STEPS — single source of truth */
+#include "ce_wave_steps.h"   /* WAVE_STEPS only — keeps this TU free of
+                                CEUnit/ingest deps per the header note. */
 
 #include <stdlib.h>
 #include <string.h>
