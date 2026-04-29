@@ -91,11 +91,15 @@ int main(void) {
             &book, &probe, CE_RESIDUAL_DEFAULT_THRESHOLD);
 
         /* Force a high enough strength so the apply step actually
-         * mutates blend_y by more than 0. */
+         * mutates blend_y by more than 0. Spread the patches across
+         * different (x, y) positions so the 8×8 stamp reaches
+         * non-overlapping rows. */
+        uint16_t px = (uint16_t)((i * 37) & 0xFF);
+        uint16_t py = (uint16_t)((i * 53) & 0xFF);
         ce_residual_storage_add(&S, /*cid=*/0xC0DEu,
             /*slot=*/(uint16_t)(i / 8),
             /*block_idx=*/(uint16_t)(i % 8),
-            idx, /*strength=*/200, probe.tick);
+            idx, /*strength=*/200, probe.tick, px, py);
     }
     CHECK(book.count > 0, "codebook populated");
 

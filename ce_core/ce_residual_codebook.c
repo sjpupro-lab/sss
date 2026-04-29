@@ -107,14 +107,16 @@ void ce_residual_storage_add(CEStorage *storage,
                              uint16_t   block_idx,
                              uint8_t    codebook_idx,
                              uint8_t    strength,
-                             TickRGBA   tick) {
+                             TickRGBA   tick,
+                             uint16_t   x,
+                             uint16_t   y) {
     if (!storage) return;
 
     CEUnit descriptor;
     ce_init(&descriptor);
     /* Pack via direct byte access. ce_cbytes is the read-side helper;
      * we write through a pointer cast since CEUnit's byte layout is
-     * exposed by ce_core.h. The first 8 bytes carry the descriptor;
+     * exposed by ce_core.h. The first 10 bytes carry the descriptor;
      * the rest stay zero so distance comparisons against true CEUnits
      * never falsely tie. */
     uint8_t *b = (uint8_t *)&descriptor;
@@ -124,7 +126,11 @@ void ce_residual_storage_add(CEStorage *storage,
     b[3] = tick.g;
     b[4] = tick.b;
     b[5] = tick.a;
-    /* b[6..7] reserved — zero from ce_init */
+    b[6] = (uint8_t)( x        & 0xFF);
+    b[7] = (uint8_t)((x >> 8)  & 0xFF);
+    b[8] = (uint8_t)( y        & 0xFF);
+    b[9] = (uint8_t)((y >> 8)  & 0xFF);
+    /* b[10..] reserved — zero from ce_init */
 
     CEUnit zero;
     ce_init(&zero);
@@ -135,7 +141,9 @@ void ce_residual_storage_add(CEStorage *storage,
 int ce_residual_storage_unpack(const CEStorageEntry *entry,
                                uint8_t              *out_codebook_idx,
                                uint8_t              *out_strength,
-                               TickRGBA             *out_tick) {
+                               TickRGBA             *out_tick,
+                               uint16_t             *out_x,
+                               uint16_t             *out_y) {
     if (!entry || entry->type != CE_TYPE_RESIDUAL) return -1;
     const uint8_t *b = ce_cbytes(&entry->keyframe);
     if (out_codebook_idx) *out_codebook_idx = b[0];
@@ -146,5 +154,7 @@ int ce_residual_storage_unpack(const CEStorageEntry *entry,
         out_tick->b = b[4];
         out_tick->a = b[5];
     }
+    if (out_x) *out_x = (uint16_t)b[6] | ((uint16_t)b[7] << 8);
+    if (out_y) *out_y = (uint16_t)b[8] | ((uint16_t)b[9] << 8);
     return 0;
 }

@@ -470,10 +470,8 @@ void hybrid_vae_decode(uint8_t                *out_rgb,
     /* ── Step 4b: tick-sorted residual codebook 적용 ──
      *
      * storage에 들어있는 CE_TYPE_RESIDUAL descriptors를 tick(B>G>R>A)
-     * 순으로 정렬한 뒤 그 순서대로 codebook 패턴을 blend_y에 누적.
-     * 위치 정보가 descriptor에 없으므로(현재는 strength + tick만)
-     * 타일링 적용: tick.r을 256-pixel 행 인덱스로 해석해 그 행 전체에
-     * 패턴 amplitude를 가산. 패턴 자체가 행별 modulation 신호인 셈.
+     * 순으로 정렬한 뒤 그 순서대로 codebook 패턴을 blend_y에 적용.
+     * descriptor의 (x, y)를 패치 중심 좌표로 사용해 8×8 가우시안 stamp.
      * book이 NULL이면 이 단계는 no-op. */
     if (c.residual_book) {
         uint32_t resid_idx[256];
@@ -482,34 +480,60 @@ void hybrid_vae_decode(uint8_t                *out_rgb,
             (1u << CE_TYPE_RESIDUAL),
             resid_idx, 256);
 
+        /* 8×8 패치용 가우시안 양자화 weight (Q8 — sum / 256 = 1.0 in
+         * the central row, falling off at edges). 사전계산해서 매 패치
+         * 호출 시 곱셈만 한다. */
+        static const uint8_t patch_w[8][8] = {
+            { 16,  32,  48,  64,  64,  48,  32, 16},
+            { 32,  64,  96, 128, 128,  96,  64, 32},
+            { 48,  96, 144, 192, 192, 144,  96, 48},
+            { 64, 128, 192, 255, 255, 192, 128, 64},
+            { 64, 128, 192, 255, 255, 192, 128, 64},
+            { 48,  96, 144, 192, 192, 144,  96, 48},
+            { 32,  64,  96, 128, 128,  96,  64, 32},
+            { 16,  32,  48,  64,  64,  48,  32, 16},
+        };
+
         for (uint32_t k = 0; k < nresid; ++k) {
             const CEStorageEntry *e = &storage->entries[resid_idx[k]];
             uint8_t cb_idx = 0, strength = 0;
             TickRGBA tk = (TickRGBA){0,0,0,0};
-            if (ce_residual_storage_unpack(e, &cb_idx, &strength, &tk) != 0)
+            uint16_t px = 0, py = 0;
+            if (ce_residual_storage_unpack(e, &cb_idx, &strength, &tk,
+                                           &px, &py) != 0)
                 continue;
 
             const CEResidualCode *code =
                 ce_residual_codebook_get(c.residual_book, cb_idx);
             if (!code) continue;
 
-            /* 패턴 amplitude를 cell signal의 audio_amps[0]에서 추출.
-             * 효과 강도 = (descriptor.strength × code.strength) >> 8. */
             uint8_t code_amp = ce_tick_amp_from_cell(&code->unit);
             int eff = ((int)strength * (int)code_amp) >> 8;
-            if (eff > 64) eff = 64;  /* 한 패턴이 너무 세게 박히지 않도록 */
+            if (eff > 64) eff = 64;
             if (eff <= 0) continue;
 
-            /* tick.r을 행 인덱스로 매핑 — 256으로 wrap. 같은 행에 여러
-             * 패턴이 떨어지면 누적. */
-            int row = (int)tk.r;
-            int sign = (tk.g & 1) ? -1 : 1;  /* tick.g 패리티로 부호 분기 */
-            int delta = sign * eff;
-            for (int x = 0; x < 256; ++x) {
-                int v = (int)blend_y[row * 256 + x] + delta;
-                if (v < 0) v = 0;
-                if (v > 255) v = 255;
-                blend_y[row * 256 + x] = (uint8_t)v;
+            int sign = (tk.g & 1) ? -1 : 1;
+
+            /* px / py 가 16-bit 이지만 source 패치는 256-pixel 좌표계
+             * 위에서 stamping된다. 캔버스 범위 wrap 클램프. */
+            int cx = (int)(px & 0xFF);
+            int cy = (int)(py & 0xFF);
+
+            /* 8×8 패치 적용: 중심 (cx, cy) 기준 -3..+4 픽셀 윈도우.
+             * 가장자리는 클램프해서 잘려도 이상한 wrap 안 생기게. */
+            for (int dy = -3; dy <= 4; ++dy) {
+                int yy = cy + dy;
+                if (yy < 0 || yy >= 256) continue;
+                for (int dx = -3; dx <= 4; ++dx) {
+                    int xx = cx + dx;
+                    if (xx < 0 || xx >= 256) continue;
+                    int wpx = patch_w[dy + 3][dx + 3];
+                    int delta = sign * ((eff * wpx) >> 8);
+                    int v = (int)blend_y[yy * 256 + xx] + delta;
+                    if (v < 0) v = 0;
+                    if (v > 255) v = 255;
+                    blend_y[yy * 256 + xx] = (uint8_t)v;
+                }
             }
         }
     }

@@ -161,10 +161,21 @@ static uint32_t store_cells_with_codebook(CEStorage *storage,
         uint8_t idx = ce_residual_codebook_add_or_lookup(
             book, &probe, threshold);
 
+        /* Position: read origin_x / origin_y from the cell's SligSignal —
+         * slig_decompose_color/events stamp where in the source plane
+         * the patch was sampled (0..255 for a 256×256 image). Scale to
+         * 16-bit so the descriptor can carry sub-pixel positions in
+         * future high-resolution passes. */
+        SligSignal sig;
+        slig_unpack(&sig, &dec->cells[i]);
+        uint16_t pos_x = (uint16_t)sig.origin_x;
+        uint16_t pos_y = (uint16_t)sig.origin_y;
+
         ce_residual_storage_add(storage, canvas_id,
                                 /*slot=*/(uint16_t)(i / 8),
                                 /*block_idx=*/(uint16_t)(i % 8),
-                                idx, probe.strength, probe.tick);
+                                idx, probe.strength, probe.tick,
+                                pos_x, pos_y);
         ++total;
         if (out_residuals) ++(*out_residuals);
     }

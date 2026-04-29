@@ -89,7 +89,8 @@ int main(void) {
     TickRGBA tick = (TickRGBA){10, 1, 2, 200};
     ce_residual_storage_add(&S, /*cid=*/7u,
         /*slot=*/4, /*block_idx=*/3,
-        /*idx=*/0, /*strength=*/180, tick);
+        /*idx=*/0, /*strength=*/180, tick,
+        /*x=*/123, /*y=*/200);
     CHECK(S.count == 1, "storage gained one row");
     CHECK(S.entries[0].type == CE_TYPE_RESIDUAL, "row tagged RESIDUAL");
     CHECK(S.entries[0].canvas_id == 7u, "canvas_id stored");
@@ -98,19 +99,32 @@ int main(void) {
 
     uint8_t got_idx = 0xFF, got_strength = 0;
     TickRGBA got_tick = (TickRGBA){0};
+    uint16_t got_x = 0, got_y = 0;
     int rc = ce_residual_storage_unpack(&S.entries[0],
-        &got_idx, &got_strength, &got_tick);
+        &got_idx, &got_strength, &got_tick, &got_x, &got_y);
     CHECK(rc == 0, "unpack returns 0");
     CHECK(got_idx == 0, "descriptor idx = 0");
     CHECK(got_strength == 180, "descriptor strength = 180");
     CHECK(got_tick.r == 10 && got_tick.g == 1
        && got_tick.b == 2  && got_tick.a == 200,
        "descriptor tick roundtrips");
+    CHECK(got_x == 123 && got_y == 200, "descriptor x/y roundtrip");
+
+    /* High position values use both bytes (16-bit roundtrip). */
+    ce_residual_storage_add(&S, /*cid=*/7u,
+        /*slot=*/0, /*block_idx=*/0,
+        /*idx=*/0, /*strength=*/100, (TickRGBA){0,0,0,0},
+        /*x=*/65530, /*y=*/300);
+    int rc_hi = ce_residual_storage_unpack(&S.entries[1],
+        NULL, NULL, NULL, &got_x, &got_y);
+    CHECK(rc_hi == 0, "unpack high-byte returns 0");
+    CHECK(got_x == 65530 && got_y == 300,
+          "16-bit position survives high-byte roundtrip");
 
     /* unpack on wrong type returns -1 */
     CEStorageEntry fake = {0};
     fake.type = CE_TYPE_IMAGE;
-    int rc2 = ce_residual_storage_unpack(&fake, NULL, NULL, NULL);
+    int rc2 = ce_residual_storage_unpack(&fake, NULL, NULL, NULL, NULL, NULL);
     CHECK(rc2 != 0, "unpack rejects non-RESIDUAL entries");
 
     ce_storage_free(&S);

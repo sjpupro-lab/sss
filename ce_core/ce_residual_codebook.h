@@ -26,9 +26,10 @@
  *   keyframe[0]   = codebook index
  *   keyframe[1]   = strength
  *   keyframe[2..5]= TickRGBA (r, g, b, a)
- *   keyframe[6..7]= reserved
- *   ...           = position / context (left as zero by the encoder
- *                    today; future passes may stamp a (x, y) here)
+ *   keyframe[6..7]= x position    (uint16 little-endian, 0..65535;
+ *                                  decoder maps to canvas coords)
+ *   keyframe[8..9]= y position    (uint16 little-endian)
+ *   keyframe[10..]= reserved (zero)
  *
  * That keeps the entry size identical to other CEStorage rows but
  * the 64 bytes are interpreted as a *descriptor*, not as a CEUnit
@@ -113,8 +114,9 @@ const CEResidualCode *ce_residual_codebook_get(const CEResidualCodebook *book,
  *   bytes[0]    = codebook_idx
  *   bytes[1]    = strength
  *   bytes[2..5] = tick.r / tick.g / tick.b / tick.a
- *   bytes[6..7] = reserved (zero)
- *   bytes[8..]  = zero (no payload — the patch lives in the codebook)
+ *   bytes[6..7] = x position (uint16 little-endian)
+ *   bytes[8..9] = y position (uint16 little-endian)
+ *   bytes[10..] = zero (no payload — the patch lives in the codebook)
  *
  * delta is left zero (the descriptor doesn't chain). slot/block_idx
  * carry the (scale_level * 3 + channel, cell index) layout used by
@@ -126,7 +128,9 @@ void ce_residual_storage_add(CEStorage *storage,
                              uint16_t   block_idx,
                              uint8_t    codebook_idx,
                              uint8_t    strength,
-                             TickRGBA   tick);
+                             TickRGBA   tick,
+                             uint16_t   x,
+                             uint16_t   y);
 
 /* Decode the descriptor portion of a CE_TYPE_RESIDUAL entry.
  * Returns 0 on success. The `out_*` fields are optional (pass NULL
@@ -134,7 +138,9 @@ void ce_residual_storage_add(CEStorage *storage,
 int ce_residual_storage_unpack(const CEStorageEntry *entry,
                                uint8_t              *out_codebook_idx,
                                uint8_t              *out_strength,
-                               TickRGBA             *out_tick);
+                               TickRGBA             *out_tick,
+                               uint16_t             *out_x,
+                               uint16_t             *out_y);
 
 #ifdef __cplusplus
 }
