@@ -18,6 +18,9 @@
 #include "spatial_grid.h"
 #include "slig_signal.h"
 #include "slig_codebook.h"
+#include "ce_hybrid_vae.h"
+#include "ce_masked_train.h"
+#include "ce_storage.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -462,6 +465,97 @@ int main(void) {
     }
 
     spatial_ai_destroy(ai);
+
+    /* ═══ Test 12: hybrid_vae roundtrip on a synthetic image ═══ */
+    printf("\n--- Test 12: hybrid_vae roundtrip ---\n");
+    {
+        /* Build a 256×256 RGBA image with quadrant colours. */
+        uint8_t *rgba = (uint8_t *)malloc(256 * 256 * 4);
+        check("hybrid alloc rgba", rgba != NULL);
+        if (rgba) {
+            for (int y = 0; y < 256; y++) {
+                for (int x = 0; x < 256; x++) {
+                    int i = (y * 256 + x) * 4;
+                    int q = (y < 128 ? 0 : 2) + (x < 128 ? 0 : 1);
+                    static const uint8_t Q[4][3] = {
+                        {220, 40, 40}, {40, 200, 60},
+                        {30, 60, 220}, {220, 200, 40}};
+                    rgba[i + 0] = Q[q][0];
+                    rgba[i + 1] = Q[q][1];
+                    rgba[i + 2] = Q[q][2];
+                    rgba[i + 3] = 255;
+                }
+            }
+
+            CEStorage hstorage;
+            ce_storage_init(&hstorage, 64);
+            SligCodebook hcodebook;
+            slig_codebook_init(&hcodebook);
+            HybridVAEConfig hcfg;
+            hybrid_vae_config_default(&hcfg);
+
+            uint8_t *out_rgb = (uint8_t *)malloc(256 * 256 * 3);
+            check("hybrid alloc out_rgb", out_rgb != NULL);
+            if (out_rgb) {
+                float psnr = hybrid_vae_roundtrip(
+                    out_rgb, &hstorage, &hcodebook,
+                    rgba, 256, 256, /*canvas_id=*/77u, &hcfg);
+                printf("  hybrid_vae PSNR=%.2f dB (entries=%u)\n",
+                       psnr, hstorage.count);
+                check("hybrid_vae registers entries in storage",
+                      hstorage.count > 0);
+                check("hybrid_vae roundtrip PSNR > 5 dB", psnr > 5.0f);
+                free(out_rgb);
+            }
+            ce_storage_free(&hstorage);
+            free(rgba);
+        }
+    }
+
+    /* ═══ Test 13: masked_train E2E (single image learns + stores) ═══ */
+    printf("\n--- Test 13: masked_train E2E ---\n");
+    {
+        uint8_t *rgba = (uint8_t *)malloc(256 * 256 * 4);
+        check("masked alloc rgba", rgba != NULL);
+        if (rgba) {
+            /* Diagonal stripes — gives the decomposer non-trivial
+             * structure/edge cells without colour starvation. */
+            for (int y = 0; y < 256; y++) {
+                for (int x = 0; x < 256; x++) {
+                    int i = (y * 256 + x) * 4;
+                    int s = ((x + y) / 16) & 1;
+                    rgba[i + 0] = s ? 200 : 60;
+                    rgba[i + 1] = s ? 80  : 180;
+                    rgba[i + 2] = s ? 100 : 90;
+                    rgba[i + 3] = 255;
+                }
+            }
+
+            CEStorage mstorage;
+            ce_storage_init(&mstorage, 128);
+            MaskedTrainConfig mcfg;
+            masked_train_config_default(&mcfg);
+            mcfg.epochs = 3; /* keep the regression test fast */
+            MaskedTrainResult mres;
+            memset(&mres, 0, sizeof(mres));
+            masked_train_image(&mres, &mstorage, rgba, 256, 256,
+                               /*canvas_id=*/123u, &mcfg);
+
+            printf("  masked_train epochs_run=%d final_loss=%.2f "
+                   "cells_stored=%u\n",
+                   mres.epochs_run, mres.final_loss, mres.cells_stored);
+            check("masked_train ran at least 1 epoch", mres.epochs_run >= 1);
+            check("masked_train stored converged cells",
+                  mres.cells_stored > 0);
+            check("masked_train final_loss is finite",
+                  mres.final_loss >= 0.0f && mres.final_loss < 1e6f);
+            check("masked_train wrote into CEStorage",
+                  mstorage.count >= mres.cells_stored);
+
+            ce_storage_free(&mstorage);
+            free(rgba);
+        }
+    }
 
     printf("\n=== Result: %d PASS / %d FAIL ===\n", pass, fail);
     return fail;

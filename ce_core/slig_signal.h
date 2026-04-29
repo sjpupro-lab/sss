@@ -124,7 +124,7 @@ enum SligScaleLevel {
 #define SLIG_CELL_BUDGET_CB   6
 #define SLIG_CELL_BUDGET_CR   6
 
-typedef struct {
+typedef struct SligCellSet {
     CEUnit   cells[SLIG_MAX_CELLS];
     uint32_t num_cells;
     uint8_t  channel;       /* SligChannel — tagged when produced */

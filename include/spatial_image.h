@@ -20,7 +20,6 @@
 #include <stdint.h>
 #include "spatial_grid.h"
 #include "spatial_keyframe.h"   /* SpatialAI */
-#include "spatial_generate.h"   /* RefineConfig */
 
 /* Load a PPM P6 image from `path` and map it onto a fresh SpatialGrid.
  *   - R/G/B channels ← image R/G/B bytes
@@ -34,24 +33,7 @@ SpatialGrid* image_to_grid(const char* path);
  * The A channel is not written — grid→image is lossy on luminance. */
 int grid_to_image(const SpatialGrid* g, const char* out_path);
 
-/* Feasibility-prototype generator. Encodes the prompt text through
- * the existing refine path with an image-tuned RefineConfig, then
- * emits the resulting grid as a PPM file at `out_path`.
- *
- * cfg == NULL applies refine_config_default_image(). Returns 1 on
- * success, 0 if refine produced no output or the file write failed.
- *
- * This is NOT a diffusion-style generator. It is strictly an
- * iterative refinement over the grid's prior, rendered as an image. */
-int ai_generate_image(SpatialAI* ai,
-                      const char* prompt_text,
-                      const char* out_path,
-                      const RefineConfig* cfg);
-
 /* ── SLIG v2 image API ───────────────────────────────────────
- *
- *  v2 keeps ai_generate_image (above) for the legacy refine-based
- *  prototype and adds the integrated pipeline below:
  *
  *    ai_learn_image  — load a PPM, decompose into a CEUnit set
  *                      (multi-direction SVD + ripple), and store it

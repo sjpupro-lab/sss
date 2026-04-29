@@ -1,5 +1,7 @@
 #include "ce_storage.h"
 #include "ce_feed_image.h"
+#include "ce_tick.h"
+#include "slig_signal.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -180,4 +182,110 @@ uint32_t ce_storage_ingest_rgba(CEStorage *s,
         }
     }
     return added;
+}
+
+uint32_t ce_storage_persist_slig_set(CEStorage *s,
+                                     uint32_t canvas_id,
+                                     const struct SligCellSet *set) {
+    if (!s || !set || set->num_cells == 0) return 0;
+    if (set->scale_level >= SLIG_NUM_LEVELS ||
+        set->channel >= SLIG_NUM_CHANNELS) return 0;
+
+    uint16_t slot = (uint16_t)(set->scale_level * SLIG_NUM_CHANNELS + set->channel);
+
+    CEUnit prev; ce_init(&prev);
+    int has_prev = 0;
+    uint32_t added = 0;
+    for (uint32_t i = 0; i < set->num_cells; ++i) {
+        const CEUnit *kf = &set->cells[i];
+        CEUnit delta;
+        if (!has_prev) {
+            CEUnit zero; ce_init(&zero);
+            ce_delta(&delta, &zero, kf);
+        } else {
+            ce_delta(&delta, &prev, kf);
+        }
+        ce_storage_add_typed(s, canvas_id, slot, (uint16_t)(i & 0xFFFF),
+                             CE_TYPE_SLIG, kf, &delta);
+        prev = *kf;
+        has_prev = 1;
+        ++added;
+    }
+    return added;
+}
+
+uint32_t ce_storage_load_slig_sets(const CEStorage *s,
+                                   uint32_t canvas_id,
+                                   struct SligCellSet *out_) {
+    SligCellSet (*out)[SLIG_NUM_CHANNELS] =
+        (SligCellSet (*)[SLIG_NUM_CHANNELS])out_;
+    if (!s || !out_) return 0;
+
+    /* Initialise the 3×3 grid: zeroed cells, num_cells = 0, but tag
+     * channel/scale_level so renderers can still match buckets. */
+    for (uint8_t lvl = 0; lvl < SLIG_NUM_LEVELS; ++lvl) {
+        for (uint8_t ch = 0; ch < SLIG_NUM_CHANNELS; ++ch) {
+            SligCellSet *set = &out[lvl][ch];
+            memset(set, 0, sizeof(*set));
+            set->scale_level = lvl;
+            set->channel = ch;
+        }
+    }
+
+    uint32_t loaded = 0;
+    for (uint32_t i = 0; i < s->count; ++i) {
+        const CEStorageEntry *e = &s->entries[i];
+        if (e->type != CE_TYPE_SLIG)        continue;
+        if (e->canvas_id != canvas_id)      continue;
+        uint16_t slot = e->slot;
+        uint8_t lvl = (uint8_t)(slot / SLIG_NUM_CHANNELS);
+        uint8_t ch  = (uint8_t)(slot % SLIG_NUM_CHANNELS);
+        if (lvl >= SLIG_NUM_LEVELS) continue;
+        uint16_t idx = e->block_idx;
+        if (idx >= SLIG_MAX_CELLS)  continue;
+
+        SligCellSet *set = &out[lvl][ch];
+        set->cells[idx] = e->keyframe;
+        if (idx + 1 > set->num_cells) set->num_cells = idx + 1;
+        ++loaded;
+    }
+    return loaded;
+}
+
+/* qsort comparator over CEStorage entry indices, sorted by their
+ * derived TickRGBA. The comparator takes a context pointer (the
+ * storage we are indexing into) but qsort_r isn't portable to MinGW,
+ * so we use a thread-local pointer and qsort. ce_tick_sorted_indices
+ * is the only call site, so the static is bounded. */
+static const CEStorage *g_tick_sort_storage;
+static int tick_index_cmp(const void *pa, const void *pb) {
+    uint32_t ia = *(const uint32_t *)pa;
+    uint32_t ib = *(const uint32_t *)pb;
+    const CEStorageEntry *ea = &g_tick_sort_storage->entries[ia];
+    const CEStorageEntry *eb = &g_tick_sort_storage->entries[ib];
+    TickRGBA ta = ce_tick_from_entry(ea);
+    TickRGBA tb = ce_tick_from_entry(eb);
+    return ce_tick_compare(ta, tb);
+}
+
+uint32_t ce_tick_sorted_indices(const CEStorage *s,
+                                uint32_t         canvas_id,
+                                uint32_t         allowed_type_mask,
+                                uint32_t        *out_idx,
+                                uint32_t         cap) {
+    if (!s || !out_idx || cap == 0) return 0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < s->count && n < cap; ++i) {
+        const CEStorageEntry *e = &s->entries[i];
+        if (e->canvas_id != canvas_id) continue;
+        uint32_t bit = 1u << (uint32_t)e->type;
+        if ((allowed_type_mask & bit) == 0) continue;
+        out_idx[n++] = i;
+    }
+    if (n > 1) {
+        g_tick_sort_storage = s;
+        qsort(out_idx, n, sizeof(uint32_t), tick_index_cmp);
+        g_tick_sort_storage = NULL;
+    }
+    return n;
 }

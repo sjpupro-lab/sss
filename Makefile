@@ -41,7 +41,10 @@ CE_CORE_SRCS = $(CE_CORE_DIR)/ce_core.c \
                $(CE_CORE_DIR)/slig_codebook.c \
                $(CE_CORE_DIR)/slig_pipeline.c \
                $(CE_CORE_DIR)/slig_tick_math.c \
-               $(CE_CORE_DIR)/slig_material_harmonic.c
+               $(CE_CORE_DIR)/slig_material_harmonic.c \
+               $(CE_CORE_DIR)/ce_hybrid_vae.c \
+               $(CE_CORE_DIR)/ce_masked_train.c \
+               $(CE_CORE_DIR)/ce_residual_codebook.c
 
 CE_CORE_OBJS = $(patsubst $(CE_CORE_DIR)/%.c,$(BUILD_DIR)/ce_core_%.o,$(CE_CORE_SRCS))
 
@@ -49,7 +52,7 @@ OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS)) $(CE_CORE_OBJS)
 
 TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_recluster test_refine test_image_roundtrip test_image_gen test_tick_math test_material test_gen_routed
 
-.PHONY: all clean test gpu_train_help probe_task_a bench_context bench_refine image_tools
+.PHONY: all clean test bench_context bench_refine image_tools
 
 all: $(BUILD_DIR) $(OBJS)
 	@echo "Build complete."
@@ -163,7 +166,14 @@ $(BUILD_DIR)/make_demo_dataset: tools/make_demo_dataset.c | $(BUILD_DIR)
 $(BUILD_DIR)/train_demo: tools/train_demo.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
-demo_tools: $(BUILD_DIR)/make_demo_dataset $(BUILD_DIR)/train_demo $(BUILD_DIR)/gen_image_ce
+$(BUILD_DIR)/verify_hybrid: tools/verify_hybrid.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+verify_hybrid: $(BUILD_DIR)/verify_hybrid
+	@echo "Built verify_hybrid. Example:"
+	@echo "  ./build/verify_hybrid data/demo/img/*.ppm"
+
+demo_tools: $(BUILD_DIR)/make_demo_dataset $(BUILD_DIR)/train_demo $(BUILD_DIR)/gen_image_ce $(BUILD_DIR)/verify_hybrid
 	@echo "Built demo tools. Pipeline:"
 	@echo "  ./build/make_demo_dataset data/demo"
 	@echo "  ./build/train_demo data/demo build/models/demo"
@@ -187,13 +197,6 @@ bench_context: $(BUILD_DIR)/bench_context
 
 bench_refine: $(BUILD_DIR)/bench_refine
 	@./$(BUILD_DIR)/bench_refine
-
-# ─── v4 Task A probe (manual run, not part of `make test`) ────
-$(BUILD_DIR)/probe_task_a: $(TEST_DIR)/probe_task_a.c $(OBJS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
-
-probe_task_a: $(BUILD_DIR)/probe_task_a
-	@./$(BUILD_DIR)/probe_task_a
 
 # ─── Wikipedia integration test (manual run) ─────────────────
 $(BUILD_DIR)/test_wiki: $(TEST_DIR)/test_wiki.c $(OBJS) | $(BUILD_DIR)
@@ -226,12 +229,6 @@ bench_word: $(BUILD_DIR)/bench_word_predict
 bench_qa: $(BUILD_DIR)/bench_qa
 	@echo "Built bench_qa. Run with:"
 	@echo "  ./build/bench_qa data/qa.tsv"
-
-gpu_train_help:
-	@echo "Kaggle GPU trainer (experimental):"
-	@echo "  pip install -r requirements-gpu.txt"
-	@echo "  python tools/kaggle_gpu_train.py --input data/sample_en.txt --max-clauses 50000 --checkpoint-every 5000"
-	@echo "  output: build/gpu_models/gpu_model_final.pt"
 
 # ─── Streaming trainer (line-by-line, no full-file buffering) ────
 $(BUILD_DIR)/stream_train: tools/stream_train.c $(OBJS) | $(BUILD_DIR)

@@ -1,8 +1,10 @@
 /* spatial_image_gen.c — SLIG v2.2 integrated image pipeline
  * (color × multi-scale pyramid).
  *
- * The legacy ai_generate_image (spatial_image.c) is kept as a refine-
- * driven feasibility prototype. This file adds the v2 path:
+ * Hosts the v2 image generation path; spatial_image.c retains only
+ * the PPM I/O helpers (image_to_grid / grid_to_image). The legacy
+ * refine-based ai_generate_image was removed during the SSS
+ * refactor. This file adds the v2 path:
  *
  *   prompt
  *     ↓ layers_encode_clause + update_rgb_directional + apply_ema

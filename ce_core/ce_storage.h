@@ -88,6 +88,45 @@ uint32_t ce_storage_ingest_rgba_16(CEStorage *s,
                                    uint32_t canvas_id,
                                    const uint8_t *rgba, int width, int height);
 
+/* ─── SLIG cell persistence (CE_TYPE_SLIG) ─────────────────────────
+ *
+ *   `set` is one (scale_level, channel) bucket — the same struct
+ *   produced by slig_decompose_channel. Each cell becomes one
+ *   CEStorage entry with:
+ *       canvas_id  = caller-supplied
+ *       slot       = scale_level * 3 + channel        (0..8)
+ *       block_idx  = cell index inside the set        (0..num_cells-1)
+ *       type       = CE_TYPE_SLIG
+ *       keyframe   = the SLIG CEUnit
+ *       delta      = delta against the previous cell of the same set
+ *                    (zero CEUnit for cell 0)
+ *
+ *   The 9-bucket layout matches what hybrid_vae_encode produces, so
+ *   reassembly only needs to walk entries whose canvas_id matches and
+ *   bucket them by (slot / 3, slot % 3, block_idx).
+ *
+ *   Returns number of entries appended. The set's channel /
+ *   scale_level fields are read from the struct itself — the function
+ *   does not require the caller to recompute the slot number.
+ */
+struct SligCellSet; /* forward; full definition in slig_signal.h */
+uint32_t ce_storage_persist_slig_set(CEStorage *s,
+                                     uint32_t canvas_id,
+                                     const struct SligCellSet *set);
+
+/* Reassemble the [SLIG_NUM_LEVELS][SLIG_NUM_CHANNELS] set grid for one
+ * canvas_id. `out` is a 3×3 grid of SligCellSets the caller owns; the
+ * function zero-clears it before populating. Sets that have no entries
+ * in storage are left zero (num_cells = 0 and the matching channel /
+ * scale_level tags pre-set so downstream `slig_reconstruct_at_dim`
+ * treats them as silent residuals).
+ *
+ * Returns the total number of cells loaded across all sets.
+ */
+uint32_t ce_storage_load_slig_sets(const CEStorage *s,
+                                   uint32_t canvas_id,
+                                   struct SligCellSet *out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -15,16 +15,6 @@
 extern "C" {
 #endif
 
-void ce_generate_image(
-    CEImage *output,
-    const CEStorage *storage,
-    const char *prompt,
-    uint64_t seed,
-    const CEGenConfig *config,
-    const CEMemoLayer *memo,
-    const CEHintLayer *hint,
-    const CEAudioTrack *audio);
-
 /* HQ image generation: filters retrieval to a single modality and (when
  * `wave_refine_iters > 0`) runs ce_image_wave_refine on the decoded canvas
  * using the top-k retrieved blocks as wave targets. The `type` argument
@@ -81,12 +71,6 @@ void ce_generate_inpaint(
     const CEStorage *storage,
     const char *prompt,
     uint64_t seed,
-    const CEGenConfig *config);
-
-void ce_generate_upscale(
-    CEHiresGrid *output_hires,
-    const CELatentGrid *input_lores,
-    const CEStorage *storage,
     const CEGenConfig *config);
 
 #ifdef __cplusplus

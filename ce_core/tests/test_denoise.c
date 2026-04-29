@@ -52,8 +52,8 @@ int main(void) {
     cfg.total_steps = 4;
 
     /* Determinism */
-    ce_denoise_loop(&z1, &S, &prompt_unit, 1, NULL, &cfg);
-    ce_denoise_loop(&z2, &S, &prompt_unit, 1, NULL, &cfg);
+    ce_denoise_loop(&z1, &S, &prompt_unit, 1, &cfg);
+    ce_denoise_loop(&z2, &S, &prompt_unit, 1, &cfg);
     int eq = 1;
     for (int i = 0; i < CE_GRID_N; ++i)
         if (!ce_equal(&z1.cells[i], &z2.cells[i])) { eq = 0; break; }
@@ -65,7 +65,7 @@ int main(void) {
     CELatentGrid z3;
     ce_latent_init(&z3, &noise_b, &S.entries[0].keyframe, &S.entries[0].delta,
                    &prompt_unit, NULL, w);
-    ce_denoise_loop(&z3, &S, &prompt_unit, 1, NULL, &cfg);
+    ce_denoise_loop(&z3, &S, &prompt_unit, 1, &cfg);
     int diff_cells = 0;
     for (int i = 0; i < CE_GRID_N; ++i)
         if (!ce_equal(&z1.cells[i], &z3.cells[i])) ++diff_cells;
@@ -77,7 +77,7 @@ int main(void) {
     CELatentGrid zp;
     ce_latent_init(&zp, &noise, &S.entries[0].keyframe, &S.entries[0].delta,
                    &prompt_b, NULL, w);
-    ce_denoise_loop(&zp, &S, &prompt_b, 1, NULL, &cfg);
+    ce_denoise_loop(&zp, &S, &prompt_b, 1, &cfg);
     int diff_prompt = 0;
     for (int i = 0; i < CE_GRID_N; ++i)
         if (!ce_equal(&z1.cells[i], &zp.cells[i])) ++diff_prompt;

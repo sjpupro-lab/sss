@@ -1,648 +1,494 @@
-# SPATIAL-PATTERN-AI (CANVAS)
+# SSS — Spatial Pattern AI + CE-Cell Image Engine
 
 ![Main Hero](main_hero.png)
 
-> A spatial pattern–based AI engine that encodes text as brightness patterns on a 256×256 grid.
-> Language is treated like video frames, not token vectors.
+> A two-engine codebase. **Text** is encoded as brightness patterns on a
+> 256×256 grid; **images** decompose into 64-byte `CEUnit` cells with an
+> RGBA tick clock and a residual codebook. Both share one storage layer
+> and one save file.
+>
+> Inference is integer-only. Float math (DCT / SVD) appears only at
+> training time.
 
 ```
- "The cat eats rice."          256×256 Grid  (1 clause = 1 frame)
-         │                    ┌────────────────────────┐
-    UTF-8 bytes               │  ·                     │
-         │                    │    ·  ·                │
-   ┌─────▼──────┐             │  · · ·  ·   ·         │
-   │ X = byte    │             │     ·    ·            │
-   │ Y = position│  ──────►   │  ·    ·                │
-   │ A = 3-layer │             │       ·  ·            │
-   │     sum     │             │  · ·       ·  ·       │
-   └─────────────┘             └────────────────────────┘
-                                A channel: byte-frequency heatmap
+   text engine                          image engine
+   ───────────────                       ─────────────
+   "The cat eats rice."                  256×256 PPM
+        │                                    │
+   3-layer encode                       16×16 stamp + SLIG decompose
+        │                                    │
+   256×256 RGBA grid                    CEUnit pyramid (3 scale × 3 chan)
+        │                                    │
+   keyframe / Δ                         block + SLIG entries (CEStorage)
+        │                                    │
+   ai_save *.spai                       ce_storage_save *.ces
 ```
 
 ---
 
-## Table of Contents
+## Table of contents
 
 - [Why this exists](#why-this-exists)
-- [How it works](#how-it-works)
-  - [1. Three-layer bitmap summation](#1-three-layer-bitmap-summation)
-  - [2. RGBA channels](#2-rgba-channels)
-  - [3. Keyframe / Delta storage](#3-keyframe--delta-storage)
-  - [4. Matching cascade](#4-matching-cascade)
-  - [5. Canvas Pool (subtitle routing)](#5-canvas-pool-subtitle-routing)
-  - [6. Image modality (Task F — feasibility prototype)](#6-image-modality-task-f--feasibility-prototype)
-  - [7. SLIG v2/v3 — signal-latent image generation](#7-slig-v2v3--signal-latent-image-generation)
-  - [8. Material auto-learn (Mat-1/2/3/4)](#8-material-auto-learn-mat-1234)
-- [Current verified results](#current-verified-results)
+- [Text engine — Spatial Pattern](#text-engine--spatial-pattern)
+- [Image engine — CE Cell](#image-engine--ce-cell)
+  - [16×16 block stamp](#1-16x16-atomic-block-stamp)
+  - [SLIG signal cells](#2-slig-signal-cells)
+  - [Hybrid VAE — encode + decode](#3-hybrid-vae)
+  - [Masked train](#4-masked-train)
+  - [RGBA tick clock + residual codebook](#5-rgba-tick-clock--residual-codebook)
+  - [Tick-sorted dynamic decode](#6-tick-sorted-dynamic-decode)
+- [End-to-end demo](#end-to-end-demo)
+- [Verified results](#verified-results)
 - [Build & run](#build--run)
-- [Image training](#image-training)
-- [Save / Load](#save--load)
+- [Save / load formats](#save--load-formats)
 - [Project layout](#project-layout)
-- [Engine optimizations](#engine-optimizations)
-- [Morpheme analyzer](#morpheme-analyzer)
-- [vs. Traditional LLM](#vs-traditional-llm)
+- [Roadmap](#roadmap)
 - [License](#license)
 
 ---
 
 ## Why this exists
 
-A traditional LLM bakes language into a fixed-size weight matrix. Adding new data
-means re-training, and the internal state is a black box.
+A traditional LLM bakes language into a fixed weight matrix and a
+diffusion model bakes images into the same pattern in latent space. Both
+are opaque, both retrain instead of incrementally accept new data.
 
-This engine does the opposite:
+This engine is the inverse:
 
-- **Unlimited parameters** — each new clause is a new frame, frames stack without limit
-- **Unlimited context** — bounded only by disk
-- **Inspectable** — `A` channel is a heatmap you can open and eyeball
-- **Incremental** — new text = one delta or one new keyframe, never a full retrain
-- **Tiny** — one frame ≈ 320 KB, engine core is a few MB; runs on Termux / embedded
+- **Unlimited parameters** — every new clause / image becomes a frame
+  or set of cells, never a retrained weight tensor.
+- **Unlimited context** — bounded only by disk.
+- **Inspectable** — text grids are heatmaps you can open; image cells
+  carry tagged `(scale, channel)` with a documented 64-byte layout.
+- **Incremental** — a new clause is one delta or one new keyframe, a
+  new image is 1024 block stamps + 9 SLIG sets + a residual codebook
+  pass. Never a full retrain.
+- **Embedded-friendly** — runs in Termux / on Windows MSYS.
+- **Integer at inference** — float only at SVD / DCT during learning.
 
-The cost: pattern encoding is a bet that byte-level spatial statistics carry
-enough signal. The current benchmarks say "yes, enough to be useful as a
-retrieval + recall substrate," not "yes, it replaces an LLM."
+The cost: pattern encoding is a bet that byte-level spatial statistics
+plus a tick clock carry enough signal to substitute for an attention
+matrix. Current benchmarks say "yes, useful as retrieval + recall +
+deterministic image generation", not "yes, this replaces a transformer."
 
 ---
 
-## How it works
+## Text engine — Spatial Pattern
 
-### 1. Three-layer bitmap summation
+The historical core. A clause becomes a 256×256 RGBA grid through a
+three-layer encoder, then enters a video-codec-style keyframe / delta
+store.
 
-Every clause is encoded through three independent layers that are then summed into
-the `A` channel. The weights are picked so the overlap tiers become visibly separated.
+### Three-layer summation
 
-| Layer | Target | Weight | What it captures |
+| Layer | Target | Weight | Captures |
 |---|---|---|---|
-| **Base** | every byte | **+1** | raw byte positions |
-| **Morpheme** | noun/verb/adj… byte ranges | **+3** | morpheme-level structure |
-| **Word** | space-split word bytes | **+5** | word-level emphasis |
+| **Base** | every byte | +1 | raw byte positions |
+| **Morpheme** | noun/verb/adj byte ranges | +3 | morpheme-level structure |
+| **Word** | space-split word bytes | +5 | word-level emphasis |
 
-Overlap tiers in the combined `A`:
+Overlap tiers in `A`: `1 / 4 / 6 / 9`.
+On `"귀여운 고양이가 밥을 먹는다."`: active 40 px, max 9, total 297
+(`= 40 + 185 + 72`, conservation holds).
 
-```
-  base only               A = 1
-  base + morpheme         A = 4   (1 + 3)
-  base + word             A = 6   (1 + 5)
-  base + word + morpheme  A = 9   (1 + 3 + 5)  ← content morpheme inside a word
-```
-
-Current numbers on `"귀여운 고양이가 밥을 먹는다."` (from `test_layers`):
-
-```
-  active  = 40 pixels
-  max A   = 9
-  total A = 297
-
-  base total   = 40
-  word total   = 185
-  morph total  = 72
-  sum check    = 40 + 185 + 72 = 297   ✓  (conservation holds)
-```
-
-### 2. RGBA channels
+### RGBA channels
 
 | Channel | Type | Role | How it's set |
 |---|---|---|---|
-| **A** | `uint16` | Brightness / importance | 3-layer sum |
-| **R** | `uint8`  | Semantic (content-word / meaning) | morpheme POS seed + **diagonal** diffusion |
-| **G** | `uint8`  | Functional (particle / ending / punct) | morpheme POS seed + **vertical** diffusion |
-| **B** | `uint8`  | Extended (context / order / emotion slot) | morpheme POS seed + **horizontal** diffusion, EMA convergence |
+| **A** | u16 | brightness / importance | 3-layer sum |
+| **R** | u8 | semantic | morpheme POS seed + diagonal diffusion |
+| **G** | u8 | functional | morpheme POS seed + vertical diffusion |
+| **B** | u8 | extended | morpheme POS seed + horizontal diffusion + EMA |
 
-R/G/B are **not fixed tables**. After encoding, `update_rgb_directional`
-propagates each channel along its own axis inside the clause's own grid
-(never across slots, never across clauses). On top of that, the engine
-maintains a per-cell EMA of R/G/B that converges across the whole
-corpus:
+`update_rgb_directional` propagates each channel along its own axis;
+the engine maintains a per-cell EMA across the corpus.
 
-```
-  R ← diagonal neighbors  (↗ ↘ ↙ ↖)    α = 0.05   morpheme / semantic
-  G ← vertical neighbors  (↑ ↓)        β = 0.08   word substitution
-  B ← horizontal neighbors (← →)       γ = 0.03   clause order / context
-  EMA (all 3 channels)     α = 0.10   accumulated across every store
-```
-
-POS-keyed seeds (before directional diffusion):
+### Keyframe / delta storage
 
 ```
-  POS_NOUN     R=40   G=30   B=100
-  POS_VERB     R=120  G=40   B=140
-  POS_ADJ      R=170  G=35   B=180
-  POS_PARTICLE R=8    G=85   B=90
-  POS_ENDING   R=12   G=95   B=110
-  POS_PUNCT    R=5    G=120  B=60
-  POS_UNKNOWN  R=210  G=20   B=200
+  first clause                              → new keyframe
+  best cosine-A ≥ 0.3 vs any KF             → delta (sparse — only moved cells)
+  best similarity < 0.3                     → new keyframe
 ```
 
-Implementation notes that matter:
+`apply_delta(base, entries, count, out)` reconstructs the target grid
+bit-for-bit. `test_io` verifies `|sim_before − sim_after| < 1e-3`
+across 700 clauses.
 
-- **Read/write buffers are separated** (`oldR/newR`, `oldG/newG`, `oldB/newB`)
-  so the scan direction doesn't bias the update.
-- When the average neighbor delta rounds to zero but isn't actually zero, the
-  cell still moves by ±1. Small signals don't get silently killed.
-- `A` is *only* a mask here. The RGB update never edits `A`.
-- B carries a per-POS prior so `bg_score`, `channel_sim_B`, and the
-  engine-wide EMA actually have signal to work with. A per-clause
-  hash overlay on B was tried earlier and removed — it stamped over
-  the bitmap pattern instead of refining it.
+### Matching cascade
 
-### 3. Keyframe / Delta storage
-
-Video-codec style. `ai_store_auto` decides per clause:
+`spatial_match()` is the unified core:
 
 ```
-  first clause                               → new keyframe (I-frame)
-  best cosine-A similarity ≥ 0.3 vs. any KF  → delta (P-frame) against that parent
-  best similarity < 0.3                      → new keyframe
+  Step 1 (coarse)  bucket index for KF ≥ 100, full overlap_score otherwise.
+                   topk_select → top-K (K=8).
+  Step 2 (precise) per-mode scorer:
+                     PREDICT  → cosine_rgb_weighted
+                     SEARCH   → cosine_a_only
+                     QA       → rg_score    (0..1)
+                     GENERATE → bg_score    (0..1)
 ```
 
-Delta records are **sparse** — only the cells that actually moved:
+All scorers normalise to `[0, 1]`, so threshold comparisons are well-
+defined everywhere.
+
+### Canvas pool (subtitle routing)
+
+A 2048×1024 canvas tiles 32 × 256² clause slots. `pool_match` jumps
+straight to slots of the query's `DataType` (prose / dialog / code /
+short) before cascading.
+
+---
+
+## Image engine — CE Cell
+
+The image side reuses the same `CEStorage` (one file = `*.ces`). Every
+storage entry is a 140-byte row tagged with one of the modalities:
+
+```c
+typedef enum {
+    CE_TYPE_TEXT     = 0,
+    CE_TYPE_IMAGE    = 1,   /* 16×16 block stamps */
+    CE_TYPE_AUDIO    = 2,
+    CE_TYPE_SLIG     = 3,   /* SLIG cells per (scale, channel) */
+    CE_TYPE_RESIDUAL = 4    /* codebook descriptors only */
+} CEType;
+```
+
+The image flow is `block stamp → SLIG decompose → codebook → tick-
+sorted decode`.
+
+### 1. 16×16 atomic block stamp
+
+`ce_storage_ingest_rgba_16` cuts the 256×256 image into 16 × 16 blocks
+(=256 blocks). Each block goes through `ce_feed_image_16` and produces
+**4 quadrant CEUnits** (TL/TR/BL/BR). 256 blocks × 4 quadrants =
+**1024 CE_TYPE_IMAGE entries** per image, all sharing one
+`canvas_id`. `slot = block-row`, `block_idx = (block-col << 2) | quadrant`.
+
+### 2. SLIG signal cells
+
+`slig_decompose_channel` runs per (scale_level, channel) on the image's
+YCbCr planes:
+
+- `SLIG_LEVEL_COARSE` (32×32), `MID` (128), `FINE` (256)
+- `SLIG_CH_Y / CB / CR`
+
+3 × 3 = **9 sets per image**. Each set holds up to 32 cells; each cell
+is a 64-byte `CEUnit` with 16-coefficient DCT signals on `inc.G/B`,
+metadata on `inc.R`, energy / audio bins on `inc.A`, and event /
+audio-link bytes on the `dec` half.
+
+Persistence (Phase 6+): `ce_storage_persist_slig_set` writes each cell
+as a `CE_TYPE_SLIG` row with `slot = scale_level * 3 + channel` and
+`block_idx = cell index`. `ce_storage_load_slig_sets` reassembles the
+9-grid from any matching `canvas_id`.
+
+### 3. Hybrid VAE
+
+`ce_hybrid_vae.{c,h}` wraps a single API around the two paths:
+
+```c
+HybridEncodeResult res;
+hybrid_vae_encode(&res, &storage, &codebook, rgba, w, h, canvas_id);
+//  → 1024 block stamps (CE_TYPE_IMAGE)
+//  → 9 SLIG sets       (CE_TYPE_SLIG, also linked via audio_bins)
+//  → 9 codebook indices for the (scale, channel) buckets
+
+uint8_t out_rgb[256*256*3];
+hybrid_vae_decode(out_rgb, &storage, canvas_id, res.sets, &cfg);
+//  base = block-stamp colour restoration
+//  detail = SLIG residual chain (coarse → mid → fine, per channel)
+//  blend(base, detail) + wave refine + CFG guidance + YCbCr→RGB
+```
+
+The encode step links the two paths: each SLIG cell's `dec.A.audio_bins`
+records the originating `canvas_id`, so a later search across cells
+can recover which block stamp set produced them.
+
+### 4. Masked train
+
+`ce_masked_train.{c,h}` teaches the latent to fill in missing cells.
+Per epoch:
+
+```
+  1. slig_decompose_v2 → SligDecomposed
+       cells[0..structure_end)         basis
+       cells[structure_end..edge_end)  residual edge
+       cells[edge_end..texture_end)    residual texture
+       cells[texture_end..color_end)   correction (color)
+       cells[color_end..num_cells)     correction (event)
+
+  2. mask the correction (or further) cells
+  3. ce_denoise_loop predicts the masked positions
+  4. ce_compute_loss(predicted, original)
+  5. ce_update_params adjusts CEGenConfig
+  6. converged cells go back into storage
+```
+
+Mask schedule is progressive:
+
+```
+  epoch 0..33%   correction-only mask
+  epoch 33..67%  residual + correction mask
+  epoch 67..100% random 50% mask
+```
+
+### 5. RGBA tick clock + residual codebook
+
+The image cells carry an implicit ordering — every `CEStorageEntry`
+maps to a `TickRGBA` derived from `(slot, block_idx)` and
+`audio_amps`:
+
+| Channel | What it means | Read from |
+|---|---|---|
+| **R** | local cell index inside its set / block | `block_idx` |
+| **G** | scale level (0=COARSE, 1=MID, 2=FINE) | `slot / 3` |
+| **B** | render layer / channel (Y / Cb / Cr) | `slot % 3` |
+| **A** | amplitude / residual strength | `audio_amps` max + `sigma>>8` |
+
+Carry chain mirrors `slig_tick_math::tick_add(plus, 1)`:
+
+```c
+void ce_tick_step(TickRGBA *t) {
+    if (++t->r == 0) {        /* R wraps 255→0 */
+        if (++t->g == 0) {    /* carry into G  */
+            if (++t->b == 0) {/* carry into B  */
+                ++t->a;       /* and into A    */
+            }
+        }
+    }
+}
+```
+
+`ce_tick_compare` ranks `B > G > R > A`, so `ce_tick_sorted_indices`
+walks the storage in render order: layer-by-layer, coarse-to-fine,
+cells in index order, weakest-first within ties.
+
+The **residual codebook** (`ce_residual_codebook.{c,h}`) is a
+256-entry dictionary keyed by L1 distance, bucketed by scale_level so
+chroma never collides with luma.
 
 ```c
 typedef struct {
-    uint32_t index;   // y*256 + x
-    int16_t  diff_A;
-    int8_t   diff_R;
-    int8_t   diff_G;
-} DeltaEntry;         // 8 bytes
+    CEUnit   unit;            /* the actual correction CEUnit */
+    uint8_t  scale_level;     /* SligScaleLevel (or 0xFF wildcard) */
+    uint8_t  direction;       /* SligDir */
+    uint8_t  strength;        /* 0..255 */
+    TickRGBA tick;
+    uint32_t used_count;
+} CEResidualCode;
 ```
 
-`apply_delta(base, entries, count, out)` reconstructs the target grid bit-for-bit.
-The `test_io` roundtrip test verifies that `|sim_before − sim_after| < 0.001`
-over 700 clauses across save → destroy → load.
-
-### 4. Matching cascade — unified 2-stage core
-
-All three matching APIs (`ai_predict`, `match_engine`, `match_cascade`)
-now delegate to a single `spatial_match()` function:
+Storage descriptor (`CE_TYPE_RESIDUAL`) reuses the keyframe bytes:
 
 ```
-  query clause
-      │
-      ▼
-  ┌─────────────────────────┐
-  │ encode (3 layers)        │
-  │ update_rgb_directional   │
-  │ ema_apply                │
-  └───────────┬─────────────┘
-              │
-        Step 1: coarse          if (bucket_idx && KF ≥ 100) → hash-bucket hop
-              │                 else → full overlap_score scan
-              │                 topk_select → Top-K (K=8)
-              ▼
-        Step 2: precise         mode-specific scorer:
-              │                 MATCH_PREDICT  → cosine_rgb_weighted
-              │                 MATCH_SEARCH   → cosine_a_only
-              │                 MATCH_QA       → rg_score   (0..1)
-              │                 MATCH_GENERATE → bg_score   (0..1)
-              ▼
-        best id + similarity + topk[]
+  bytes[0]    = codebook_idx
+  bytes[1]    = strength
+  bytes[2..5] = TickRGBA  (R, G, B, A)
+  bytes[6..7] = x position (u16 LE)
+  bytes[8..9] = y position (u16 LE)
+  bytes[10..] = reserved (zero)
 ```
 
-`MatchContext` carries the optional bucket index and reserved slots
-for block-skip and frame-cache integration. `MatchResult` returns
-`best_id`, `best_score`, and a sorted `topk[]` of the final K
-candidates.
+**No raw patch payload in storage.** When `train_demo --residual-codebook`
+is on, `masked_train_image` runs each correction cell through
+`ce_residual_codebook_add_or_lookup` (threshold-based). On the
+`data/demo` 10-image set, **96 correction cells reduce to 6–9 codebook
+patterns** — about 10× pattern compression on the encode side.
 
-All channel-pair scorers return values in **[0, 1]** — they're means
-over co-active cells, not raw sums. Threshold comparisons against
-cosine-normalized scores are well defined everywhere now.
+### 6. Tick-sorted dynamic decode
 
-### 5. Canvas Pool (subtitle routing)
+`hybrid_vae_decode` Step 4b walks `CE_TYPE_RESIDUAL` entries in tick
+order (B > G > R > A), looks up each patch, and stamps an 8×8
+gaussian-weighted patch onto `blend_y` centred at `(x & 0xFF, y & 0xFF)`.
+The amplitude cap is 64 per single patch; `tick.g` parity flips the
+sign so different cells can both add and subtract.
 
-Above the per-clause grid there's a **2048×1024 Canvas** that tiles 32 × 256×256
-clause slots. A `SubtitleTrack` records `(DataType, canvas_id, slot_id)` for
-each stored clause so `pool_match` can jump straight to slots of the query's
-own type (prose / dialog / code / short), then cascade through the four
-channel-pair stages as above.
-
-This gives the "H.264 scene change" behavior:
-a canvas can be `KEYFRAME` or `DELTA-of-parent-canvas`, and save/load
-preserves parent_canvas_id + changed_ratio + classified flag.
-
-### 6. Image modality (Task F — feasibility prototype)
-
-The same 256×256 grid doubles as an image canvas. `image_to_grid` maps
-PPM P6 pixel bytes onto the grid's RGB planes (A channel ← luminance);
-`grid_to_image` writes the RGB planes back out as PPM. Images and text
-share one keyframe store:
-
-```c
-SpatialGrid* g = image_to_grid("photo.ppm");      /* 256×256 RGB  */
-uint32_t kf_id = ai_store_grid(ai, g, "photo");   /* → keyframe id */
-grid_destroy(g);
-ai_save(ai, "model.spai");                        /* persist both  */
+```
+  cell drawn first  (low B, low G)  → coarse structure
+  cell drawn middle (mid G)         → texture detail
+  cell drawn last   (high G)        → high-frequency residual
+  amplitude (A) tie-breaks          → weak first, strong stamps over it
 ```
 
-`ai_store_grid` mirrors `ai_force_keyframe` but skips the text-encoding
-layers: the caller provides a ready grid and a label, and the keyframe
-inherits a label-derived `topic_hash`, so the topic-aware bucket index
-and cascade apply unchanged. The per-cell EMA store is updated too.
-
-For joint text+image ingestion (e.g. captioned photos) use
-`ai_store_auto_with_image(ai, clause, img_grid, label)` — see
-[§8 Material auto-learn](#8-material-auto-learn-mat-1234) for the full
-flow. It mirrors `ai_store_auto`'s match logic and additionally writes
-`DeltaFrame.cell_deltas[]` against the parent's FINE-Y cells when the
-clause is similar enough to land on the delta path.
-
-Scope reminder (per Task F spec): this is an ingestion + refine-based
-render prototype, **not** a diffusion-style generator. PNG and baseline
-JPEG inputs are ingested via the tools below (the core stays PPM-only).
+This replaces the older fixed-phase decode with a per-cell ordering
+read directly from storage. `cfg.residual_book == NULL` falls back to
+the previous behaviour, so existing callers see no difference.
 
 ---
 
-### 7. SLIG v2/v3 — signal-latent image generation
-
-Beyond the Task F refine prototype, the engine ships a CE-Cell-based
-image stack that **decomposes images into ≤32-cell signal sets** and
-**reconstructs them by additive rendering**. Built on 64-byte `CEUnit`s
-from `ce_core/`.
-
-```
- PPM image         CE Cell (64B)         SligCanvas (256×256 i32)
- ┌──────┐    SVD   ┌────────────┐  apply ┌──────────────────────┐
- │ 256² │ ─────►   │ inc.R meta │ ─────► │ ∑ σᵢ · uᵢ ⊗ vᵢ        │
- │ RGB  │ DCT-16   │ inc.GB DCT │        │ + ripple/beam events │
- └──────┘          │ inc.A nrg  │        └──────────────────────┘
-                   │ dec.R DCT+ │              │
-                   │ dec.B trig │              ▼ canvas_to_u8
-                   │ dec.A audio│         ┌──────────┐
-                   └────────────┘         │ uint8 PPM│
-                                          └──────────┘
-```
-
-#### 7.1 v2 baseline — signal cells + canvas
-
-`slig_decompose(image)` extracts up to 25 cells per channel:
-12 horizontal SVD layers (sigma ≥ 0.003), 4 diagonal-down SVD,
-4 diagonal-up SVD, 4 zigzag SVD, 1 ripple event. Each cell stores
-16 DCT coefficients per signal axis (u, v) plus metadata (sigma,
-direction, origin, decay, audio bins). Render is the additive
-`slig_apply` of each cell's u⊗v outer product into a 256×256
-`SligCanvas`; canvas → PPM via min-max normalize.
-
-#### 7.2 v2.1 — color (YCbCr split)
-
-RGB image → BT.601 YCbCr planes. Y carries shape (≈20-cell budget),
-Cb / Cr carry chroma (≈6 cells each). `slig_decompose_channel` runs
-per-plane and tags each `SligCellSet` with channel + scale_level.
-Render maintains 3 canvases and composes back to RGB at output.
-
-#### 7.3 v2.2 — multi-scale pyramid
-
-Per channel, decompose at 3 scales: **COARSE** (32×32) / **MID** (128)
-/ **FINE** (256). 3 levels × 3 channels = **9 cell sets per keyframe**.
-Render upsamples coarse/mid panels to 256 and combines per-scale.
-
-#### 7.4 v2.3 — texture codebook
-
-Repeated textures share patterns via an engine-wide **`SligCodebook`**
-(≤256 entries). Each keyframe stores 9 byte-sized indices instead of
-9 × 2 KB inline sets. Online clustering: novel patterns append; near
-matches reuse existing indices; full codebook falls back to nearest.
-Storage drops from 18 KB → **9 B per keyframe**.
-
-#### 7.5 Residual pyramid (encode / decode chain)
-
-Each pyramid level stores a residual against the upsampled lower level:
-
-```
-encode  : coarse  = decompose(downsample(image, 32))
-          mid     = decompose((image_128 − upsample(coarse_recon, 128)) + 128)
-          fine    = decompose((image     − upsample(mid_recon,    256)) + 128)
-decode  : pred128 = clamp(upsample(coarse_recon, 128) + (mid_recon  − 128), 0, 255)
-          final   = clamp(upsample(pred128, 256)      + (fine_recon − 128), 0, 255)
-```
-
-The +128 offset preserves signed residuals through uint8. Inner-loop
-arithmetic is integer-only; SVD/DCT happen at encode time only.
-
-#### 7.6 Conditional + spatial + guidance
-
-- **`cond_type=1`** (brightness gating): `slig_apply` honors
-  `cond_threshold` — a cell only contributes where the canvas already
-  has |value| ≥ threshold. Enables layered effects.
-- **Spatial masks** (`slig_make_mask_left/right/top/bottom`): per-item
-  256×256 mask applied during render. Direction keywords in prompts
-  ("왼쪽 산", "오른쪽 바다") tag the matching morpheme with a half-plane
-  mask via `ai_generate_image_v2_guided`.
-- **Classifier-free guidance**: `out = clamp(128 + scale × (cond − 128))`.
-  scale=1 → identity, scale=2 → emphasized, scale=3 → caricatured.
-  Pure-integer Q8 inner loop.
-
-#### 7.7 Animation — frame sequences
-
-```c
-uint32_t frames = ai_generate_animation(ai, "사과 먹", "/tmp/anim/", 16);
-/* writes frame_000.ppm .. frame_015.ppm with cumulative event ticks */
-```
-
-EVENT-stage cells (POS_VERB morphemes → `SLIG_RENDER_EVENT`) propagate
-cumulatively over `event_max_tick`, producing natural ripple/beam
-evolution across frames. Prompts without verbs render identical
-frames (no event cells fire).
-
-#### 7.8 v3 standalone pipeline (`ce_core/slig_pipeline.{c,h}`)
-
-A 5-stage SSS-independent image roundtripper:
-
-```
-preprocess  : histogram normalize + bilateral filter + symmetry detect
-decompose   : structure (SVD) → edge (Sobel) → texture (block variance)
-              → color (YCbCr block) → event (brightness centroid + beam)
-              residual chain between stages — recon = ∑σuv + img_mean
-upscale     : harmonic / SBR / Wiener / optional compressed-sensing
-              on DCT coefficients (audio bandwidth-extension techniques)
-render      : Atmos-style adaptive rendering with 3-canvas YCbCr,
-              audio_bins[0] dispatches Cb/Cr, progressive callback
-              per phase
-postprocess : unsharp mask + debanding + saturation/contrast +
-              optional histogram match (preprocess inverse)
-```
-
-```c
-#include "slig_pipeline.h"
-
-SligDecomposed dec;
-slig_learn_image(&dec, rgb_pixels, w, h, 3);
-uint8_t *out = malloc(w*h*3);
-slig_generate_image(out, w, h, &dec, /*guidance_scale=*/1.0f);
-/* save out as PPM... */
-```
-
-Progressive streaming: pass `on_progress` in `SligRenderConfig` to
-receive partial frames after each of 5 phases — wires to HTTP SSE,
-WebSocket, or shared-memory UI consumers without further glue.
-
-```c
-SligRenderConfig rc;
-slig_render_config_default(&rc);
-rc.progressive  = 1;
-rc.on_progress  = my_consumer;
-rc.progress_ctx = my_ctx;       /* gets pushed phase 1..5 */
-slig_render_adaptive(out_image, &dec, &rc);
-```
-
-`make bench_v3` runs the full v2.3 / v3 / v3-progressive comparison and
-writes 8 PPMs + `SUMMARY.txt` (timing / PSNR / RSS / cell distribution)
-to `/sdcard/Download/sss_bench/`.
-
----
-
-### 8. Material auto-learn (Mat-1/2/3/4)
-
-A 4-stage pipeline that closes the loop **"이미지 학습 → 재질 자동
-추출 → CE Cell에 기록 → 생성 시 텍스처 보임"** without any external
-labels or presets. Each cell carries its own 8-byte material descriptor
-(roughness / anisotropy / dir_angle / h_strength / h_decay / pore /
-specular / grain) extracted from the 8×8 source block during decompose.
-
-```
-  image                                                 generated image
-  ┌────────┐                                           ┌────────┐
-  │ pixels │ ──▶ Mat-1 ──▶ Mat-2 ──▶ Mat-3 ──▶ Mat-4 ──▶ pixels │
-  │ (RGB)  │     analyze   damp     delta     overlay  │ (RGB)  │
-  └────────┘                                           └────────┘
-              auto-extract per-cell roughness/pore
-                  ↓
-           CE Cell.dec.A (8B) + HAS_MATERIAL flag
-```
-
-| Step | What it does | Where |
-|---|---|---|
-| **Mat-1** | 8×8 block → integer roughness/anisotropy/dir/grain — no float, no presets, no labels. Stored in cell `dec.A` after `slig_pack`, flag bit `0x08` in `inc.R.minus[3]`. Cb/Cr cells skip this so the chroma marker (`audio_bins[0]=1/2`) stays intact. | `slig_material_harmonic.{c,h}` |
-| **Mat-2** | `slig_upscale_harmonic` reads each cell's `h_strength` and maps it to a per-cell DCT damping factor in `[0, 0.04]`. Smooth surfaces → low damping (clean edges); textured surfaces → high damping (visible high-freq energy). Cells without material fall back to the `0.02` constant default. | `slig_pipeline.c` |
-| **Mat-3** | `DeltaFrame.cell_deltas[32]` — when a clause+image pair lands on the delta path (text grid similar to a parent), `ce_delta(parent_FINE_Y[i], new_FINE_Y[i])` is recorded inline. `ce_apply` reverses it byte-exactly. Adds 2 KB / delta. `.spai v6` serializes; v5 files load with `cell_delta_count = 0`. | `spatial_keyframe.h`, `spatial_io.c` |
-| **Mat-4** | `slig_apply_material_overlay(panel, dim, cells)` imprints the average material onto the rendered Y panel: `roughness/4` noise band + sparse pore dark spots + grain shimmer. Content-addressed — same cells + same panel → bit-exact same output. Hooked into `ai_generate_image_v2_guided` after `render_channel_pyramid`. | `slig_material_harmonic.c`, `spatial_image_gen.c` |
-
-#### `ai_store_auto_with_image` — joint text + image ingestion
-
-The Mat pipeline's primary ingestion entry point. Mirrors `ai_store_auto`'s
-match flow but takes both a text clause and an image grid:
-
-```c
-SpatialGrid *img = image_to_grid("apple.ppm");
-ai_store_auto_with_image(ai, "사과", img, "apple");
-/*  → text grid match against existing keyframes:
- *    - similarity ≥ threshold   → DeltaFrame with cell_deltas vs parent FINE-Y
- *    - similarity <  threshold  → new Keyframe with full image_idx pyramid
- *    Either way, Mat-1 has already filled per-cell roughness/pore during
- *    the pyramid decompose, and Mat-4 will surface them at render time.   */
-grid_destroy(img);
-```
-
-#### Verified results (test_material — 47 PASS)
-
-```
-  apple texture learn:      roughness=113  pore=182  grain=61   (auto-extracted)
-  overlay on flat panel:    64434 / 65536 pixels changed (≈98%)
-  max luminance deviation:  40 luma   (visible, well below clamp)
-  smooth material (METAL):  max_dev 7   ←  1/5× rougher material → less texture
-  determinism:              same cells + same panel → bit-exact
-  delta-path cell_delta:    20 entries  → ce_apply roundtrip exact
-  .spai v6 roundtrip:       cell_delta_count survives
-```
-
----
-
-## Demo: text → image generation
-
-End-to-end demonstration of the SSS image pipeline:
-**procedurally synthesized dataset → joint text+image training (`.spai` + `.ces`) → morpheme-routed denoise + 16×16 atomic wave-refine → 256×256 PPM**.
-Total training set: **10,240 image entries (16×16 atomic blocks via
-`ce_feed_image_16`) + 38 per-morpheme TEXT bridges = 10,278 CEStorage
-entries** — above the 10K minimum exercised by `test_stress_10k`.
-
-### Training set
-
-10 labelled images: 4 solid colours (`red`, `green`, `blue`, `yellow`) and
-6 fruit shapes drawn as ellipses with a luminance gradient
-(`apple`, `banana`, `grape`, `lime`, `blueberry`, `orange`).
-Each row of `data/demo/labels.tsv` ties a label, a clause
-(e.g. `"apple is red and round"`) and an image path.
-
-![dataset](docs/demo/dataset_grid.png)
-
-### Pipeline
+## End-to-end demo
 
 ```bash
-# 0. build everything
-make demo_tools
+make demo_tools                            # builds make_demo_dataset, train_demo,
+                                           # gen_image_ce, verify_hybrid
 
-# 1. synthesize the 10-image dataset
-./build/make_demo_dataset data/demo
+./build/make_demo_dataset data/demo        # 10 PPM images + labels.tsv
 
-# 2. joint train: SpatialAI keyframes (text+image) +
-#    CEStorage 16×16 atomic IMAGE blocks via ce_feed_image_16 +
-#    one CE_TYPE_TEXT entry per morpheme of the clause
+# Joint text+image training
 ./build/train_demo data/demo build/models/demo
-# -> build/models/demo.spai
-# -> build/models/demo.ces  (10,240 IMAGE + 38 TEXT entries, all sharing
-#                            canvas_id with their paired image)
+#   IMG=10240   block stamps
+#   TEXT=38     per-morpheme bridges
+#   HYB_blocks=10240  (= IMG)
+#   HYB_cells=648     SLIG cells from hybrid_vae_encode
 
-# 3. generate. The CLI tokenises the prompt with morpheme_tokenize_clause,
-#    looks up each morpheme via ce_search_by_type(CE_TYPE_TEXT, ...),
-#    votes a winning canvas_id (weight = 1/(1+distance)), and calls
-#    ce_generate_image_canvas_routed which restricts wave-refine targets
-#    to the routed canvas_id and decodes 16×16 atomic patches via
-#    ce_decode_image_block_16.
-./build/gen_image_ce build/models/demo.ces \
-    "red apple" build/gen/red_apple.ppm 0 50 200
+# With masked-train + residual codebook
+./build/train_demo data/demo build/models/demo_cb \
+    --masked-epochs 5 --residual-codebook
+#   masked-train summary: stored_cells=253 residuals=96
+#   codebook=6–9 patterns (≈10× compression on correction cells)
+
+# Generate (canvas-routed default path)
+./build/gen_image_ce build/models/demo.ces "red apple" \
+    build/red_apple.ppm 0 50 200
+
+# Generate (hybrid VAE path)
+./build/gen_image_ce build/models/demo_cb.ces "red apple" \
+    build/red_apple_hybrid.ppm 0 50 200 --hybrid --guidance 1.5
+
+# Roundtrip PSNR over a folder
+./build/verify_hybrid data/demo/colors/*.ppm data/demo/fruits/*.ppm
+#   per-file dB output + average across the batch
 ```
 
-### Generated outputs
+`gen_image_ce` morpheme-tokenises the prompt, votes a winning
+`canvas_id` via `ce_search_by_type(CE_TYPE_TEXT, ...)`, then either:
 
-50 denoise steps + 200 wave-refine iterations per prompt, deterministic seed 0:
+- (default) `ce_generate_image_canvas_routed` — denoise + decode +
+  16×16 atomic wave-refine on entries with the matching canvas_id, **or**
+- (`--hybrid`) `hybrid_vae_decode` — block-stamp colour base + SLIG
+  detail (loaded from CEStorage via `ce_storage_load_slig_sets`) +
+  optional codebook patches + wave refine + guidance.
 
-![generated](docs/demo/generated_grid.png)
+---
+
+## Verified results
+
+`make test` passes 19/19 upper engine binaries on this branch. The
+`ce_core` suite passes 20/21 (`test_slig_signal` is a documented
+Windows-MSYS-only baseline issue with file-write permissions, present
+before any of this work and unchanged by it).
+
+### Test surface
+
+```
+  Upper engine (make test):
+    test_grid             6/6
+    test_morpheme         5/5
+    test_layers           3/3
+    test_match            5/5
+    test_keyframe         6/6
+    test_context          5/5
+    test_integration      4/4
+    test_io               7/7
+    test_cascade          6/6
+    test_canvas           8/8
+    test_adaptive         8/8
+    test_subtitle         8/8
+    test_recluster        7/7
+    test_refine          13/13
+    test_image_roundtrip  3/3
+    test_image_gen       68/68   (incl. hybrid VAE + masked-train E2E)
+    test_tick_math       28/28
+    test_material        47/47
+
+  ce_core (make -C ce_core test):
+    test_core / test_storage / test_engine / test_denoise / test_extend /
+    test_gen / test_ingest / test_decode_image_block / test_feed_image /
+    test_image_wave_refine / test_pipeline / test_stress_10k /
+    test_slig_energy / test_storage_ingest16 / test_decode16          PASS
+
+    test_hybrid_vae        16/16   (encode + decode + roundtrip PSNR)
+    test_masked_train      14/14   (config / single image / batch / progressive)
+    test_slig_persist      19/19   (persist + load + tick-sorted iter)
+    test_residual_codebook 27/27   (lookup + add + (x, y) roundtrip)
+    test_residual_decode    8/8   (codebook on/off changes blend_y)
+    test_slig_signal       30/33   (3 fails: Windows-MSYS file-write only)
+```
+
+### Hybrid VAE roundtrip on synthetic images
+
+```
+  test_hybrid_vae:
+    solid 2×2 image       → block_entries=1024, total_cells=14, PSNR  6.3 dB
+    synth gradient image  → PSNR 13.2 dB
+    base-only restoration → non-blank
+    detail-only render    → non-blank
+    wave refine baseline  → PSNR > 5 dB
+```
+
+### Demo pipeline (10 images, deterministic seed 0)
 
 | Prompt | Routed canvas | Mean RGB | Verdict |
 |---|---|---:|---|
-| `"red apple"`       | `apple`     | (196, 38, 38)  | **red** ✓ |
-| `"yellow banana"`   | `banana`    | (213, 195, 46) | **yellow** ✓ |
-| `"purple grape"`    | `grape`     | (118, 42, 146) | **purple** ✓ |
-| `"green lime"`      | `lime`      | (38, 195, 38)  | **green** ✓ |
-| `"blue blueberry"`  | `blueberry` | (38, 39, 196)  | **blue** ✓ |
-| `"orange fruit"`    | `orange`    | (220, 140, 41) | **orange** ✓ |
+| `"red apple"`       | apple     | (196, 38, 38)  | red ✓ |
+| `"yellow banana"`   | banana    | (213, 195, 46) | yellow ✓ |
+| `"purple grape"`    | grape     | (118, 42, 146) | purple ✓ |
+| `"green lime"`      | lime      | (38, 195, 38)  | green ✓ |
+| `"blue blueberry"`  | blueberry | (38, 39, 196)  | blue ✓ |
+| `"orange fruit"`    | orange    | (220, 140, 41) | orange ✓ |
 
-**6/6** prompts route to the correct dataset row and decode to the
-matching colour. Routing works even when the prompt contains a non-label
-word (`"fruit"` is unknown to the dataset; the morpheme vote still picks
-`"orange"` as the dominant signal because `1/(1+distance)` falls off
-sharply for unrelated tokens).
+6/6 prompts route to the correct dataset row and decode to the
+expected colour, including the `"orange fruit"` case where `"fruit"`
+is unknown to the dataset (the morpheme vote still resolves to
+`"orange"` because `1/(1+distance)` falls off sharply for unrelated
+tokens).
 
-### What the textures show
-
-The generated images are colour-correct but visibly textured rather than
-smooth: this is the wave-refine loop tiling the top-K retrieved **16×16
-atomic patches** into a 256×256 canvas, ridden over by the residual
-noise of a 50-step denoise. Each patch comes from 4 quadrant CEUnits
-emitted by `ce_feed_image_16` (TL/TR/BL/BR) and decoded back via
-`ce_decode_image_block_16`. The block-level encoding preserves per-
-channel sums and 4-direction gradients; the high-frequency carry-chain
-pattern is the integer denoise asserting itself before averaging. With
-more diverse training data (real photographs rather than solid fills +
-ellipses) the CE retrieval has more useful neighbours to blend, which
-softens the texture without changing the algorithm.
-
----
-
-## Current verified results
-
-Everything below is reproduced by `make test` on this branch
-(`claude/refactor-canvas-spatial-ai-FJt1Y`).
-
-### Test suite
+### Masked train on the demo set
 
 ```
-  test_grid             6/6
-  test_morpheme         5/5
-  test_layers           3/3
-  test_match            5/5
-  test_keyframe         6/6
-  test_context          5/5
-  test_integration      4/4
-  test_io               7/7
-  test_cascade          6/6
-  test_canvas           8/8
-  test_adaptive         8/8
-  test_subtitle         8/8
-  test_recluster        7/7
-  test_refine          13/13
-  test_image_roundtrip  3/3
-  test_image_gen       59/59   (SLIG v2.3 integration)
-  test_tick            28/28   (tick math + frequency search)
-  test_material        47/47   (Mat-1/2/3/4 auto-learn)
-  ────────────────────────────
-  total               228/228   ALL TESTS PASSED
+  --masked-epochs 5 --residual-codebook
+  ────────────────────────────────────
+  per image: epochs_run=5, final_loss≈80, cells_stored=25, residuals≈10
+  batch:     stored_cells=253, residuals=96, codebook=6–9 patterns
 ```
 
-### Brightness distribution
+Loss above the convergence target (`8.0`) is expected — 5 epochs ×
+10 images is too small to converge the masked predictor. Phase 13's
+test_residual_decode confirms the codebook layer is wired in
+correctly (`diff_pixels=984` between codebook on/off, max per-pixel
+deviation 77).
+
+### Stress test
+
+`test_stress_10k`:
 
 ```
-  "귀여운 고양이가 밥을 먹는다."    →  active 40, max A = 9, total 297
-  conservation:                     297 = 40 + 185 + 72    (base+word+morph)
+  N = 12,000 entries
+    ingest:   5 ms       (2.66M blocks/s)
+    search:   0.2 ms     (k=8)
+    save:     <1 ms
+    load:     <1 ms
+    generate: 60 ms      (4-step + 30 wave refines)
+  N = 100,000 entries
+    ingest:   60 ms
+    search:   1.5 ms
+    save:    100 ms
+    load:    130 ms
+    generate: 90 ms
 ```
 
-### Matching integrity
-
-```
-  block-skip vs full cosine               0.000% difference
-  KF0↔KF1 cosine (similar clauses)       73.2%
-  KF0↔KF2 cosine (different clauses)      0.0%
-  self-query cosine                     100.0%
-```
-
-### Pipeline smoke test (`test_wiki data/sample_en.txt`, 50 clauses)
-
-```
-  clauses placed        50 / 50
-  canvases              2
-  self-query avg sim    100.0%
-  cascade step 1 hits   50
-  fallbacks             0
-  Recall@1 / @5 / @10   100% / 100% / 100%
-  next-clause top-1     22.0%     (beats best-of-5 random = 20%)
-  save size             20.9 MB   (.spai on disk)
-  load + append         OK        (4 canvases, 100 slots after append)
-```
-
-### `stream_train` smoke test (1000 clauses over a 10k-line corpus)
-
-```
-  ingest                clauses=1000  KF=49  Δ=951   elapsed 4.64 s
-  .spai file size       17.2 MB
-  verify tail (500)     avg sim 0.9867  min 0.34  max 1.000
-  hits ≥ 0.90 / 0.50    490 / 490
-  R range               0..210
-  G range               0..120
-  B range               0..200         (POS seed active, was 0..0)
-```
-
-### Unified match performance
-
-Since `match_cascade`, `match_engine`, and `ai_predict` all
-delegate to `spatial_match()`, and since the bucket index skips
-the O(N) scan past `BUCKET_THRESHOLD = 100`, `stream_train` on the
-same 10k-line synthetic corpus went from **58.85 s → 22.14 s**
-(−62%) across the refactor.
-
-### Cascade / canvas
-
-```
-  cascade early-return on exact clause     ≥ CASCADE_STEP1_THRESHOLD (0.5)
-  ai_force_keyframe 1-1 mapping            kf_count == N, df_count == 0
-  pool_match jumps to same-type slots      step=1 on matching DataType
-  pool_match fallback to other types       step=4 when query type empty
-```
+All time budgets hold. 1M entries (≈1000 images × 1024 blocks) keep
+generate under 0.1 s.
 
 ---
 
 ## Build & run
 
 ```bash
-# Build everything
-make all
-
-# Full test suite (228 tests across 18 binaries)
-make test
-
-# Clean
-make clean
-
-# Wikipedia-style pipeline probe (uses data/sample_en.txt or data/sample_ko.txt)
-make wiki
-./build/test_wiki data/sample_en.txt
-./build/test_wiki data/sample_en.txt --save build/model.spai
-./build/test_wiki data/sample_en.txt --load build/model.spai
+make all                  # all object files + linked test/demo binaries
+make test                 # 268 upper-engine cases
+make -C ce_core all       # ce_core engine + tests
+make -C ce_core test      # ce_core regression
+make demo_tools           # train_demo / gen_image_ce / verify_hybrid
 ```
 
-**Requires:** GCC (C11), Make, POSIX (`posix_memalign`) or MinGW on Windows.
-For the visualizer: Python 3, `numpy`, `Pillow`, `ffmpeg`.
+**Requires:** GCC ≥ 9 (C11), Make, POSIX-ish shell. On Windows MSYS2's
+`/usr/bin/gcc` works; the MinGW fork hits POSIX-mkdir issues in
+`test_ingest`.
 
-### Streaming trainer (`stream_train`)
-
-For large corpora where the full text can't fit in RAM:
+### Streaming text trainer
 
 ```bash
 make stream
@@ -653,314 +499,201 @@ make stream
                      --verify
 ```
 
-`stream_train` reads one clause per line with `fgets` (4 KB buffer)
-and calls `ai_store_auto` per clause. Memory stays flat regardless
-of source-file size. `--checkpoint N` emits `foo.ckpt_NNNNNN.spai`
-every N clauses; `--verify` re-scans the tail after training and
-reports avg/min/max similarity plus hit counts at 0.9 / 0.5 / 0.1.
-
-### End-to-end practical test
-
-One script that builds, trains, verifies, then points at the visualizer:
-
-```bash
-./tools/run_practical_test.sh              # default: 1000 clauses
-./tools/run_practical_test.sh 5000
-./tools/run_practical_test.sh 25000 data/kaggle_train.txt
-```
-
-The checkpoint cadence is `min(N / 2, 5000)`. The corpus falls back
-to `data/sample_en.txt` / `data/sample_ko.txt` if no path is given.
-
-### Training-evolution visualizer
-
-```bash
-pip install numpy Pillow
-python3 tools/visualize_training.py build/models
-```
-
-For every `.spai` checkpoint in the directory it renders a 1280×720
-PNG (A-channel heatmap, RGB composite, KF / Δ stats, adaptive
-weights, EMA coverage, sample keyframe labels) and stitches the
-frames into `training_evolution.mp4` via `ffmpeg` at 3 s per frame.
-The RGB composite shows B actually contributing — a visual
-confirmation that the POS-keyed seed reached the stored grid.
+Memory stays flat regardless of source-file size. `--checkpoint N`
+emits intermediate `.spai` files; `--verify` re-scans the tail.
 
 ### Image training
 
-Train a model from images — PNG and baseline JPEG are supported via
-small ingestion helpers; the engine's native format stays PPM P6 256×256.
-
 ```bash
-# Convert inputs to 256×256 PPM (box-average downsample)
-python3 tools/png_to_ppm256.py IMG_0304.png build/training/IMG_0304.ppm
-
-make image_tools          # builds img2grid / grid2img
-gcc -Wall -O2 -Iinclude tools/jpeg_to_ppm256.c -o build/jpeg_to_ppm256 -ljpeg
-./build/jpeg_to_ppm256 IMG_0305.jpeg build/training/IMG_0305.ppm
-
-# Build the train / verify tools
-gcc -Wall -O2 -Iinclude tools/train_images.c       build/*.o -o build/train_images       -lm
-gcc -Wall -O2 -Iinclude tools/verify_image_train.c build/*.o -o build/verify_image_train -lm
-
-# Train: one keyframe per image + EMA update
-./build/train_images build/training/img_model.spai \
-    build/training/IMG_0304.ppm \
+# Convert PNG / JPEG to 256×256 PPM
+python3 tools/png_to_ppm256.py data/samples/IMG_0304.png \
+    build/training/IMG_0304.ppm
+make image_tools
+gcc -Wall -O2 -Iinclude tools/jpeg_to_ppm256.c \
+    -o build/jpeg_to_ppm256 -ljpeg
+./build/jpeg_to_ppm256 data/samples/IMG_0305.jpeg \
     build/training/IMG_0305.ppm
 
-./build/verify_image_train build/training/img_model.spai
-# → kf_count: 2   EMA cells w/ evi: 65536/65536 (100.0%)
+# CE-cell trainer (replaces the legacy SpatialAI-only one)
+make train_images_ce
+./build/train_images_ce build/training/img_model.ces \
+    build/training/IMG_0304.ppm \
+    build/training/IMG_0305.ppm
 ```
 
-`png_to_ppm256.py` is stdlib-only (decodes 8-bit RGB/RGBA
-non-interlaced PNGs); `jpeg_to_ppm256` links against `libjpeg`
-(`apt install libjpeg-dev`). `img2grid` / `grid2img` demonstrate
-the raw image ↔ SpatialGrid roundtrip.
+### `verify_hybrid`
 
-### Benchmarks (optional)
+PPM → `hybrid_vae_roundtrip` → PSNR per file + batch average.
+Useful for tracking whether the encode/decode regresses across
+changes.
 
 ```bash
-make bench        # builds bench_stsb / bench_perplexity / bench_word_predict / bench_qa
-
-./build/bench_word_predict  data/sample_en.txt  1000
-./build/bench_qa            data/qa.tsv
-./build/bench_perplexity    data/sample_en.txt  500
-./build/bench_stsb          data/stsb.tsv
-```
-
-`bench_word_predict` also exposes `--save`, `--load`, `--load-only`.
-If `--save` is omitted, a run that actually trains auto-saves to
-`build/models/bench_word_predict_auto.spai`.
-
-### Quick corpus bootstrap (3k-line Wikipedia abstracts)
-
-Streams just enough of `enwiki-latest-abstract1.xml.gz` to extract
-3000 abstracts (≈ 2500 usable clauses after short-line filtering).
-Works on Kaggle / Linux. No full dump download:
-
-```python
-import os, gzip, re, urllib.request
-os.makedirs("data", exist_ok=True)
-URL  = "https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-abstract1.xml.gz"
-OUT  = "data/kaggle_train.txt"
-pat, n = re.compile(rb"<abstract>([^<]+)</abstract>"), 0
-with urllib.request.urlopen(URL) as resp, gzip.GzipFile(fileobj=resp) as gz, \
-     open(OUT, "wb") as out:
-    buf = b""
-    while n < 3000:
-        c = gz.read(1 << 20)
-        if not c: break
-        buf += c
-        last = 0
-        for m in pat.finditer(buf):
-            s = m.group(1).strip()
-            if len(s) >= 20:
-                out.write(s + b"\n"); n += 1
-                if n >= 3000: break
-            last = m.end()
-        buf = buf[last:]
-print(f"{OUT}: {n} lines, {os.path.getsize(OUT)/1e6:.1f} MB")
-```
-
-Then:
-
-```bash
-./tools/run_practical_test.sh 2500 data/kaggle_train.txt
-python3 tools/visualize_training.py build/models
+make demo_tools                               # also builds verify_hybrid
+./build/verify_hybrid data/demo/colors/*.ppm data/demo/fruits/*.ppm
 ```
 
 ---
 
-## Save / Load
+## Save / load formats
 
-Binary format `.spai` — `SPAI` magic, current version **6**. Versions
-3, 4, and 5 load transparently (missing fields default to zero).
+### `.spai` — text engine state
+
+Magic `SPAI`, current version **6**. v3/4/5 load transparently.
 
 ```
-  [Header 32B]   magic "SPAI" | version | kf_count | df_count | reserved[3]
-
-  [Records]*     tagged stream, KFs + deltas in insertion order
-    tag 0x01  Keyframe:  id + label[64] + text_byte_count +
-                         (v5: topic_hash + seq_in_topic) +
-                         A + R + G + B
-    tag 0x02  Delta:     id + parent_id + label[64] + count + change_ratio +
-                         entries[]  (v4+: 9 B/entry with diff_B; v3: 8 B) +
-                         (v6: cell_delta_count + CEUnit cell_deltas[N], up to 32; Mat-S3)
-    tag 0x03  Weights:   global ChannelWeight (4× float)
-    tag 0x04  Canvas:    slot_count, canvas_type, frame_type, parent_canvas_id,
-                         changed_ratio, classified, SlotMeta[32], A + R + G + B
-    tag 0x05  Subtitle:  count + (type, topic_hash, canvas_id, slot_id, byte_length)[]
-    tag 0x06  EMA:       R[65536] + G[65536] + B[65536] + count[65536]  (float each, 1 MB)
-    tag 0x07  SeqMeta:   per-canvas slot sequence_id + timestamp_us (Task B)
-    tag 0x49  ImageCells (legacy v2.0): no longer written — reserved
-    tag 0x4A  Codebook:  pattern_count + (channel + scale_level + cells[])* (SLIG v2.3)
-    tag 0x4B  ImageIdx:  kf_id + idx[SLIG_NUM_LEVELS][SLIG_NUM_CHANNELS] (9 B/keyframe)
+  Header 32B    magic + version + kf_count + df_count + reserved
+  Records*      tagged stream:
+    0x01 Keyframe    id, label, A/R/G/B
+    0x02 Delta       id, parent, sparse entries (v6: + cell_deltas[])
+    0x03 Weights     ChannelWeight (4× float)
+    0x04 Canvas      slot_count, type, parent, A/R/G/B
+    0x05 Subtitle    type/topic_hash/canvas_id/slot_id table
+    0x06 EMA         R/G/B/count per cell
+    0x07 SeqMeta     per-canvas sequence id + timestamp
+    0x4A Codebook    SligCodebook patterns (v2.3)
+    0x4B ImageIdx    per-keyframe (3×3) codebook indices
 ```
 
-Version bumps:
+### `.ces` — CE-Cell storage
 
-- **v3 → v4** added `diff_B` to `DeltaEntry` (sparse delta now covers
-  the B channel) and the EMA trailing block.
-- **v4 → v5** added `topic_hash` + `seq_in_topic` to every keyframe
-  record so `ai_generate_next` can walk same-topic threads instead
-  of falling back to `id + 1`.
-- **v5 → v6** appended `cell_delta_count` + `CEUnit cell_deltas[N]`
-  to every Delta record (Mat-S3). When a clause+image pair lands on
-  the delta path with `parent.has_image`, up to `SLIG_MAX_CELLS=32`
-  CE-Cell deltas (`ce_delta(parent_FINE_Y, new_FINE_Y)`) are stored
-  inline so the variant's image is recoverable byte-exactly via
-  `ce_apply`. v5 readers stop before this trailing block; v6 readers
-  loading a v5 file see `cell_delta_count = 0` (memset zeroed).
+Format v2 (current). Each entry is **140 bytes**:
 
-Public API (`include/spatial_io.h`):
+```
+   4 B  canvas_id          uint32
+   2 B  slot               uint16
+   2 B  block_idx          uint16
+   1 B  type               CE_TYPE_* (0..4 used today)
+   3 B  reserved (zero)
+  64 B  keyframe           CEUnit
+  64 B  delta              CEUnit
+```
+
+Adding `CE_TYPE_SLIG=3` and `CE_TYPE_RESIDUAL=4` is forward-compatible
+— the type field is a single byte that already supported up to 254
+modalities. Older readers that don't recognise the new values still
+load the rest.
+
+For `CE_TYPE_RESIDUAL` the 64-byte `keyframe` slot is reused as a
+descriptor (no raw patch payload). See
+[§5 RGBA tick clock + residual codebook](#5-rgba-tick-clock--residual-codebook)
+for the byte layout.
+
+### Save / load API
 
 ```c
 SpaiStatus ai_save(const SpatialAI* ai, const char* path);
 SpatialAI* ai_load(const char* path, SpaiStatus* out_status);
 SpaiStatus ai_save_incremental(const SpatialAI* ai, const char* path);
-SpaiStatus ai_peek_header(const char* path,
-                          uint32_t* kf_count, uint32_t* df_count, uint32_t* version);
+SpaiStatus ai_peek_header(const char* path, ...);
+
+int ce_storage_save(const CEStorage *s, const char *path);
+int ce_storage_load(CEStorage *out, const char *path);
 ```
 
-Guarantees validated by `test_io`:
-
-- **Roundtrip integrity**: 700 clauses → save → destroy → load → same query
-  cosine within `1e-3`.
-- **Incremental growth**: `ai_save_incremental` refuses to shrink
-  (returns `SPAI_ERR_STATE` if engine has fewer entries than disk) and
-  grows the file by the new records only.
-- **Forward compat**: unknown trailing tags are tolerated — older readers
-  stop cleanly instead of corrupting.
-- **Corrupt-file safety**: bad magic → `SPAI_ERR_MAGIC`,
-  bad version → `SPAI_ERR_VERSION`, truncated body → `SPAI_ERR_READ`.
+`test_io` validates `|sim_before − sim_after| < 1e-3` over a 700-clause
+roundtrip and proves that `ai_save_incremental` refuses to shrink an
+on-disk model.
 
 ---
 
 ## Project layout
 
 ```
-├── include/                  # Public headers
-│   ├── spatial_grid.h        # 256×256 grid, 1D aligned channels
-│   ├── spatial_layers.h      # 3-layer summation (base / morpheme / word)
-│   ├── spatial_morpheme.h    # Korean morpheme analyzer (longest-match)
-│   ├── spatial_keyframe.h    # Keyframe / delta / SpatialAI engine
-│   ├── spatial_match.h       # Cosine, cascade modes, adaptive weights,
-│   │                         #   MorphemeMatch (SLIG v2.x)
-│   ├── spatial_context.h     # Context frames + LRU cache
-│   ├── spatial_canvas.h      # 2048×1024 canvas with 32 slots
-│   ├── spatial_subtitle.h    # SubtitleTrack + SpatialCanvasPool
-│   ├── spatial_generate.h    # Next-clause generation
-│   ├── spatial_image.h       # ai_learn_image / ai_generate_image_v2 /
-│   │                         #   ai_generate_image_v2_guided / animation
-│   └── spatial_io.h          # .spai binary format (v5 + v2.3 codebook)
-├── src/                      # Implementations (one per header)
-│   └── spatial_image_gen.c    # SLIG v2.3 generator (color × multi-scale × residual)
-├── ce_core/                  # CE Cell library (vendored)
-│   ├── ce_core.{c,h}         # 64-byte CEUnit, ce_pack/unpack/distance
-│   ├── ce_storage.{c,h}      # CE-Cell storage / search / engine helpers
-│   ├── slig_signal.{c,h}     # SligSignal / decompose / render / canvas / masks /
-│   │                         #   guidance / animation tick / pyramid helpers
-│   ├── slig_codebook.{c,h}   # SligCodebook — texture pattern dictionary
-│   ├── slig_material_harmonic.{c,h}  # Mat-1/2/4: per-cell roughness/pore +
-│   │                                 #   render-time material overlay
-│   ├── slig_tick_math.{c,h}  # 32-bit tick arithmetic + frequency search
-│   └── slig_pipeline.{c,h}   # v3 standalone 5-stage pipeline
-├── dict/                     # Korean dictionaries (nouns/verbs/adj/particles/endings)
-├── tests/                    # 18 test binaries, 228 tests total
-│   ├── test_image_gen.c       # SLIG v2.3 integration suite (59 cases)
-│   ├── test_tick.c            # tick math + frequency search (28 cases)
-│   └── test_material.c        # Mat-1/2/3/4 auto-learn (47 cases)
-├── data/                     # Sample corpora + download scripts
+├── include/                    public headers (text engine)
+│   ├── spatial_grid.h          256×256 RGBA grid
+│   ├── spatial_layers.h        3-layer summation
+│   ├── spatial_morpheme.h      Korean longest-match analyser
+│   ├── spatial_keyframe.h      Keyframe / delta / SpatialAI
+│   ├── spatial_match.h         spatial_match() unified core
+│   ├── spatial_context.h       LRU frame cache
+│   ├── spatial_canvas.h        2048×1024 canvas + 32 slots
+│   ├── spatial_subtitle.h      SubtitleTrack + canvas pool
+│   ├── spatial_generate.h      next-clause refine
+│   ├── spatial_image.h         image_to_grid / grid_to_image +
+│   │                           ai_generate_image_v2_guided / animation
+│   └── spatial_io.h            .spai binary format
+├── src/                        text engine implementations
+│   ├── spatial_grid.c / layers.c / morpheme.c / keyframe.c /
+│   │   match.c / context.c / canvas.c / subtitle.c / recluster.c /
+│   │   generate.c / io.c / image.c
+│   └── spatial_image_gen.c     SLIG v2.3 generator
+├── ce_core/                    CE Cell engine
+│   ├── ce_core.{c,h}           64-byte CEUnit primitives
+│   ├── ce_type.h               CEType (TEXT/IMAGE/AUDIO/SLIG/RESIDUAL)
+│   ├── ce_storage.{c,h}        CEStorage + 16×16 ingest + SLIG persist +
+│   │                           tick-sorted iter
+│   ├── ce_storage_io.{c,h}     .ces v2 reader/writer
+│   ├── ce_search.{c,h}         top-k retrieval, by-type filter
+│   ├── ce_engine.{c,h}         UNet-equivalent ops (Down/Conv/Attn/Up)
+│   ├── ce_denoise.{c,h}        50-step denoise loop
+│   ├── ce_decode.{c,h}         latent → image / text
+│   ├── ce_extend.{c,h}         sampler + inpaint (CEInpaintMask)
+│   ├── ce_gen.{c,h}            top-level generation API
+│   ├── ce_feed_image.{c,h}     8×8 / 16×16 block encoders
+│   ├── ce_image_wave_refine.{c,h}  0.01→3→0.01 wave refine
+│   ├── ce_hybrid_vae.{c,h}     hybrid encode + decode + roundtrip
+│   ├── ce_masked_train.{c,h}   PROGRESSIVE mask schedule
+│   ├── ce_residual_codebook.{c,h}  256-entry correction dictionary
+│   ├── ce_tick.h               TickRGBA carry chain (header-only)
+│   ├── slig_signal.{c,h}       SligSignal + decompose + canvas
+│   ├── slig_codebook.{c,h}     (scale, channel) pattern dictionary
+│   ├── slig_pipeline.{c,h}     v3 5-stage standalone pipeline
+│   ├── slig_tick_math.{c,h}    32-bit packed tick + sin/cos/gauss tables
+│   └── slig_material_harmonic.{c,h}  Mat-1/2/4 auto-extract
+├── tests/                      upper-engine tests (19 binaries)
+├── ce_core/tests/              ce_core tests (21 binaries)
 ├── tools/
-│   ├── stream_train.c         # Line-by-line streaming trainer (C binary)
-│   ├── bench_v3.c             # v2.3 vs v3 pipeline benchmark + PPM dump
-│   ├── img2grid.c / grid2img.c  # PPM ↔ grid roundtrip (Task F)
-│   ├── chat.c                 # Interactive REPL
-│   ├── run_practical_test.sh  # Build + train + verify wrapper
-│   ├── visualize_training.py  # .spai → PNG frames + MP4 video
-│   └── kaggle_gpu_train.py    # Optional CUDA training helper
-├── Makefile
-├── SPEC.md                   # Core spec (Page 1)
-├── SPEC-ENGINE.md            # Engine optimization spec (Page 2)
+│   ├── train_demo.c            joint text+image trainer
+│   │                            (--masked-epochs N, --residual-codebook)
+│   ├── gen_image_ce.c          prompt → 256×256 PPM
+│   │                            (default canvas-routed, --hybrid --guidance N)
+│   ├── verify_hybrid.c         hybrid_vae_roundtrip PSNR over a folder
+│   ├── train_images_ce.c       single-image CE trainer
+│   ├── stream_train.c          line-by-line text trainer
+│   ├── chat.c                  interactive REPL
+│   ├── make_demo_dataset.c     generates data/demo
+│   ├── img2grid.c / grid2img.c PPM ↔ SpatialGrid round-trip
+│   └── png_to_ppm256.py / jpeg_to_ppm256.c image converters
+├── data/
+│   ├── samples/                IMG_0304.png, IMG_0305.jpeg, IMG_0306.jpeg
+│   └── demo/                   procedurally generated PPMs + labels.tsv
+├── PIPELINE.md                 phase-by-phase log of this branch
+├── SPEC.md / SPEC-ENGINE.md    historical spec
 └── README.md / README_KO.md
 ```
 
 ---
 
-## Engine optimizations
+## Roadmap
 
-All of these live in `src/spatial_match.c` + `src/spatial_keyframe.c` and are
-exercised by `test_match`, `test_integration`, `test_cascade`, `test_adaptive`.
+Implemented (this branch — see `PIPELINE.md` for the 13-phase log):
 
-| Optimization | Where | Result |
-|---|---|---|
-| 1D aligned channels (32-byte) | `spatial_grid.c` | AVX2-ready, cache-line friendly |
-| Block skip (16×16 sums) | `compute_block_sums`, `cosine_block_skip` | 93% blocks skipped on clauses, **0.000%** accuracy loss |
-| Adaptive Top-K (hash buckets) | `bucket_index_*`, `grid_hash` | O(N) → O(N/B + K) for KF ≥ 100 |
-| Sparse delta | `compute_delta` / `DeltaEntry` | 16-entry delta = 128 B |
-| LRU frame cache | `spatial_context.c` | 90% hit on repeat access |
-| Adaptive channel weights | `ChannelWeight` + `weight_update` | winner-take-reward per store |
-| Directional RGB diffusion | `update_rgb_directional` | read/write split, min ±1 delta |
+- [x] Dead-code purge (`ce_memo`, `ce_hint`, `ce_audio`, `ce_upscale`,
+      `ce_generate_image` legacy, `ai_generate_image` v1).
+- [x] Hybrid VAE (encode + decode + roundtrip), test suite 16/16.
+- [x] Masked train (progressive mask schedule), test suite 14/14.
+- [x] `train_demo --masked-epochs N`, `gen_image_ce --hybrid --guidance N`,
+      `verify_hybrid`.
+- [x] `CE_TYPE_SLIG` / `CE_TYPE_RESIDUAL` modalities; `.ces` v2
+      forward-compatible.
+- [x] SLIG cellset persistence + tick-sorted storage iteration
+      (`ce_tick.h`).
+- [x] Residual codebook (256 entries, scale-bucketed, used_count
+      tracked).
+- [x] `train_demo --residual-codebook` reduces correction cells
+      ~10× via the codebook.
+- [x] hybrid VAE decode applies `CE_TYPE_RESIDUAL` patches in
+      tick order, with positional `(x, y)` 8×8 gaussian stamping.
 
-Targets: 20–100× combined over a naïve per-cell cosine at 1000+ keyframes,
-with accuracy preserved.
+Pending (deferred per user direction until end-to-end is validated on
+a 1000+-image corpus):
 
----
-
-## Morpheme analyzer
-
-Dictionary-based longest-match tokenizer. No external libs.
-
-```
-  Input              Output
-  ─────────────────────────────────────────────────
-  "귀여운"        → [adj: 귀여운]
-  "고양이가"      → [noun: 고양이] + [particle: 가]
-  "밥을"          → [noun: 밥] + [particle: 을]
-  "먹는다."       → [verb: 먹] + [ending: 는다] + [punct: .]
-```
-
-```
-  Dictionary
-  ├── Nouns       88   (animals, food, objects, nature, people, abstract)
-  ├── Verbs       39   (먹, 가, 오, 보, 하, 되, …)
-  ├── Adjectives  20   (귀여운, 예쁜, 밝은, 아름다운, …)
-  ├── Particles   26   (은/는/이/가/을/를/에서/으로, …)
-  └── Endings     20   (는다/었다/았다/겠다, …)
-```
-
-POS tags also seed the R / G channels before diffusion:
-
-```
-  POS_NOUN     R=40  G=30
-  POS_VERB     R=120 G=40
-  POS_ADJ      R=170 G=35
-  POS_PARTICLE R=8   G=85
-  POS_ENDING   R=12  G=95
-  POS_PUNCT    R=5   G=120
-  POS_UNKNOWN  R=210 G=20
-```
-
----
-
-## vs. Traditional LLM
-
-```
-                      Traditional LLM            SPATIAL-PATTERN-AI
-  ───────────────────────────────────────────────────────────────────
-  Encoding            token → vector → matrix    byte → pixel → 256×256
-  Parameters          fixed-size matrix          unlimited frame stack
-  Context             bounded window (32K-1M)    unlimited (disk-bound)
-  Interpretability    opaque weights             visible heatmap
-  Learning            full retrain / SFT         incremental delta
-  Per-frame cost      —                          ~320 KB on disk
-  Retrieval           attention / embed search   overlap → cosine → cascade
-```
-
-Strengths: retrieval, incremental memory, rewindable learning, interpretability,
-embedded footprint.
-Trade-off: not a generative LLM replacement — it's a substrate for
-retrieval-heavy and memory-heavy tasks where pattern persistence matters.
+- Larger dataset experiment (epochs 50–200 × ≥1000 images), residual
+  threshold + amplitude cap retuning.
+- `CE_TYPE_RESIDUAL` descriptors gain a per-frame `direction` /
+  `scale` field once corpus statistics support a non-wildcard scale tag.
+- `hybrid_vae_decode` row-stamp → patch-stamp policy review (currently
+  fixed at 8×8; sensible to make this `cfg.patch_radius`).
 
 ---
 

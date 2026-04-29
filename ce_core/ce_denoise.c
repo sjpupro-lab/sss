@@ -3,13 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Audio energy lookup is provided by ce_extend.c when available. We keep
- * a weak reference here so denoise can stay in Phase 3 without dragging
- * in Phase 4 headers. */
-struct CEAudioTrack;
-extern float ce_audio_energy_at(const struct CEAudioTrack *track,
-                                int step, int total_steps);
-
 CEGenConfig ce_gen_config_default(void) {
     CEGenConfig c;
     c.total_steps = 8;
@@ -37,7 +30,6 @@ CEGenConfig ce_gen_config_hq(void) {
 void ce_denoise_loop(CELatentGrid *z,
                      const CEStorage *storage,
                      const CEUnit *prompt_cells, int prompt_count,
-                     const struct CEAudioTrack *audio,
                      const CEGenConfig *config) {
     if (!config || config->total_steps <= 0) return;
 
@@ -84,20 +76,6 @@ void ce_denoise_loop(CELatentGrid *z,
         ce_skip_connect(z, skip_buf, config->skip_weight);
         /* 7. Up */
         ce_up(z, skip_buf, pairs, found);
-
-        /* 8. Audio sync — modulate global magnitude by audio energy.
-         *    Without an audio track the function returns 1.0 (no-op). */
-        float e = ce_audio_energy_at(audio, t, total);
-        if (e != 1.0f) {
-            for (int i = 0; i < CE_GRID_N; ++i) {
-                CEUnit zero; ce_init(&zero);
-                CEUnit d, ds, out;
-                ce_delta(&d, &zero, &z->cells[i]);
-                ce_delta_scale(&ds, &d, e);
-                ce_apply(&out, &zero, &ds);
-                z->cells[i] = out;
-            }
-        }
     }
     z->current_step = total;
 }

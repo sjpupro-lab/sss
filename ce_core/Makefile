@@ -8,7 +8,9 @@ SRCS = ce_core.c ce_storage.c ce_search.c ce_engine.c \
        ce_denoise.c ce_decode.c ce_extend.c ce_gen.c \
        ce_storage_io.c ce_feed_image.c ce_image_wave_refine.c \
        slig_signal.c slig_material_harmonic.c \
-       slig_pipeline.c slig_codebook.c slig_tick_math.c
+       slig_pipeline.c slig_codebook.c slig_tick_math.c \
+       ce_hybrid_vae.c ce_masked_train.c \
+       ce_residual_codebook.c
 
 # Ingest unit pulls in stb_image.h (vendored, public domain). We compile
 # it with reduced warnings — stb_image is third-party and contains many
@@ -36,7 +38,12 @@ TEST_BINS = $(BUILD_DIR)/test_core \
             $(BUILD_DIR)/test_stress_10k \
             $(BUILD_DIR)/test_slig_energy \
             $(BUILD_DIR)/test_storage_ingest16 \
-            $(BUILD_DIR)/test_decode16
+            $(BUILD_DIR)/test_decode16 \
+            $(BUILD_DIR)/test_hybrid_vae \
+            $(BUILD_DIR)/test_masked_train \
+            $(BUILD_DIR)/test_slig_persist \
+            $(BUILD_DIR)/test_residual_codebook \
+            $(BUILD_DIR)/test_residual_decode
 
 TOOL_BINS = $(BUILD_DIR)/ce_ingest \
             $(BUILD_DIR)/slig_diag \
@@ -102,6 +109,21 @@ $(BUILD_DIR)/test_storage_ingest16: tests/test_storage_ingest16.c $(OBJS) | $(BU
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/test_decode16: tests/test_decode16.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_hybrid_vae: tests/test_hybrid_vae.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_masked_train: tests/test_masked_train.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_slig_persist: tests/test_slig_persist.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_residual_codebook: tests/test_residual_codebook.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_residual_decode: tests/test_residual_decode.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/ce_ingest: tools/ce_ingest.c $(OBJS) | $(BUILD_DIR)
