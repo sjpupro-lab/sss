@@ -43,7 +43,18 @@
 #include <string.h>
 
 #define MAX_MORPHS 256
-#define MAX_VOTES  16
+#define MAX_VOTES  64
+#define TEXT_TOPK_PER_MORPH 4
+
+/* One canvas vote — accumulated across morphemes and across the per-
+ * morpheme top-k matches. Each TEXT hit contributes
+ *   weight = 1.0 / ((rank + 1) * (1.0 + distance))
+ * so the nearest match gets full weight, the second-nearest gets ½,
+ * and so on. Different morphemes voting for the same canvas stack. */
+typedef struct {
+    uint32_t cid;
+    double   weight;
+} CanvasVote;
 
 static int write_ppm(const char *path, const CEImage *img) {
     FILE *f = fopen(path, "wb");
@@ -59,22 +70,22 @@ static int write_ppm(const char *path, const CEImage *img) {
     return 1;
 }
 
-/* Vote canvas_ids by per-morpheme TEXT search and return the top-K
- * sorted by accumulated weight. Each morpheme contributes
- * weight 1/(1+distance) to the canvas_id of its nearest TEXT entry.
+/* Collect canvas votes from every morpheme. Each morpheme runs a
+ * TEXT-typed top-K search (K = TEXT_TOPK_PER_MORPH) and contributes
+ *   weight = 1.0 / ((rank + 1) * (1.0 + distance))
+ * to every distinct canvas_id encountered, so the nearest TEXT entry
+ * gets the largest weight and lower-ranked siblings still register a
+ * partial vote. Hits across morphemes accumulate into the same
+ * canvas — that's how "red" and "apple" both feed the apple canvas
+ * if its TEXT bridge contains either token.
  *
- * `out_cids[]` and `out_weights[]` must hold at least `k_max` slots.
- * Returns the actual number of distinct cids written (0..k_max). The
- * weights are NOT normalised — callers can divide by the sum if a
- * mixing fraction is wanted. */
-static int vote_canvas_ids_topk(const CEStorage *storage,
+ * `out` must hold MAX_VOTES slots; returns the number written. Votes
+ * come back in insertion order — pick_topk_votes sorts them. */
+static int collect_canvas_votes(const CEStorage *storage,
                                 const Morpheme *morphs, uint32_t n,
-                                uint32_t *out_cids, double *out_weights,
-                                int k_max) {
-    if (!storage || storage->count == 0 || n == 0 || k_max <= 0) return 0;
-
-    struct { uint32_t cid; double weight; } votes[MAX_VOTES];
+                                CanvasVote *out) {
     int vote_count = 0;
+    if (!storage || storage->count == 0 || n == 0) return 0;
 
     for (uint32_t i = 0; i < n; ++i) {
         const char *tok = morphs[i].token;
@@ -85,28 +96,34 @@ static int vote_canvas_ids_topk(const CEStorage *storage,
         ce_init(&q);
         ce_feed(&q, (const uint8_t *)tok, (uint32_t)len);
 
-        CESearchResult res;
-        int got = ce_search_by_type(storage, &q, CE_TYPE_TEXT, 1, &res);
-        if (got <= 0) continue;
+        CESearchResult res[TEXT_TOPK_PER_MORPH];
+        int got = ce_search_by_type(storage, &q, CE_TYPE_TEXT,
+                                    TEXT_TOPK_PER_MORPH, res);
+        for (int j = 0; j < got; ++j) {
+            uint32_t cid = storage->entries[res[j].entry_idx].canvas_id;
+            double w = 1.0 / (((double)j + 1.0) * (1.0 + (double)res[j].distance));
 
-        uint32_t cid = storage->entries[res.entry_idx].canvas_id;
-        double w = 1.0 / (1.0 + (double)res.distance);
-
-        int slot = -1;
-        for (int v = 0; v < vote_count; ++v) {
-            if (votes[v].cid == cid) { slot = v; break; }
+            int slot = -1;
+            for (int v = 0; v < vote_count; ++v) {
+                if (out[v].cid == cid) { slot = v; break; }
+            }
+            if (slot < 0 && vote_count < MAX_VOTES) {
+                slot = vote_count++;
+                out[slot].cid    = cid;
+                out[slot].weight = 0.0;
+            }
+            if (slot >= 0) out[slot].weight += w;
         }
-        if (slot < 0 && vote_count < MAX_VOTES) {
-            slot = vote_count++;
-            votes[slot].cid = cid;
-            votes[slot].weight = 0.0;
-        }
-        if (slot >= 0) votes[slot].weight += w;
     }
+    return vote_count;
+}
 
-    if (vote_count == 0) return 0;
-
-    /* Selection sort the top-K (small N, no need for qsort). */
+/* Pick the top-K votes by weight. Selection sort over the small vote
+ * pool — `k_max` is bounded by MAX_VOTES. Returns the number written
+ * to `out_cids` / `out_weights`. */
+static int pick_topk_votes(const CanvasVote *votes, int vote_count,
+                           uint32_t *out_cids, double *out_weights,
+                           int k_max) {
     int picked = 0;
     int taken[MAX_VOTES] = {0};
     while (picked < k_max && picked < vote_count) {
@@ -122,6 +139,20 @@ static int vote_canvas_ids_topk(const CEStorage *storage,
         ++picked;
     }
     return picked;
+}
+
+/* Convenience wrapper preserved for existing callers. Internally runs
+ * collect_canvas_votes (top-K per morpheme, rank-decay weighting) then
+ * picks the K best canvases. */
+static int vote_canvas_ids_topk(const CEStorage *storage,
+                                const Morpheme *morphs, uint32_t n,
+                                uint32_t *out_cids, double *out_weights,
+                                int k_max) {
+    if (k_max <= 0) return 0;
+    CanvasVote votes[MAX_VOTES];
+    int vc = collect_canvas_votes(storage, morphs, n, votes);
+    if (vc <= 0) return 0;
+    return pick_topk_votes(votes, vc, out_cids, out_weights, k_max);
 }
 
 /* Backwards-compatible single-cid vote (kept for the canvas_routed
