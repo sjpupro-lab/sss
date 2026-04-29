@@ -6,6 +6,7 @@
 
 #include "slig_signal.h"
 #include "slig_material_harmonic.h"   /* SligMaterialTick + auto-analyzer */
+#include "slig_tick_math.h"            /* TICK_COS_TABLE — float-free cos LUT */
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -21,6 +22,17 @@ static inline int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi) {
 }
 static inline uint8_t clamp_u8(int32_t v) {
     return (uint8_t)clamp_i32(v, 0, 255);
+}
+
+/* cos(radians) via TICK_COS_TABLE. 256 entries ≡ one full 2π cycle.
+ * Drop-in for cosf() in the wave-event paths so the periodic kernel is
+ * float-free; surrounding float math (expf, sqrtf, atan2f) is left to
+ * later cleanup steps. */
+static inline float tick_cosf(float radians) {
+    /* Map radians → table index: idx = round(radians × 256 / 2π) mod 256. */
+    int idx = (int)(radians * (float)(256.0 / (2.0 * M_PI)));
+    idx = ((idx % 256) + 256) % 256;
+    return ((int)TICK_COS_TABLE[idx] - 128) * (1.0f / 128.0f);
 }
 
 /* ══════════════════════════════════════════════════
@@ -667,7 +679,7 @@ static void apply_event(SligCanvas *c, const SligSignal *sig, uint8_t tick) {
                 if (abs(diff) > sig->speed * 3) continue;
                 /* 물결 파형 */
                 int32_t freq = sig->frequency > 0 ? sig->frequency : 8;
-                float wave = cosf((float)diff * 2.0f * (float)M_PI / freq);
+                float wave = tick_cosf((float)diff * 2.0f * (float)M_PI / freq);
                 float falloff = expf(-(float)(diff*diff) / (float)(sig->speed*sig->speed*4));
                 c->pixels[y][x] += (int32_t)(amp * wave * falloff) >> 8;
             }
@@ -687,8 +699,8 @@ static void apply_event(SligCanvas *c, const SligSignal *sig, uint8_t tick) {
                 float da = fabsf(atan2f(dy,dx) - angle);
                 if (da > (float)M_PI) da = 2*(float)M_PI - da;
                 if (da < wr) {
-                    float along = cosf(dist * 2*(float)M_PI / sig->frequency);
-                    float across = cosf(da / wr * (float)M_PI / 2);
+                    float along = tick_cosf(dist * 2*(float)M_PI / sig->frequency);
+                    float across = tick_cosf(da / wr * (float)M_PI / 2);
                     c->pixels[y][x] += (int32_t)(amp * along * across * expf(-dist*0.01f)) >> 8;
                 }
             }
@@ -700,7 +712,7 @@ static void apply_event(SligCanvas *c, const SligSignal *sig, uint8_t tick) {
                 int32_t minD = dx < dy ? dx : dy;
                 int32_t maxD = dx > dy ? dx : dy;
                 if (minD < sig->speed * 2 && maxD < radius) {
-                    float wave = cosf((float)(maxD-radius)*2*(float)M_PI/sig->frequency);
+                    float wave = tick_cosf((float)(maxD-radius)*2*(float)M_PI/sig->frequency);
                     float narrow = expf(-(float)(minD*minD) / (float)(sig->speed*sig->speed));
                     c->pixels[y][x] += (int32_t)(amp * wave * narrow) >> 8;
                 }
@@ -714,7 +726,7 @@ static void apply_event(SligCanvas *c, const SligSignal *sig, uint8_t tick) {
                 int32_t dist = (int32_t)sqrtf((float)(dx*dx+dy*dy));
                 if (dist < radius + sig->speed) {
                     int32_t diff = dist - radius;
-                    float wave = cosf((float)diff * 2*(float)M_PI / sig->frequency);
+                    float wave = tick_cosf((float)diff * 2*(float)M_PI / sig->frequency);
                     float fo = expf(-(float)(diff*diff) / (float)(sig->speed*sig->speed*4));
                     c->pixels[y][x] += (int32_t)(amp * wave * fo) >> 8;
                 }
@@ -724,7 +736,7 @@ static void apply_event(SligCanvas *c, const SligSignal *sig, uint8_t tick) {
                     int32_t d2 = abs(dist - bounceR);
                     int32_t r2 = radius - bounceR;
                     if (d2 < r2 + sig->speed) {
-                        float w2 = cosf((float)(d2-r2) * 2*(float)M_PI / (sig->frequency * 0.7f));
+                        float w2 = tick_cosf((float)(d2-r2) * 2*(float)M_PI / (sig->frequency * 0.7f));
                         float f2 = expf(-(float)((d2-r2)*(d2-r2)) / (float)(sig->speed*sig->speed*3));
                         c->pixels[y][x] += (int32_t)(amp * 0.4f * w2 * f2) >> 8;
                     }
