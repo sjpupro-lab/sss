@@ -254,18 +254,19 @@ PNG / 베이스라인 JPEG 모두 지원됩니다. 엔진은 PPM P6 256×256만 
 
 ```bash
 # 1) 입력을 256×256 PPM으로 변환 (박스 평균 다운샘플)
-python3 tools/png_to_ppm256.py IMG_0304.png build/training/IMG_0304.ppm
+#    샘플 이미지는 data/samples/ 아래에 있습니다.
+python3 tools/png_to_ppm256.py data/samples/IMG_0304.png build/training/IMG_0304.ppm
 
 make image_tools          # img2grid / grid2img 빌드
 gcc -Wall -O2 -Iinclude tools/jpeg_to_ppm256.c -o build/jpeg_to_ppm256 -ljpeg
-./build/jpeg_to_ppm256 IMG_0305.jpeg build/training/IMG_0305.ppm
+./build/jpeg_to_ppm256 data/samples/IMG_0305.jpeg build/training/IMG_0305.ppm
 
 # 2) 학습 / 검증 툴 빌드
-gcc -Wall -O2 -Iinclude tools/train_images.c       build/*.o -o build/train_images       -lm
+make train_images_ce
 gcc -Wall -O2 -Iinclude tools/verify_image_train.c build/*.o -o build/verify_image_train -lm
 
 # 3) 학습: 이미지 1장당 키프레임 1개 + EMA 갱신
-./build/train_images build/training/img_model.spai \
+./build/train_images_ce build/training/img_model.ces \
     build/training/IMG_0304.ppm \
     build/training/IMG_0305.ppm
 
@@ -323,25 +324,6 @@ gcc -Wall -O2 -Iinclude tools/verify_image_train.c build/*.o -o build/verify_ima
 - 자동 저장 경로: `build/models/bench_word_predict_auto.spai`
 
 저장/로드 정합성은 `test_io`로 지속 검증합니다.
-
-## Kaggle 무료 GPU 학습 (50,000)
-
-Kaggle Notebook에서 GPU(T4/P100) 활성화 후 아래를 실행하세요.
-
-```bash
-pip install -r requirements-gpu.txt
-python tools/kaggle_gpu_train.py \
-  --input data/sample_en.txt \
-  --max-clauses 50000 \
-  --checkpoint-every 5000
-```
-
-출력:
-
-- 체크포인트: `build/gpu_models/gpu_checkpoint_*.pt`
-- 최종 모델: `build/gpu_models/gpu_model_final.pt`
-
-빠른 안내는 `make gpu_train_help`로 확인할 수 있습니다.
 
 ## 정렬(검색)과 학습 처리 흐름
 

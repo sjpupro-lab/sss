@@ -1,6 +1,6 @@
 /* gen_image_ce.c — E2E image generation from a CEStorage (.ces) file.
  *
- * Pipeline:
+ * Pipeline (default canvas_routed path):
  *   1. ce_storage_load(.ces)
  *   2. morpheme_tokenize_clause(prompt) -> per-morpheme CEUnits via ce_feed
  *   3. For each morpheme: ce_search_by_type(CE_TYPE_TEXT, ...) -> winning
@@ -11,8 +11,18 @@
  *      bridges exist or no morphemes survive tokenisation.
  *   5. write 256x256 PPM P6 (RGB only).
  *
+ * Pipeline (--hybrid):
+ *   1. Vote canvas_id from morphemes as above.
+ *   2. hybrid_vae_decode(storage, cid, sets, cfg) — block-stamp colour
+ *      base + SLIG residual chain + wave refine, blended per cfg.
+ *      With no SLIG sets in scope here, we drive base-only restoration
+ *      from the block-stamp entries and wave-refine on top.
+ *   3. write 256x256 PPM P6.
+ *
  * Usage:
- *   gen_image_ce <model.ces> <prompt> <out.ppm> [seed] [steps] [wave_iters]
+ *   gen_image_ce <model.ces> <prompt> <out.ppm>
+ *               [seed] [steps] [wave_iters]
+ *               [--hybrid] [--guidance N.N]
  *
  * Defaults: seed=0, steps=8 (fast preset; pass >= 50 for HQ), wave_iters=200.
  */
@@ -25,6 +35,7 @@
 #include "ce_decode.h"
 #include "ce_denoise.h"
 #include "ce_type.h"
+#include "ce_hybrid_vae.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -100,16 +111,44 @@ static uint32_t vote_canvas_id(const CEStorage *storage,
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr,
-                "usage: %s <model.ces> <prompt> <out.ppm> [seed] [steps] [wave_iters]\n",
+                "usage: %s <model.ces> <prompt> <out.ppm> [seed] [steps] [wave_iters]"
+                " [--hybrid] [--guidance N.N]\n",
                 argv[0]);
         return 2;
     }
     const char *ces_path  = argv[1];
     const char *prompt    = argv[2];
     const char *out_path  = argv[3];
-    uint64_t seed         = (argc > 4) ? (uint64_t)strtoull(argv[4], NULL, 0) : 0u;
-    int steps             = (argc > 5) ? atoi(argv[5]) : 8;
-    uint32_t wave_iters   = (argc > 6) ? (uint32_t)strtoul(argv[6], NULL, 0) : 200u;
+
+    uint64_t seed       = 0u;
+    int      steps      = 8;
+    uint32_t wave_iters = 200u;
+    int      hybrid     = 0;
+    float    guidance   = 1.5f;
+
+    /* Positional: seed, steps, wave_iters (each optional). Stops at the
+     * first '--' flag. */
+    int positional = 0;
+    int i = 4;
+    for (; i < argc && argv[i][0] != '-'; ++i) {
+        switch (positional++) {
+            case 0: seed       = (uint64_t)strtoull(argv[i], NULL, 0); break;
+            case 1: steps      = atoi(argv[i]);                       break;
+            case 2: wave_iters = (uint32_t)strtoul(argv[i], NULL, 0); break;
+            default:
+                fprintf(stderr, "[gen_image_ce] extra positional ignored: %s\n",
+                        argv[i]);
+        }
+    }
+    for (; i < argc; ++i) {
+        if (strcmp(argv[i], "--hybrid") == 0) {
+            hybrid = 1;
+        } else if (strcmp(argv[i], "--guidance") == 0 && i + 1 < argc) {
+            guidance = (float)atof(argv[++i]);
+        } else {
+            fprintf(stderr, "[gen_image_ce] ignoring unknown arg: %s\n", argv[i]);
+        }
+    }
 
     CEStorage S;
     if (!ce_storage_load(&S, ces_path)) {
@@ -142,7 +181,55 @@ int main(int argc, char **argv) {
     int routed = 0;
     uint32_t cid = vote_canvas_id(&S, morphs, n_morph, &routed);
 
-    if (routed) {
+    if (hybrid) {
+        if (!routed) {
+            fprintf(stderr,
+                    "[gen_image_ce] --hybrid: no TEXT bridge match, using "
+                    "first IMAGE canvas_id\n");
+            for (uint32_t k = 0; k < S.count; ++k) {
+                if (S.entries[k].type == CE_TYPE_IMAGE) {
+                    cid = S.entries[k].canvas_id;
+                    routed = 1;
+                    break;
+                }
+            }
+        }
+        if (!routed) {
+            fprintf(stderr,
+                    "[gen_image_ce] --hybrid: no IMAGE entries available -> "
+                    "typed fallback\n");
+            ce_generate_image_typed(img, &S, CE_TYPE_IMAGE,
+                                    prompt, seed, &cfg, wave_iters);
+        } else {
+            fprintf(stderr,
+                    "[gen_image_ce] --hybrid: cid=0x%08x guidance=%.2f\n",
+                    cid, guidance);
+            HybridVAEConfig hcfg;
+            hybrid_vae_config_default(&hcfg);
+            hcfg.guidance_scale = guidance;
+            hcfg.wave_iterations = wave_iters;
+            /* SLIG sets are now persisted in CEStorage (CE_TYPE_SLIG).
+             * Reassemble the 3×3 grid from entries matching cid; sets
+             * with no entries fall back to silent residuals. */
+            SligCellSet sets[SLIG_NUM_LEVELS][SLIG_NUM_CHANNELS];
+            uint32_t loaded = ce_storage_load_slig_sets(
+                &S, cid, (struct SligCellSet *)sets);
+            fprintf(stderr,
+                    "[gen_image_ce] --hybrid: loaded %u SLIG cells from storage\n",
+                    loaded);
+            uint8_t out_rgb[256 * 256 * 3];
+            hybrid_vae_decode(out_rgb, &S, cid, sets, &hcfg);
+
+            img->width  = 256;
+            img->height = 256;
+            for (int p = 0; p < 256 * 256; ++p) {
+                img->pixels[p].r = out_rgb[p * 3 + 0];
+                img->pixels[p].g = out_rgb[p * 3 + 1];
+                img->pixels[p].b = out_rgb[p * 3 + 2];
+                img->pixels[p].a = 255;
+            }
+        }
+    } else if (routed) {
         fprintf(stderr, "[gen_image_ce] routed canvas_id=0x%08x\n", cid);
         ce_generate_image_canvas_routed(img, &S, cid,
                                         prompt, seed, &cfg, wave_iters);

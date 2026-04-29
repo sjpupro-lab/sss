@@ -1,7 +1,9 @@
-/* v4 Task F — spatial_image implementation.
+/* spatial_image — PPM P6 reader/writer for the SLIG image bridge.
  *
- * PPM P6 reader/writer + ai_generate_image wrapper. See the header
- * for scope constraints. */
+ * Hosts image_to_grid / grid_to_image used by the higher-level
+ * SpatialAI engine. The legacy refine-based prototype generator was
+ * removed; ai_generate_image_v2_guided (spatial_image_gen.c) is the
+ * current entry point. */
 
 #include "spatial_image.h"
 
@@ -130,61 +132,3 @@ int grid_to_image(const SpatialGrid* g, const char* out_path) {
     return 1;
 }
 
-/* ── ai_generate_image ──
- *
- * The prototype routes through the existing refine path with an
- * image-tuned RefineConfig, then writes the resulting grid as a
- * PPM file. We do NOT pretend this is equivalent to a diffusion
- * model (spec §F explicit prohibition); it's a feasibility probe
- * showing the same coarse-to-fine machinery is applicable to an
- * image-shaped grid. */
-int ai_generate_image(SpatialAI* ai,
-                      const char* prompt_text,
-                      const char* out_path,
-                      const RefineConfig* cfg) {
-    if (!ai || !prompt_text || !out_path) return 0;
-
-    RefineConfig local = cfg ? *cfg : refine_config_default_image();
-
-    /* Discard the refine decoder's text output: we want the underlying
-     * grid state, not the row-argmax byte stream. ai_generate_refine
-     * mutates a scratch grid internally, so for now we re-drive the
-     * front-end and emit the prior-seeded grid. A future iteration
-     * could expose a grid-returning variant of the refine path. */
-    char discard[64];
-    float conf = 0.0f;
-    uint32_t iters = 0;
-    uint32_t n = ai_generate_refine(ai, prompt_text, discard, sizeof discard - 1,
-                                    &local, &conf, &iters);
-    (void)n;
-
-    /* Emit the prior agg's R/G/B means as the image — this is what a
-     * "refine image" effectively converges toward on the prototype. */
-    SpatialGrid* g = grid_create();
-    if (!g) return 0;
-    AggTables* agg = agg_build(ai);
-    if (!agg) { grid_destroy(g); return 0; }
-    for (uint32_t i = 0; i < GRID_SIZE * GRID_SIZE; i++) {
-        double R = agg->R_mean[i];
-        double G = agg->G_mean[i];
-        double B = agg->B_mean[i];
-        if (R < 0.0)   R = 0.0;
-        if (R > 255.0) R = 255.0;
-        if (G < 0.0)   G = 0.0;
-        if (G > 255.0) G = 255.0;
-        if (B < 0.0)   B = 0.0;
-        if (B > 255.0) B = 255.0;
-        g->R[i] = (uint8_t)R;
-        g->G[i] = (uint8_t)G;
-        g->B[i] = (uint8_t)B;
-        double lum = 0.299 * R + 0.587 * G + 0.114 * B;
-        if (lum < 0.0)   lum = 0.0;
-        if (lum > 255.0) lum = 255.0;
-        g->A[i] = (uint16_t)lum;
-    }
-    agg_destroy(agg);
-
-    int ok = grid_to_image(g, out_path);
-    grid_destroy(g);
-    return ok;
-}

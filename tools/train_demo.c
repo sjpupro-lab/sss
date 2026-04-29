@@ -11,7 +11,14 @@
  *      16x16 atomic blocks via ce_feed_image_16. 4 quadrant CEUnits per
  *      block (TL/TR/BL/BR), 16x16 grid of blocks across 256x256 image
  *      → 1024 CE_TYPE_IMAGE entries per image, all sharing canvas_id.
- *   4. morpheme bridge — `morpheme_tokenize_clause(clause, ...)` then,
+ *   4. hybrid_vae_encode(ces, codebook, rgba, cid) — adds the SLIG
+ *      decomposition (3 scale × 3 channel) on top of the block stamps,
+ *      writing canvas_id into each SLIG cell's audio_bins so block-stamp
+ *      and SLIG entries cross-link.
+ *   5. (optional, --masked-epochs N) masked_train_image runs the
+ *      mask→denoise→loss loop and pushes the converged Slig cells back
+ *      into the storage so the latent learns to fill in missing parts.
+ *   6. morpheme bridge — `morpheme_tokenize_clause(clause, ...)` then,
  *      per morpheme: `ce_feed(.., m.token, len)` → one CE_TYPE_TEXT
  *      entry. All TEXT entries share canvas_id with the image entries
  *      so generation can: prompt → morpheme tokenize → per-morpheme
@@ -24,7 +31,7 @@
  *                     canvas_id = fnv1a(image_path).
  *
  * Usage:
- *   train_demo <dataset_dir> <out_base>
+ *   train_demo <dataset_dir> <out_base> [--masked-epochs N]
  */
 
 #include "spatial_grid.h"
@@ -37,6 +44,10 @@
 #include "ce_storage.h"
 #include "ce_storage_io.h"
 #include "ce_type.h"
+#include "ce_hybrid_vae.h"
+#include "ce_masked_train.h"
+#include "ce_residual_codebook.h"
+#include "slig_codebook.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -118,11 +129,26 @@ static char *trim(char *s) {
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <dataset_dir> <out_base>\n", argv[0]);
+        fprintf(stderr,
+                "usage: %s <dataset_dir> <out_base> [--masked-epochs N]"
+                " [--residual-codebook]\n",
+                argv[0]);
         return 2;
     }
     const char *dir = argv[1];
     const char *out = argv[2];
+    int masked_epochs   = 0;
+    int use_residual_cb = 0;
+    for (int i = 3; i < argc; ++i) {
+        if (strcmp(argv[i], "--masked-epochs") == 0 && i + 1 < argc) {
+            masked_epochs = atoi(argv[++i]);
+            if (masked_epochs < 0) masked_epochs = 0;
+        } else if (strcmp(argv[i], "--residual-codebook") == 0) {
+            use_residual_cb = 1;
+        } else {
+            fprintf(stderr, "[train_demo] ignoring unknown arg: %s\n", argv[i]);
+        }
+    }
 
     char tsv_path[1024];
     snprintf(tsv_path, sizeof(tsv_path), "%s/labels.tsv", dir);
@@ -138,9 +164,20 @@ int main(int argc, char **argv) {
     CEStorage ces;
     ce_storage_init(&ces, 256);
 
+    SligCodebook codebook;
+    slig_codebook_init(&codebook);
+
+    CEResidualCodebook residual_cb;
+    ce_residual_codebook_init(&residual_cb);
+
     int rows = 0, ai_ok = 0;
-    uint32_t total_image_entries = 0;
-    uint32_t total_text_entries  = 0;
+    uint32_t total_image_entries  = 0;
+    uint32_t total_text_entries   = 0;
+    uint32_t total_hybrid_blocks  = 0;
+    uint32_t total_hybrid_cells   = 0;
+    uint32_t total_masked_stored  = 0;
+    uint32_t total_residual_descriptors = 0;
+    int      masked_converged     = 0;
 
     char line[1024];
     while (fgets(line, sizeof(line), tsv)) {
@@ -180,15 +217,45 @@ int main(int argc, char **argv) {
                     label);
         }
 
-        /* 2. CEStorage 16x16 atomic image ingest. */
+        /* 2. CEStorage 16x16 atomic image ingest + hybrid VAE encode. */
         int w = 0, h = 0;
         uint8_t *rgba = grid_to_rgba(g, &w, &h);
         if (rgba) {
             uint32_t added_img = ce_storage_ingest_rgba_16(&ces, cid, rgba, w, h);
             total_image_entries += added_img;
-            free(rgba);
             fprintf(stderr, "[train_demo]  +IMG entries=%u (16x16 quadrants)  cid=0x%08x\n",
                     added_img, cid);
+
+            /* 2b. Hybrid VAE encode: SLIG decomposition + audio link. */
+            HybridEncodeResult henc;
+            hybrid_vae_encode(&henc, &ces, &codebook, rgba, w, h, cid);
+            total_hybrid_blocks += henc.block_entries;
+            total_hybrid_cells  += henc.total_cells;
+            fprintf(stderr,
+                    "[train_demo]  +HYB block_entries=%u slig_cells=%u  cid=0x%08x\n",
+                    henc.block_entries, henc.total_cells, cid);
+
+            /* 2c. Optional masked-training loop. */
+            if (masked_epochs > 0) {
+                MaskedTrainConfig mcfg;
+                masked_train_config_default(&mcfg);
+                mcfg.epochs = masked_epochs;
+                if (use_residual_cb) {
+                    mcfg.residual_book = &residual_cb;
+                }
+                MaskedTrainResult mres;
+                masked_train_image(&mres, &ces, rgba, w, h, cid, &mcfg);
+                total_masked_stored += mres.cells_stored;
+                total_residual_descriptors += mres.residual_cells;
+                if (mres.converged) ++masked_converged;
+                fprintf(stderr,
+                        "[train_demo]  +MSK epochs_run=%d loss=%.2f converged=%d "
+                        "cells_stored=%u residuals=%u\n",
+                        mres.epochs_run, mres.final_loss,
+                        mres.converged, mres.cells_stored, mres.residual_cells);
+            }
+
+            free(rgba);
         }
 
         /* 3. Per-morpheme TEXT bridge sharing canvas_id with IMAGE entries. */
@@ -229,9 +296,20 @@ int main(int argc, char **argv) {
         return 1;
     }
     fprintf(stderr,
-            "[train_demo] saved %s (IMG=%u TEXT=%u total=%u entries across %d rows)\n",
+            "[train_demo] saved %s (IMG=%u TEXT=%u HYB_blocks=%u HYB_cells=%u "
+            "total=%u entries across %d rows)\n",
             ces_path, total_image_entries, total_text_entries,
-            total_image_entries + total_text_entries, rows);
+            total_hybrid_blocks, total_hybrid_cells,
+            ces.count, rows);
+    if (masked_epochs > 0) {
+        fprintf(stderr,
+                "[train_demo] masked-train summary: epochs/img=%d "
+                "stored_cells=%u residuals=%u (codebook=%u patterns) converged=%d/%d\n",
+                masked_epochs, total_masked_stored,
+                total_residual_descriptors,
+                use_residual_cb ? residual_cb.count : 0u,
+                masked_converged, rows);
+    }
 
     ce_storage_free(&ces);
     spatial_ai_destroy(ai);

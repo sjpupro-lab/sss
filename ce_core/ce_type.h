@@ -18,19 +18,35 @@ extern "C" {
 #endif
 
 typedef enum {
-    CE_TYPE_TEXT  = 0,
-    CE_TYPE_IMAGE = 1,
-    CE_TYPE_AUDIO = 2,
+    CE_TYPE_TEXT     = 0,
+    CE_TYPE_IMAGE    = 1,
+    CE_TYPE_AUDIO    = 2,
+    /* SLIG cellset entries — one CEStorage row per SLIG cell:
+     *   slot      = scale_level * SLIG_NUM_CHANNELS + channel  (0..8)
+     *   block_idx = cell index inside the (scale, channel) set
+     *   keyframe  = the SLIG CEUnit
+     *   delta     = delta against the previous cell of the same set
+     *               (zero CEUnit for index 0)
+     * Encoded by ce_storage_persist_slig_set, reassembled by
+     * ce_storage_load_slig_sets. */
+    CE_TYPE_SLIG     = 3,
+    /* Residual codebook reference — color/event correction patches that
+     * land in ce_residual_codebook. The CEStorage entry stores only the
+     * (index, position, tick, strength) descriptor, not the original
+     * patch — see ce_residual_codebook.h. */
+    CE_TYPE_RESIDUAL = 4,
 
     CE_TYPE_UNKNOWN = 0xFF
 } CEType;
 
 static inline const char *ce_type_name(CEType t) {
     switch (t) {
-        case CE_TYPE_TEXT:  return "text";
-        case CE_TYPE_IMAGE: return "image";
-        case CE_TYPE_AUDIO: return "audio";
-        default:            return "unknown";
+        case CE_TYPE_TEXT:     return "text";
+        case CE_TYPE_IMAGE:    return "image";
+        case CE_TYPE_AUDIO:    return "audio";
+        case CE_TYPE_SLIG:     return "slig";
+        case CE_TYPE_RESIDUAL: return "residual";
+        default:               return "unknown";
     }
 }
 

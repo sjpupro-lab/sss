@@ -46,12 +46,10 @@ CEGenConfig ce_gen_config_default(void);
 CEGenConfig ce_gen_config_hq(void);
 
 /* Step 14 — full denoising loop. `prompt_cells` may be NULL with
- * prompt_count = 0. `audio_cells` likewise optional. */
-struct CEAudioTrack;
+ * prompt_count = 0. */
 void ce_denoise_loop(CELatentGrid *z,
                      const CEStorage *storage,
                      const CEUnit *prompt_cells, int prompt_count,
-                     const struct CEAudioTrack *audio,
                      const CEGenConfig *config);
 
 /* Loss / param update. */

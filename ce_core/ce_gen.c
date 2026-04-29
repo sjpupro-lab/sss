@@ -69,33 +69,6 @@ static void build_initial_latent(CELatentGrid *z,
                    NULL, w);
 }
 
-void ce_generate_image(
-    CEImage *output,
-    const CEStorage *storage,
-    const char *prompt,
-    uint64_t seed,
-    const CEGenConfig *config,
-    const CEMemoLayer *memo,
-    const CEHintLayer *hint,
-    const CEAudioTrack *audio) {
-    CEGenConfig cfg = config ? *config : ce_gen_config_default();
-
-    int prompt_count = 0;
-    CEUnit *prompt_cells = prompt_to_cells(prompt, &prompt_count);
-
-    CELatentGrid z;
-    build_initial_latent(&z, storage, prompt_cells, prompt_count, seed);
-
-    if (memo) ce_memo_apply(&z, memo);
-    if (hint) ce_hint_apply(&z, hint);
-
-    ce_denoise_loop(&z, storage, prompt_cells, prompt_count, audio, &cfg);
-
-    ce_decode_image(output, &z);
-
-    free(prompt_cells);
-}
-
 /* Build a single CEImageLink64 whose 256x256 target is the 8x8-tiled decode
  * of one CEStorage entry's keyframe. The 64x64 semantic plane is left
  * zeroed — it is reserved for future morpheme/canvas embedding cross-talk
@@ -200,7 +173,7 @@ void ce_generate_image_typed(
                    (prompt_count > 0) ? &prompt_avg : NULL,
                    NULL, w);
 
-    ce_denoise_loop(&z, storage, prompt_cells, prompt_count, NULL, &cfg);
+    ce_denoise_loop(&z, storage, prompt_cells, prompt_count, &cfg);
     ce_decode_image(output, &z);
 
     /* Wave-refine pass: pull the top-CE_WAVE_TOPK typed entries (using the
@@ -328,7 +301,7 @@ void ce_generate_image_canvas_routed(
                    (prompt_count > 0) ? &prompt_avg : NULL,
                    NULL, w);
 
-    ce_denoise_loop(&z, storage, prompt_cells, prompt_count, NULL, &cfg);
+    ce_denoise_loop(&z, storage, prompt_cells, prompt_count, &cfg);
     ce_decode_image(output, &z);
 
     /* Wave-refine: collect 16x16 atomic groups (4 contiguous quadrants
@@ -408,7 +381,7 @@ void ce_generate_text(
 
     CELatentGrid z;
     build_initial_latent(&z, storage, prompt_cells, prompt_count, seed);
-    ce_denoise_loop(&z, storage, prompt_cells, prompt_count, NULL, &cfg);
+    ce_denoise_loop(&z, storage, prompt_cells, prompt_count, &cfg);
 
     ce_decode_text(output, output_len, &z);
 
@@ -465,13 +438,4 @@ void ce_generate_inpaint(
     ce_decode_image(output, &z);
 
     free(prompt_cells);
-}
-
-void ce_generate_upscale(
-    CEHiresGrid *output_hires,
-    const CELatentGrid *input_lores,
-    const CEStorage *storage,
-    const CEGenConfig *config) {
-    CEGenConfig cfg = config ? *config : ce_gen_config_default();
-    ce_upscale(output_hires, input_lores, storage, &cfg);
 }

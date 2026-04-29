@@ -36,24 +36,24 @@ int main(void) {
     CEGenConfig cfg = ce_gen_config_default();
     cfg.total_steps = 4; /* keep test fast */
 
-    /* --- Image generation --- */
+    /* --- Image generation (typed, base API) --- */
     static CEImage img1, img2;
 
     clock_t t0 = clock();
-    ce_generate_image(&img1, &S, "orange cat eating fish", 0xC0FFEE,
-                      &cfg, NULL, NULL, NULL);
+    ce_generate_image_typed(&img1, &S, CE_TYPE_TEXT,
+                            "orange cat eating fish", 0xC0FFEE, &cfg, 0);
     clock_t t1 = clock();
     double secs = (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
-    printf("  ce_generate_image (256x256, %d steps): %.3f s\n", cfg.total_steps, secs);
+    printf("  ce_generate_image_typed (256x256, %d steps): %.3f s\n", cfg.total_steps, secs);
 
-    ce_generate_image(&img2, &S, "orange cat eating fish", 0xC0FFEE,
-                      &cfg, NULL, NULL, NULL);
+    ce_generate_image_typed(&img2, &S, CE_TYPE_TEXT,
+                            "orange cat eating fish", 0xC0FFEE, &cfg, 0);
     CHECK(memcmp(&img1, &img2, sizeof(CEImage)) == 0, "image generation deterministic on (prompt, seed)");
 
     /* Different seed -> visibly different image. */
     static CEImage img3;
-    ce_generate_image(&img3, &S, "orange cat eating fish", 0xDEADBEEF,
-                      &cfg, NULL, NULL, NULL);
+    ce_generate_image_typed(&img3, &S, CE_TYPE_TEXT,
+                            "orange cat eating fish", 0xDEADBEEF, &cfg, 0);
     int diff_px = 0;
     for (int i = 0; i < CE_IMAGE_W * CE_IMAGE_H; ++i) {
         if (img1.pixels[i].r != img3.pixels[i].r ||
@@ -64,8 +64,8 @@ int main(void) {
 
     /* Different prompt -> different image. */
     static CEImage img4;
-    ce_generate_image(&img4, &S, "snow on the mountain top", 0xC0FFEE,
-                      &cfg, NULL, NULL, NULL);
+    ce_generate_image_typed(&img4, &S, CE_TYPE_TEXT,
+                            "snow on the mountain top", 0xC0FFEE, &cfg, 0);
     int diff_prompt_px = 0;
     for (int i = 0; i < CE_IMAGE_W * CE_IMAGE_H; ++i) {
         if (img1.pixels[i].r != img4.pixels[i].r ||
@@ -110,15 +110,6 @@ int main(void) {
     }
     /* Most anchor cells should match exactly; allow some interpolation slack. */
     CHECK(anchor_match > 0, "inpaint preserves at least some anchor pixels exactly");
-
-    /* --- Upscale --- */
-    CELatentGrid lo;
-    lo.width = CE_GRID_W; lo.height = CE_GRID_H; lo.current_step = 0; lo.total_steps = 0;
-    CEUnit noise; ce_noise_init(&noise, 0xAAAA);
-    for (int i = 0; i < CE_GRID_N; ++i) lo.cells[i] = noise;
-    static CEHiresGrid hi;
-    ce_generate_upscale(&hi, &lo, &S, &cfg);
-    CHECK(hi.width == 128 && hi.height == 128, "upscale dims");
 
     ce_storage_free(&S);
 

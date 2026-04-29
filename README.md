@@ -692,19 +692,20 @@ Train a model from images — PNG and baseline JPEG are supported via
 small ingestion helpers; the engine's native format stays PPM P6 256×256.
 
 ```bash
-# Convert inputs to 256×256 PPM (box-average downsample)
-python3 tools/png_to_ppm256.py IMG_0304.png build/training/IMG_0304.ppm
+# Convert inputs to 256×256 PPM (box-average downsample). Sample
+# images live in data/samples/ — adjust paths to taste.
+python3 tools/png_to_ppm256.py data/samples/IMG_0304.png build/training/IMG_0304.ppm
 
 make image_tools          # builds img2grid / grid2img
 gcc -Wall -O2 -Iinclude tools/jpeg_to_ppm256.c -o build/jpeg_to_ppm256 -ljpeg
-./build/jpeg_to_ppm256 IMG_0305.jpeg build/training/IMG_0305.ppm
+./build/jpeg_to_ppm256 data/samples/IMG_0305.jpeg build/training/IMG_0305.ppm
 
 # Build the train / verify tools
-gcc -Wall -O2 -Iinclude tools/train_images.c       build/*.o -o build/train_images       -lm
+make train_images_ce
 gcc -Wall -O2 -Iinclude tools/verify_image_train.c build/*.o -o build/verify_image_train -lm
 
 # Train: one keyframe per image + EMA update
-./build/train_images build/training/img_model.spai \
+./build/train_images_ce build/training/img_model.ces \
     build/training/IMG_0304.ppm \
     build/training/IMG_0305.ppm
 
