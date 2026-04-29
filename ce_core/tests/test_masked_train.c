@@ -168,6 +168,83 @@ static void test_progressive_strategy(void) {
     free(rgba);
 }
 
+/* Step-5: segment loss split.
+ *   - default config (all weights 0) keeps the legacy mean-loss path
+ *   - setting weights triggers weighted aggregation; the per-segment
+ *     means are reported separately on the result struct                */
+static void test_segment_loss(void) {
+    printf("\n[test_segment_loss]\n");
+    uint8_t *rgba = (uint8_t *)calloc(256*256*4, 1);
+    make_gradient(rgba);
+
+    CEStorage storage;
+    ce_storage_init(&storage, 256);
+
+    /* Path 1: default config — segment fields populated even when
+     * weighted aggregation is off. */
+    MaskedTrainConfig cfg;
+    masked_train_config_default(&cfg);
+    cfg.epochs = 3;
+    cfg.denoise_steps = 4;
+    cfg.loss_patience = 99;
+
+    MaskedTrainResult r1;
+    masked_train_image(&r1, &storage, rgba, 256, 256, 700, &cfg);
+
+    printf("    legacy: total=%.1f  struct=%.1f tex=%.1f color=%.1f\n",
+           r1.final_loss, r1.loss_structure, r1.loss_texture, r1.loss_color);
+    CHECK(r1.loss_structure >= 0 && r1.loss_texture >= 0 && r1.loss_color >= 0,
+          "all segment losses non-negative under legacy config");
+
+    /* Path 2: weighted config. Heavily favoring color → final_loss
+     * should track loss_color * 1.0 closely (other weights zero). */
+    MaskedTrainConfig cfg2;
+    masked_train_config_default(&cfg2);
+    cfg2.epochs = 3;
+    cfg2.denoise_steps = 4;
+    cfg2.loss_patience = 99;
+    cfg2.loss_w_structure = 0.0f;
+    cfg2.loss_w_texture   = 0.0f;
+    cfg2.loss_w_color     = 1.0f;
+
+    MaskedTrainResult r2;
+    masked_train_image(&r2, &storage, rgba, 256, 256, 701, &cfg2);
+
+    printf("    color-only weight: total=%.3f  loss_color=%.3f\n",
+           r2.final_loss, r2.loss_color);
+    /* When only the color weight is active and there were color cells,
+     * total must equal loss_color (within fp tolerance). */
+    if (r2.loss_color > 0) {
+        float diff = fabsf(r2.final_loss - r2.loss_color);
+        CHECK(diff < 0.001f, "final_loss == loss_color when only color weight set");
+    } else {
+        printf("    (no masked color cells in this run, skipping equality check)\n");
+    }
+
+    /* Mixed weights: total = 0.5*S + 0.3*T + 0.2*C */
+    MaskedTrainConfig cfg3;
+    masked_train_config_default(&cfg3);
+    cfg3.epochs = 3;
+    cfg3.denoise_steps = 4;
+    cfg3.loss_patience = 99;
+    cfg3.loss_w_structure = 0.5f;
+    cfg3.loss_w_texture   = 0.3f;
+    cfg3.loss_w_color     = 0.2f;
+
+    MaskedTrainResult r3;
+    masked_train_image(&r3, &storage, rgba, 256, 256, 702, &cfg3);
+    float expected = 0.5f * r3.loss_structure
+                   + 0.3f * r3.loss_texture
+                   + 0.2f * r3.loss_color;
+    printf("    mixed weights: total=%.3f  expected=%.3f\n",
+           r3.final_loss, expected);
+    CHECK(fabsf(r3.final_loss - expected) < 0.001f,
+          "final_loss matches weighted segment sum");
+
+    ce_storage_free(&storage);
+    free(rgba);
+}
+
 int main(void) {
     printf("=== Masked Train Test Suite ===\n");
     test_config();
@@ -175,6 +252,7 @@ int main(void) {
     test_loss_decreases();
     test_batch();
     test_progressive_strategy();
+    test_segment_loss();
     printf("\n=== %d/%d PASSED ===\n", tests_pass, tests_run);
     return (tests_pass == tests_run) ? 0 : 1;
 }

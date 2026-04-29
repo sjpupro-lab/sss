@@ -1,19 +1,24 @@
 /* train_images_ce.c — co-train SpatialAI + CEStorage from a list of PPMs.
  *
  * For each input PPM the tool:
- *   1. image_to_grid(path)      → SpatialGrid (256x256 R/G/B planes)
- *   2. ai_store_grid(ai, ...)   → SpatialAI keyframe (Mat-1..4 included)
- *   3. ce_storage_ingest_rgba   → 32x32 CEStorage entries (8x8 blocks)
+ *   1. image_to_grid(path)              → SpatialGrid (256x256 R/G/B planes)
+ *   2. ai_store_grid(ai, ...)           → SpatialAI keyframe (Mat-1..4)
+ *   3. ce_storage_ingest_rgba_16        → 16x16 atomic blocks (default)
+ *      OR ce_storage_ingest_rgba        → 8x8 blocks (--legacy-8)
  *      (RGBA buffer reconstructed from the SpatialGrid, A=255)
+ *
+ * The default 16x16 path matches train_demo so models trained by either
+ * tool can be consumed by the same hybrid_vae_decode pipeline. The 8x8
+ * path is preserved behind --legacy-8 so existing .ces files keyed to
+ * the old block layout can still be regenerated bit-identical.
  *
  * On exit it writes both `<out>.spai` (SpatialAI model) and `<out>.ces`
  * (CEStorage), so downstream generation can use the typed retrieval
  * path (ce_search_by_type / ce_generate_image_typed) AND keep the
  * existing SpatialAI render path working without changes.
  *
- * Usage:  train_images_ce <out_basename> <img1.ppm> [<img2.ppm> ...]
- *   produces  <out_basename>.spai
- *             <out_basename>.ces
+ * Usage:
+ *   train_images_ce <out_basename> [--legacy-8] <img1.ppm> [<img2.ppm> ...]
  */
 
 #include "spatial_grid.h"
@@ -74,11 +79,26 @@ static uint8_t* grid_to_rgba(const SpatialGrid* g, int* out_w, int* out_h) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <out_basename> <img1.ppm> [<img2.ppm> ...]\n",
+        fprintf(stderr,
+                "usage: %s <out_basename> [--legacy-8] <img1.ppm> [<img2.ppm> ...]\n"
+                "  --legacy-8   use the 8x8 block ingest path (default: 16x16)\n",
                 argv[0]);
         return 2;
     }
     const char* out_base = argv[1];
+
+    /* Default to 16x16 atomic blocks so .ces files match train_demo's
+     * hybrid_vae layout. --legacy-8 reverts to the original 8x8 path. */
+    int legacy_8 = 0;
+    int first_img = 2;
+    if (argc >= 3 && strcmp(argv[2], "--legacy-8") == 0) {
+        legacy_8 = 1;
+        first_img = 3;
+    }
+    if (first_img >= argc) {
+        fprintf(stderr, "[train_images_ce] no input images\n");
+        return 2;
+    }
 
     SpatialAI* ai = spatial_ai_create();
     if (!ai) {
@@ -93,7 +113,7 @@ int main(int argc, char** argv) {
     int trained_ces  = 0;
     uint32_t total_blocks = 0;
 
-    for (int i = 2; i < argc; i++) {
+    for (int i = first_img; i < argc; i++) {
         const char* in = argv[i];
         SpatialGrid* g = image_to_grid(in);
         if (!g) {
@@ -112,18 +132,21 @@ int main(int argc, char** argv) {
             fprintf(stderr, "[train_images_ce] !! ai_store_grid failed for %s\n", in);
         }
 
-        /* CEStorage side: 8x8-block CE_TYPE_IMAGE entries. */
+        /* CEStorage side: 16x16 atomic blocks by default (matches
+         * train_demo / hybrid_vae_decode), or 8x8 under --legacy-8. */
         int w = 0, h = 0;
         uint8_t* rgba = grid_to_rgba(g, &w, &h);
         if (rgba) {
             uint32_t cid = path_hash(in);
-            uint32_t added = ce_storage_ingest_rgba(&ces, cid, rgba, w, h);
+            uint32_t added = legacy_8
+                ? ce_storage_ingest_rgba   (&ces, cid, rgba, w, h)
+                : ce_storage_ingest_rgba_16(&ces, cid, rgba, w, h);
             free(rgba);
             if (added > 0) {
                 ++trained_ces;
                 total_blocks += added;
-                fprintf(stderr, "[train_images_ce] +CES blocks=%u  src=%s\n",
-                        added, in);
+                fprintf(stderr, "[train_images_ce] +CES blocks=%u (%s)  src=%s\n",
+                        added, legacy_8 ? "8x8" : "16x16", in);
             }
         }
 

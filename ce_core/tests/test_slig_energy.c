@@ -195,11 +195,97 @@ static void test_apply_global_modulation(void) {
           "amp[2]=128 produces ~50% of full magnitude (within 5%)");
 }
 
+/* Step-1 pipeline-completeness check: edges, texture, and color cells
+ * must also populate audio_amps[2] (max-normalized weight) and
+ * cond_threshold (cumulative coverage), with the strongest cell in each
+ * stage hitting amp[2] = 255. Without this, render-time amplitude is
+ * uniform across stages and the energy story stops at the SVD basis. */
+static void test_non_structure_stages_carry_energy(void) {
+    printf("\n--- 4. edges/texture/color carry audio_amps[2] + cond_threshold ---\n");
+
+    /* Use a 3-channel image with strong horizontal stripes + color
+     * variation across quadrants, so all 5 decompose stages produce
+     * cells. */
+    int dim = 64;
+    SligImage *im = slig_image_alloc(dim, dim, 3);
+    for (int y = 0; y < dim; ++y) {
+        float lum = ((y / 8) & 1) ? 0.85f : 0.10f;
+        for (int x = 0; x < dim; ++x) {
+            float r = lum, g = lum, b = lum;
+            /* Quadrant tinting -> color stage gets non-zero deviations. */
+            if (x >= dim/2 && y <  dim/2) r = fminf(1.0f, lum + 0.4f);
+            if (x <  dim/2 && y >= dim/2) g = fminf(1.0f, lum + 0.4f);
+            if (x >= dim/2 && y >= dim/2) b = fminf(1.0f, lum + 0.4f);
+            im->data[(y * dim + x) * 3 + 0] = r;
+            im->data[(y * dim + x) * 3 + 1] = g;
+            im->data[(y * dim + x) * 3 + 2] = b;
+        }
+    }
+
+    SligDecomposeConfig cfg;
+    slig_decompose_config_default(&cfg);
+    SligDecomposed d;
+    memset(&d, 0, sizeof(d));
+    slig_decompose_v2(&d, im, &cfg);
+
+    int edge_max_amp2 = 0, edge_count = 0;
+    int tex_max_amp2  = 0, tex_count  = 0;
+    int col_max_amp2  = 0, col_count  = 0;
+
+    for (uint32_t i = d.structure_end; i < d.edge_end; ++i, ++edge_count) {
+        SligSignal s; slig_unpack(&s, &d.cells[i]);
+        if (s.audio_amps[2] > edge_max_amp2) edge_max_amp2 = s.audio_amps[2];
+    }
+    for (uint32_t i = d.edge_end; i < d.texture_end; ++i, ++tex_count) {
+        SligSignal s; slig_unpack(&s, &d.cells[i]);
+        if (s.audio_amps[2] > tex_max_amp2) tex_max_amp2 = s.audio_amps[2];
+    }
+    for (uint32_t i = d.texture_end; i < d.color_end; ++i, ++col_count) {
+        SligSignal s; slig_unpack(&s, &d.cells[i]);
+        if (s.audio_amps[2] > col_max_amp2) col_max_amp2 = s.audio_amps[2];
+    }
+
+    printf("  edges:   %d cells, max amp[2] = %d\n", edge_count, edge_max_amp2);
+    printf("  texture: %d cells, max amp[2] = %d\n", tex_count,  tex_max_amp2);
+    printf("  color:   %d cells, max amp[2] = %d\n", col_count,  col_max_amp2);
+
+    /* The strongest cell in each non-empty stage must hit amp[2] = 255
+     * (max-normalization preserves the dominant cell at full sigma). */
+    if (edge_count > 0)
+        CHECK(edge_max_amp2 >= 250, "strongest edge cell amp[2] >= 250");
+    if (tex_count > 0)
+        CHECK(tex_max_amp2  >= 250, "strongest texture cell amp[2] >= 250");
+    if (col_count > 0)
+        CHECK(col_max_amp2  >= 250, "strongest color cell amp[2] >= 250");
+
+    /* Cumulative coverage must end at 255 for the last cell of each
+     * non-empty stage (cells are pushed in descending-strength order,
+     * so the last one closes the budget). */
+    if (d.edge_end > d.structure_end) {
+        SligSignal last; slig_unpack(&last, &d.cells[d.edge_end - 1]);
+        CHECK(last.cond_threshold >= 250,
+              "edge stage closes with cond_threshold >= 250");
+    }
+    if (d.texture_end > d.edge_end) {
+        SligSignal last; slig_unpack(&last, &d.cells[d.texture_end - 1]);
+        CHECK(last.cond_threshold >= 250,
+              "texture stage closes with cond_threshold >= 250");
+    }
+    if (d.color_end > d.texture_end) {
+        SligSignal last; slig_unpack(&last, &d.cells[d.color_end - 1]);
+        CHECK(last.cond_threshold >= 250,
+              "color stage closes with cond_threshold >= 250");
+    }
+
+    slig_image_free(im);
+}
+
 int main(void) {
     printf("=== test_slig_energy: SVD dir + cond_threshold + amp[2] ===\n\n");
     test_directions();
     test_cond_and_amp();
     test_apply_global_modulation();
+    test_non_structure_stages_carry_energy();
     if (fails) {
         printf("\nFAIL: %d check(s) failed\n", fails);
         return 1;

@@ -451,9 +451,39 @@ void slig_decompose_edges(SligDecomposed *out, const SligImage *img,
         }
     }
 
-    /* 방향 양자화 → CE Cell 생성 */
+    /* Energy budget for amplitude-ratio + cumulative-coverage tagging.
+     * Edges aren't orthogonal like SVD modes, so we use:
+     *   audio_amps[2] = strength / max_strength  (per-cell weight 0..255)
+     *   cond_threshold = cumulative strength / total_strength (coverage)
+     * The strongest edge keeps amp[2]=255 (full sigma at render time);
+     * weaker edges scale down proportionally. Both fields together flip
+     * apply_global's "measured" branch on, so render-time amplitude
+     * actually honours per-cell weighting instead of using raw sigma. */
+    float total_strength = 0, max_strength = 0;
     for (int i = 0; i < max_cells && i < 32; i++) {
-        if (best[i].strength <= 0) continue;
+        float s = best[i].strength;
+        if (s <= 0) continue;
+        total_strength += s;
+        if (s > max_strength) max_strength = s;
+    }
+
+    /* 방향 양자화 → CE Cell 생성 (강한 엣지부터 순서대로) */
+    /* Indirect index sort by strength (descending) so cumulative
+     * coverage advances dominant→weak in the natural order. */
+    int order[32];
+    int n_used = 0;
+    for (int i = 0; i < max_cells && i < 32; i++) {
+        if (best[i].strength > 0) order[n_used++] = i;
+    }
+    for (int a = 0; a < n_used; a++)
+        for (int b = a + 1; b < n_used; b++)
+            if (best[order[b]].strength > best[order[a]].strength) {
+                int t = order[a]; order[a] = order[b]; order[b] = t;
+            }
+
+    float cumul_s = 0;
+    for (int oi = 0; oi < n_used; oi++) {
+        int i = order[oi];
 
         /* 각도 → 4방향 (가로/세로/대각╲/대각╱) */
         float angle = best[i].angle;
@@ -476,6 +506,17 @@ void slig_decompose_edges(SligDecomposed *out, const SligImage *img,
         sig.origin_x = (uint8_t)(best[i].nx * 255);
         sig.origin_y = (uint8_t)(best[i].ny * 255);
         sig.frequency = 4;
+
+        /* Energy bookkeeping (pipeline-symmetric with structure stage) */
+        float weight = (max_strength > 0)
+                     ? (best[i].strength / max_strength) : 0.0f;
+        cumul_s += best[i].strength;
+        float coverage = (total_strength > 0)
+                       ? (cumul_s / total_strength) : 0.0f;
+        if (weight   < 0) weight = 0;   if (weight   > 1) weight = 1;
+        if (coverage < 0) coverage = 0; if (coverage > 1) coverage = 1;
+        sig.audio_amps[2]  = (uint8_t)(weight   * 255.0f + 0.5f);
+        sig.cond_threshold = (uint8_t)(coverage * 255.0f + 0.5f);
 
         /* 엣지 주변의 1D 프로파일 추출 → u/v 신호 */
         int cx = (int)(best[i].nx * img->width);
@@ -544,8 +585,27 @@ void slig_decompose_texture(SligDecomposed *out, const SligImage *img,
         }
     }
 
+    /* Energy bookkeeping: max-normalized weight + cumulative coverage,
+     * matching the edge stage. Walks cells in descending-variance order. */
+    float total_var = 0, max_var = 0;
     for (int i = 0; i < max_cells && i < 32; i++) {
         if (best[i].var <= 0) continue;
+        total_var += best[i].var;
+        if (best[i].var > max_var) max_var = best[i].var;
+    }
+    int order[32];
+    int n_used = 0;
+    for (int i = 0; i < max_cells && i < 32; i++)
+        if (best[i].var > 0) order[n_used++] = i;
+    for (int a = 0; a < n_used; a++)
+        for (int b = a + 1; b < n_used; b++)
+            if (best[order[b]].var > best[order[a]].var) {
+                int t = order[a]; order[a] = order[b]; order[b] = t;
+            }
+
+    float cumul_v = 0;
+    for (int oi = 0; oi < n_used; oi++) {
+        int i = order[oi];
 
         SligSignal sig;
         memset(&sig, 0, sizeof(sig));
@@ -555,6 +615,14 @@ void slig_decompose_texture(SligDecomposed *out, const SligImage *img,
         sig.origin_x = (uint8_t)(best[i].cx * 255);
         sig.origin_y = (uint8_t)(best[i].cy * 255);
         sig.frequency = 2;
+
+        float weight = (max_var > 0) ? (best[i].var / max_var) : 0.0f;
+        cumul_v += best[i].var;
+        float coverage = (total_var > 0) ? (cumul_v / total_var) : 0.0f;
+        if (weight   < 0) weight = 0;   if (weight   > 1) weight = 1;
+        if (coverage < 0) coverage = 0; if (coverage > 1) coverage = 1;
+        sig.audio_amps[2]  = (uint8_t)(weight   * 255.0f + 0.5f);
+        sig.cond_threshold = (uint8_t)(coverage * 255.0f + 0.5f);
 
         /* 텍스처 블록에서 1D 프로파일 추출 */
         int cx = (int)(best[i].cx * src->width);
@@ -581,61 +649,80 @@ void slig_decompose_color(SligDecomposed *out, const SligImage *img,
     int bw = img->width / grid;
     int bh = img->height / grid;
 
+    /* Two-pass: first measure deviations so we can fill audio_amps[2]
+     * (max-normalized weight) and cond_threshold (cumulative coverage)
+     * — same pipeline-completeness pattern as edges/texture. */
+    typedef struct { float dev; float avg; uint8_t ch; uint8_t ox, oy; } ColorCand;
+    ColorCand cand[16];
+    int n_cand = 0;
+    float total_dev = 0, max_dev = 0;
+
     for (int gy = 0; gy < grid; gy++) {
         for (int gx = 0; gx < grid; gx++) {
-            if ((int)out->num_cells >= 64) break;
-
-            /* 블록 내 평균 Cb, Cr 계산 */
             double sum_cb = 0, sum_cr = 0;
             int cnt = 0;
-
             for (int y = gy * bh; y < (gy + 1) * bh && y < img->height; y++) {
                 for (int x = gx * bw; x < (gx + 1) * bw && x < img->width; x++) {
                     float r = img_get(img, x, y, 0);
                     float g = img_get(img, x, y, 1);
                     float b = img_get(img, x, y, 2);
-                    /* RGB → Cb, Cr */
                     sum_cb += -0.169f * r - 0.331f * g + 0.500f * b + 0.5f;
                     sum_cr +=  0.500f * r - 0.419f * g - 0.081f * b + 0.5f;
                     cnt++;
                 }
             }
-
             float avg_cb = (float)(sum_cb / fmax(cnt, 1));
             float avg_cr = (float)(sum_cr / fmax(cnt, 1));
+            uint8_t ox = (uint8_t)((gx + 0.5f) / grid * 255);
+            uint8_t oy = (uint8_t)((gy + 0.5f) / grid * 255);
 
-            /* Cb CE Cell */
-            if (fabsf(avg_cb - 0.5f) > 0.01f && cells_per_ch > 0) {
-                SligSignal sig;
-                memset(&sig, 0, sizeof(sig));
-                sig.dir = SLIG_DIR_HORIZONTAL;
-                sig.scale = SLIG_SCALE_COARSE;
-                sig.sigma = (uint16_t)clampf(fabsf(avg_cb - 0.5f) * 50000, 0, 65535);
-                sig.origin_x = (uint8_t)((gx + 0.5f) / grid * 255);
-                sig.origin_y = (uint8_t)((gy + 0.5f) / grid * 255);
-                sig.frequency = 32;
-                sig.audio_bins[0] = 1;  /* channel marker: Cb */
-                sig.audio_amps[0] = (uint8_t)(avg_cb * 255);
-                if (avg_cb < 0.5f) sig.flags |= SLIG_FLAG_NEGATIVE;
-                push_signal(out, &sig);
+            float d_cb = fabsf(avg_cb - 0.5f);
+            float d_cr = fabsf(avg_cr - 0.5f);
+            if (d_cb > 0.01f && cells_per_ch > 0 && n_cand < 16) {
+                cand[n_cand++] = (ColorCand){ d_cb, avg_cb, 1, ox, oy };
+                total_dev += d_cb;
+                if (d_cb > max_dev) max_dev = d_cb;
             }
-
-            /* Cr CE Cell */
-            if (fabsf(avg_cr - 0.5f) > 0.01f && cells_per_ch > 0) {
-                SligSignal sig;
-                memset(&sig, 0, sizeof(sig));
-                sig.dir = SLIG_DIR_HORIZONTAL;
-                sig.scale = SLIG_SCALE_COARSE;
-                sig.sigma = (uint16_t)clampf(fabsf(avg_cr - 0.5f) * 50000, 0, 65535);
-                sig.origin_x = (uint8_t)((gx + 0.5f) / grid * 255);
-                sig.origin_y = (uint8_t)((gy + 0.5f) / grid * 255);
-                sig.frequency = 32;
-                sig.audio_bins[0] = 2;  /* channel marker: Cr */
-                sig.audio_amps[0] = (uint8_t)(avg_cr * 255);
-                if (avg_cr < 0.5f) sig.flags |= SLIG_FLAG_NEGATIVE;
-                push_signal(out, &sig);
+            if (d_cr > 0.01f && cells_per_ch > 0 && n_cand < 16) {
+                cand[n_cand++] = (ColorCand){ d_cr, avg_cr, 2, ox, oy };
+                total_dev += d_cr;
+                if (d_cr > max_dev) max_dev = d_cr;
             }
         }
+    }
+
+    /* Sort candidates by deviation (descending) so cumulative coverage
+     * is meaningful — the strongest color contribution lands first. */
+    for (int a = 0; a < n_cand; a++)
+        for (int b = a + 1; b < n_cand; b++)
+            if (cand[b].dev > cand[a].dev) {
+                ColorCand t = cand[a]; cand[a] = cand[b]; cand[b] = t;
+            }
+
+    float cumul_d = 0;
+    for (int i = 0; i < n_cand; i++) {
+        if ((int)out->num_cells >= 64) break;
+        SligSignal sig;
+        memset(&sig, 0, sizeof(sig));
+        sig.dir = SLIG_DIR_HORIZONTAL;
+        sig.scale = SLIG_SCALE_COARSE;
+        sig.sigma = (uint16_t)clampf(cand[i].dev * 50000, 0, 65535);
+        sig.origin_x = cand[i].ox;
+        sig.origin_y = cand[i].oy;
+        sig.frequency = 32;
+        sig.audio_bins[0] = cand[i].ch;            /* 1=Cb, 2=Cr */
+        sig.audio_amps[0] = (uint8_t)(cand[i].avg * 255);
+        if (cand[i].avg < 0.5f) sig.flags |= SLIG_FLAG_NEGATIVE;
+
+        float weight = (max_dev > 0) ? (cand[i].dev / max_dev) : 0.0f;
+        cumul_d += cand[i].dev;
+        float coverage = (total_dev > 0) ? (cumul_d / total_dev) : 0.0f;
+        if (weight   < 0) weight = 0;   if (weight   > 1) weight = 1;
+        if (coverage < 0) coverage = 0; if (coverage > 1) coverage = 1;
+        sig.audio_amps[2]  = (uint8_t)(weight   * 255.0f + 0.5f);
+        sig.cond_threshold = (uint8_t)(coverage * 255.0f + 0.5f);
+
+        push_signal(out, &sig);
     }
 }
 
