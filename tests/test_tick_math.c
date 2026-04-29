@@ -65,8 +65,10 @@ int main(void) {
     check("GAUSS strictly decreasing (0→64)",
           TICK_GAUSS_TABLE[0] > TICK_GAUSS_TABLE[64]);
 
-    /* WAVE_STEPS shape check (1,3,10,30,10,3,1) */
-    check("WAVE_STEPS[3] = 30 (peak)", WAVE_STEPS[3] == 30);
+    /* WAVE_STEPS shape check (1,10,100,300,100,10,1) — ×100 of the
+     * ce_image_wave_refine float pattern (0.01→0.1→1→3→1→0.1→0.01). */
+    check("WAVE_STEPS[3] = 300 (peak)", WAVE_STEPS[3] == 300);
+    check("WAVE_STEPS[0] = 1 (trough)", WAVE_STEPS[0] == 1);
     check("WAVE_STEPS symmetric",
           WAVE_STEPS[0] == WAVE_STEPS[6] &&
           WAVE_STEPS[1] == WAVE_STEPS[5] &&

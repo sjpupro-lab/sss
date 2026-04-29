@@ -1148,8 +1148,8 @@ void slig_wave_refine(SligCanvas       *canvas,
                       int               iterations) {
     if (!canvas || iterations <= 0) return;
 
-    static const int wave_num[7] = { 1, 10, 100, 300, 100, 10, 1 };  /* ×0.01 */
-
+    /* WAVE_STEPS (slig_tick_math) is the canonical 7-step cycle —
+     * values are ×100 of ce_image_wave_refine's float pattern. */
     int32_t max_abs = 0;
     for (int y = 0; y < SLIG_CANVAS_DIM; y++) {
         for (int x = 0; x < SLIG_CANVAS_DIM; x++) {
@@ -1191,7 +1191,7 @@ void slig_wave_refine(SligCanvas       *canvas,
 
     int total_steps = iterations * 7;
     for (int it = 0; it < total_steps; it++) {
-        int32_t step = (int32_t)wave_num[it % 7] * scale;
+        int32_t step = (int32_t)WAVE_STEPS[it % 7] * scale;
         for (int y = 0; y < SLIG_CANVAS_DIM; y++) {
             for (int x = 0; x < SLIG_CANVAS_DIM; x++) {
                 int32_t cur  = canvas->pixels[y][x];
