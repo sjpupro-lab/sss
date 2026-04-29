@@ -114,6 +114,25 @@ uint32_t ce_storage_persist_slig_set(CEStorage *s,
                                      uint32_t canvas_id,
                                      const struct SligCellSet *set);
 
+/* Count how many CE_TYPE_SLIG cells are already persisted under
+ * (canvas_id, slot = scale*SLIG_NUM_CHANNELS + channel). Returns the
+ * smallest available block_idx for an append operation. Useful when a
+ * second pass (e.g. masked-train) wants to add cells behind the
+ * encoder's set without overwriting them. Returns 0 when the bucket
+ * is empty. */
+uint32_t ce_storage_slig_bucket_count(const CEStorage *s,
+                                      uint32_t canvas_id,
+                                      uint8_t  scale_level,
+                                      uint8_t  channel);
+
+/* Like ce_storage_persist_slig_set but writes cells starting at
+ * block_idx = base_idx, base_idx+1, ... so additional sets stack
+ * behind any pre-existing entries in the same bucket. */
+uint32_t ce_storage_append_slig_set(CEStorage *s,
+                                    uint32_t canvas_id,
+                                    const struct SligCellSet *set,
+                                    uint32_t base_idx);
+
 /* Reassemble the [SLIG_NUM_LEVELS][SLIG_NUM_CHANNELS] set grid for one
  * canvas_id. `out` is a 3×3 grid of SligCellSets the caller owns; the
  * function zero-clears it before populating. Sets that have no entries

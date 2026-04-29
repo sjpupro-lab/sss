@@ -94,12 +94,44 @@ static void store_cells_masked(CEStorage *storage,
     (void)store_raw_cells(storage, canvas_id, dec, mask, CE_TYPE_IMAGE);
 }
 
+/* Map a flat SligDecomposed cell index to a (scale_level, channel)
+ * bucket so masked-train output lands in the same 3×3 grid that
+ * hybrid_vae_decode reads via ce_storage_load_slig_sets. The mapping
+ * follows the natural decomposition split:
+ *
+ *   [0           .. structure_end)  → COARSE × Y    (basis luminance)
+ *   [structure_end .. edge_end)     → MID    × Y    (luma edges)
+ *   [edge_end    .. texture_end)    → FINE   × Y    (luma textures)
+ *   [texture_end .. color_end)      → COARSE × Cb   (color base, even idx)
+ *                                     COARSE × Cr   (color base, odd  idx)
+ *   [color_end   .. num_cells)      → MID    × Cr   (transient events)
+ *
+ * The decoder reads Y at all three scales for shape and Cb/Cr at
+ * COARSE for chroma, so this distribution exposes every region of the
+ * masked-train output to the decode pipeline. */
+static void map_decomposed_to_bucket(const SligDecomposed *dec, uint32_t i,
+                                     uint8_t *out_scale, uint8_t *out_channel) {
+    if (i < dec->structure_end) {
+        *out_scale = SLIG_LEVEL_COARSE; *out_channel = SLIG_CH_Y;
+    } else if (i < dec->edge_end) {
+        *out_scale = SLIG_LEVEL_MID;    *out_channel = SLIG_CH_Y;
+    } else if (i < dec->texture_end) {
+        *out_scale = SLIG_LEVEL_FINE;   *out_channel = SLIG_CH_Y;
+    } else if (i < dec->color_end) {
+        *out_scale = SLIG_LEVEL_COARSE;
+        *out_channel = (i & 1u) ? SLIG_CH_CR : SLIG_CH_CB;
+    } else {
+        *out_scale = SLIG_LEVEL_MID;    *out_channel = SLIG_CH_CR;
+    }
+}
+
 /* Pattern-bucketed path: split SligDecomposed cells across two
  * storage layouts.
  *   - basis + residual edge + residual texture (cells[0..texture_end))
- *     → raw CE_TYPE_SLIG entries (one per cell). slot/block_idx use
- *       the same i/8, i%8 convention as the legacy path so loaders
- *       don't need a layout switch.
+ *     → CE_TYPE_SLIG entries deposited into (scale, channel) buckets
+ *       so ce_storage_load_slig_sets picks them up at decode time.
+ *       Cells stack BEHIND any pre-existing entries in each bucket
+ *       (encoder runs first, masked-train output appends).
  *   - correction = color + event (cells[texture_end..num_cells))
  *     → ce_residual_codebook lookup-or-add → CE_TYPE_RESIDUAL
  *       descriptor only (idx + strength + tick), patch payload lives
@@ -121,19 +153,33 @@ static uint32_t store_cells_with_codebook(CEStorage *storage,
     uint32_t basis_end = dec->texture_end;
     if (basis_end > dec->num_cells) basis_end = dec->num_cells;
 
-    /* Part 1: basis + residual cells stored raw as CE_TYPE_SLIG. */
+    /* Part 1: basis + residual cells deposited into (scale, channel)
+     * buckets. We accumulate into a local 3×3 SligCellSet grid first
+     * so we can compute each bucket's append base just once and stamp
+     * channel/scale_level tags consistently. */
+    SligCellSet buckets[SLIG_NUM_LEVELS][SLIG_NUM_CHANNELS];
+    for (uint8_t s = 0; s < SLIG_NUM_LEVELS; ++s) {
+        for (uint8_t c = 0; c < SLIG_NUM_CHANNELS; ++c) {
+            memset(&buckets[s][c], 0, sizeof(SligCellSet));
+            buckets[s][c].scale_level = s;
+            buckets[s][c].channel     = c;
+        }
+    }
     for (uint32_t i = 0; i < basis_end; ++i) {
-        CEUnit zero;
-        ce_init(&zero);
-        CEUnit delta;
-        ce_delta(&delta, &zero, &dec->cells[i]);
-
-        ce_storage_add_typed(storage, canvas_id,
-                             (uint16_t)(i / 8),
-                             (uint16_t)(i % 8),
-                             CE_TYPE_SLIG,
-                             &dec->cells[i], &delta);
-        ++total;
+        uint8_t s = 0, c = 0;
+        map_decomposed_to_bucket(dec, i, &s, &c);
+        SligCellSet *b = &buckets[s][c];
+        if (b->num_cells >= SLIG_MAX_CELLS) continue;
+        b->cells[b->num_cells++] = dec->cells[i];
+    }
+    for (uint8_t s = 0; s < SLIG_NUM_LEVELS; ++s) {
+        for (uint8_t c = 0; c < SLIG_NUM_CHANNELS; ++c) {
+            SligCellSet *b = &buckets[s][c];
+            if (b->num_cells == 0) continue;
+            uint32_t base = ce_storage_slig_bucket_count(
+                storage, canvas_id, s, c);
+            total += ce_storage_append_slig_set(storage, canvas_id, b, base);
+        }
     }
 
     /* Part 2: correction cells reduced to codebook descriptors. */

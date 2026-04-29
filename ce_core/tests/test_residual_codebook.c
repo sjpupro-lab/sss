@@ -10,10 +10,12 @@
  */
 #include "../ce_core.h"
 #include "../ce_storage.h"
+#include "../ce_storage_io.h"
 #include "../ce_residual_codebook.h"
 #include "../ce_tick.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int fails = 0;
@@ -126,6 +128,38 @@ int main(void) {
     fake.type = CE_TYPE_IMAGE;
     int rc2 = ce_residual_storage_unpack(&fake, NULL, NULL, NULL, NULL, NULL);
     CHECK(rc2 != 0, "unpack rejects non-RESIDUAL entries");
+
+    /* --- v3 .ces trailer roundtrip --- */
+    {
+        const char *tmp_path = "/tmp/ce_storage_residual_roundtrip.ces";
+        CEStorage save_s;
+        ce_storage_init(&save_s, 4);
+        ce_residual_storage_add(&save_s, /*cid=*/9u, 1, 2, 0, 200,
+                                (TickRGBA){5,6,7,8}, 100, 100);
+
+        int wok = ce_storage_save_with_codebook(&save_s, &book, tmp_path);
+        CHECK(wok, "save_with_codebook returns ok");
+
+        CEStorage load_s;
+        CEResidualCodebook load_book;
+        int rok = ce_storage_load_with_codebook(&load_s, &load_book, tmp_path);
+        CHECK(rok, "load_with_codebook returns ok");
+        CHECK(load_s.count == save_s.count, "storage count roundtrips");
+        CHECK(load_book.count == book.count, "codebook count roundtrips");
+        if (load_book.count == book.count) {
+            int byte_match = (memcmp(&load_book.codes[0].unit,
+                                     &book.codes[0].unit,
+                                     sizeof(CEUnit)) == 0);
+            CHECK(byte_match, "first code unit byte-for-byte");
+            CHECK(load_book.codes[0].scale_level == book.codes[0].scale_level,
+                  "scale_level roundtrips");
+            CHECK(load_book.codes[0].used_count == book.codes[0].used_count,
+                  "used_count roundtrips");
+        }
+        ce_storage_free(&load_s);
+        ce_storage_free(&save_s);
+        remove(tmp_path);
+    }
 
     ce_storage_free(&S);
 
