@@ -14,6 +14,7 @@
 #include "sss_rowvae.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +35,9 @@ static void usage(const char *argv0)
 static int parse_uint_strict(const char *s, uint32_t *out)
 {
     if (!s || !*s) return -1;
+    /* strtoul accepts an optional leading '+' or '-'; without this
+     * guard "-1" would silently wrap to 0xFFFFFFFF on most platforms. */
+    if (*s == '-' || *s == '+') return -1;
     errno = 0;
     char *endp = NULL;
     unsigned long v = strtoul(s, &endp, 0);
@@ -59,14 +63,24 @@ static int parse_pos_float_strict(const char *s, float *out)
     errno = 0;
     char *endp = NULL;
     double v = strtod(s, &endp);
-    if (errno != 0 || !endp || *endp != '\0' || !(v > 0.0)) return -1;
-    *out = (float)v;
+    /* Reject non-finite ("inf", "nan") and anything that would overflow
+     * the float cast — letting them through would poison the FFT math
+     * with infinities or NaNs. */
+    if (errno != 0 || !endp || *endp != '\0' || !isfinite(v) || !(v > 0.0))
+        return -1;
+    float f = (float)v;
+    if (!isfinite(f) || !(f > 0.0f)) return -1;
+    *out = f;
     return 0;
 }
 
 int main(int argc, char **argv)
 {
-    if (argc < 4) { usage(argv[0]); return 1; }
+    /* Strict positional contract: 3 required + up to 3 optional. Any
+     * trailing arguments are typos that would otherwise be silently
+     * ignored — reject them so reproducibility is never quietly
+     * compromised. */
+    if (argc < 4 || argc > 7) { usage(argv[0]); return 1; }
 
     const char *model_path = argv[1];
     const char *prompt     = argv[2];

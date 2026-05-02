@@ -94,9 +94,11 @@ int  sss_image_save_ppm(const SSSImage *img, const char *path);
  *
  * The model's COLOR/SHAPE/FACE cells supply the targets, the prompt
  * picks the cells via 256-grid fingerprint, `seed` initialises the
- * noise PRNG (xorshift32), `detail` scales the high-frequency target,
- * and `steps` controls how many refinement passes run (0 = engine
- * default of 24). */
+ * noise PRNG (xorshift32), `detail` scales the high-frequency target
+ * (must be > 0), and `steps` is a positive integer iteration count
+ * (24 is the typical schedule; the library defensively falls back to
+ * 24 if a non-positive value slips through, but new callers should
+ * pass an explicit positive value). */
 int  sss_generate(const SSSModel *m,
                   const char     *prompt,
                   uint32_t        seed,
