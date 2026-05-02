@@ -1,15 +1,29 @@
-/* sss_rowvae.c — Spectrogram-based image generation engine.
+/* sss_rowvae.c — Sculpt-based image generation engine.
  *
- * The model stores spectrograms (row-FFT amplitudes for color/face
- * cells, column-FFT amplitudes for shape cells), not pixels. To draw
- * an image we look up cells by 256-grid fingerprint, assemble Y and
- * X half-spectra with a touch of seeded noise, inverse-FFT them,
- * cross-multiply (color × shading × edge), and run a few passes of
- * row/column smoothing to suppress FFT ringing.
+ * The model stores a *pool of training images* per attribute cell
+ * (color / shape / face). To draw, the engine walks the canvas one
+ * row at a time and at each row:
  *
- * No external FFT library is used — sss_irfft is a direct DFT-inverse
- * with the real-symmetry shortcut, which is fast enough for the
- * 64×64 / 128×128 sizes this engine targets.
+ *   1. proposes every (color_candidate, shape_candidate) pair —
+ *      "if it were this image, this row would look like that";
+ *   2. erases the bad pairs by scoring agreement (low MSE between
+ *      the two candidates on this row) plus continuity with the
+ *      previous row plus a cumulative bonus for candidates that
+ *      have already been picked;
+ *   3. composes the surviving pair into the output row by tinting
+ *      the color row with the shape row's brightness pattern, then
+ *      adding the face row's high-frequency detail;
+ *   4. writes the row to the canvas and bumps the winner's score.
+ *
+ * Row 0 is uncertain; by the time row H-1 is drawn the scores have
+ * usually converged on a single (color, shape) pair, so the image
+ * is one specific drawing rather than a blur of the pool. Two
+ * 4-pass row/column smoothings at the end remove any single rows
+ * that disagree with both neighbours.
+ *
+ * No noise base, no FFT — the canvas starts at a flat (0.94, 0.94,
+ * 0.94) gray. The 256-grid fingerprint is only used to look cells
+ * up by name.
  */
 #include "sss_rowvae.h"
 
@@ -22,12 +36,12 @@
 #define M_PI 3.14159265358979323846f
 #endif
 
-#define MAX_TOKENS 32
+#define MAX_TOKENS    32
+#define MAX_CANDS     32     /* per cell, sampled if the pool is larger */
 
 /* ── 256-grid fingerprint ─────────────────────────────────────
  * Byte-level histogram with a position-mixed neighbour bump,
- * then L2-normalised. The Python trainer must implement the
- * exact same algorithm (see scripts/sss_train.py:fingerprint).
+ * then L2-normalised. Mirror in scripts/sss_train.py:fingerprint.
  */
 void sss_fingerprint(const char *text, float *fp)
 {
@@ -68,40 +82,8 @@ int sss_search(const SSSModel *m, uint32_t type, const float *fp)
         float d = fp_distance(fp, m->cells[i].fp);
         if (d < best_d) { best_d = d; best = (int)i; }
     }
-    /* Unit-vector distance is in [0, sqrt(2)]; treat anything past
-     * 1.2 as "no real match" so noise can take over for that slot. */
     if (best >= 0 && best_d > 1.2f) return -1;
     return best;
-}
-
-/* ── Inverse real FFT ─────────────────────────────────────────
- * Reverses numpy.fft.rfft: given amp[0..nf-1] and phase[0..nf-1],
- * rebuild the N-length real signal via
- *   x[n] = (1/N) * ( amp[0]*cos(phase[0])
- *                  + 2 * sum_{k=1..nf-2} amp[k]*cos(2*pi*k*n/N + phase[k])
- *                  + amp[nf-1]*cos(pi*n + phase[nf-1])    if N even )
- * The Nyquist bin (k = nf-1, present only when N is even) does not
- * get the factor of 2 because it has no symmetric partner.
- */
-void sss_irfft(const float *amp, const float *phase, int nf, int N, float *out)
-{
-    float two_pi_over_N = 2.0f * (float)M_PI / (float)N;
-    for (int n = 0; n < N; ++n) {
-        float sum = amp[0] * cosf(phase[0]);
-        for (int k = 1; k < nf - 1; ++k) {
-            float ang = two_pi_over_N * (float)k * (float)n + phase[k];
-            sum += 2.0f * amp[k] * cosf(ang);
-        }
-        if ((N & 1) == 0 && nf > 1) {
-            float ang = (float)M_PI * (float)n + phase[nf - 1];
-            sum += amp[nf - 1] * cosf(ang);
-        } else if (nf > 1) {
-            int k = nf - 1;
-            float ang = two_pi_over_N * (float)k * (float)n + phase[k];
-            sum += 2.0f * amp[k] * cosf(ang);
-        }
-        out[n] = sum / (float)N;
-    }
 }
 
 /* ── Image helpers ──────────────────────────────────────────── */
@@ -158,29 +140,18 @@ static uint32_t rng_next(uint32_t *s)
     *s = x;
     return x;
 }
-static float rng_uniform(uint32_t *s)        /* [-1, 1) */
+
+/* Fisher–Yates shuffle of `n` indices, deterministic per seed. */
+static void rng_shuffle(int *idx, int n, uint32_t *s)
 {
-    return ((float)(rng_next(s) >> 8) / 8388608.0f) - 1.0f;
+    for (int i = n - 1; i > 0; --i) {
+        uint32_t r = rng_next(s);
+        int j = (int)(r % (uint32_t)(i + 1));
+        int tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
+    }
 }
 
-/* ── Generation ──────────────────────────────────────────────
- * The pipeline:
- *   1. Tokenise the prompt on whitespace, strip command words.
- *   2. For each token compute its fingerprint and try to match
- *      it against COLOR / SHAPE / FACE cells. Per type, keep the
- *      single best hit.
- *   3. Build the Y half-spectrum (rows × nf × 3): low-band copy
- *      from COLOR, high-band copy (scaled by `detail`) from FACE,
- *      both blended with seeded noise. Phases pulled from the
- *      stored reference plus a small jitter (otherwise the same
- *      seed/labels always yield the same image — the task requires
- *      seed-driven variation).
- *   4. Build the X half-spectrum (cols × nf): from SHAPE.
- *   5. Inverse-FFT row-wise → y_image (RGB), col-wise → x_struct.
- *   6. Combine: shade × color, with an extracted edge term darkening
- *      structural boundaries.
- *   7. Two-axis median-style smoothing to kill ringing artefacts.
- */
+/* ── Generation ─────────────────────────────────────────────── */
 
 static int is_command_word(const char *t)
 {
@@ -194,9 +165,6 @@ static int is_command_word(const char *t)
     return 0;
 }
 
-/* Splits prompt on whitespace into up to MAX_TOKENS owned strings.
- * Caller must free each tokens[i] and the array slots are valid up
- * to *out_count. */
 static int tokenise(const char *prompt, char **tokens, int *out_count)
 {
     int n = 0;
@@ -241,6 +209,75 @@ static int best_cell_for_type(const SSSModel *m,
     return best;
 }
 
+/* Mean-square distance between two RGB rows of length W. */
+static float row_mse_rgb(const float *a, const float *b, int W)
+{
+    float s = 0.0f;
+    int n = W * 3;
+    for (int i = 0; i < n; ++i) {
+        float d = a[i] - b[i];
+        s += d * d;
+    }
+    return s / (float)n;
+}
+
+/* Pointer to row r of image idx inside cell c (RGB, length W*3). */
+static inline const float *cell_row(const SSSCell *c, int H, int W,
+                                    int img_idx, int r)
+{
+    (void)H;
+    return c->imgs + ((size_t)img_idx * (size_t)H + (size_t)r)
+                   * (size_t)W * 3u;
+}
+
+/* face_detail = high-frequency residual of a face row, mean-zero,
+ * computed from the average of all face candidates at this row.
+ * Stored in `out` (length W*3). */
+static void build_face_detail(const SSSCell *cf, int H, int W, int r,
+                              float *out)
+{
+    if (!cf || cf->num_imgs == 0) {
+        memset(out, 0, (size_t)W * 3 * sizeof(float));
+        return;
+    }
+    float inv_n = 1.0f / (float)cf->num_imgs;
+    /* Average row. */
+    float *avg = out;                /* reuse */
+    memset(avg, 0, (size_t)W * 3 * sizeof(float));
+    for (uint32_t k = 0; k < cf->num_imgs; ++k) {
+        const float *row = cell_row(cf, H, W, (int)k, r);
+        for (int x = 0; x < W * 3; ++x) avg[x] += row[x];
+    }
+    for (int x = 0; x < W * 3; ++x) avg[x] *= inv_n;
+
+    /* High-pass: subtract a 1-D box blur (radius 2) along the row,
+     * channel-wise, so the residual is mean-zero locally. */
+    float buf[3];
+    float *tmp = (float *)malloc((size_t)W * 3 * sizeof(float));
+    if (!tmp) {
+        for (int x = 0; x < W * 3; ++x) avg[x] = 0.0f;
+        return;
+    }
+    for (int x = 0; x < W; ++x) {
+        buf[0] = buf[1] = buf[2] = 0.0f;
+        int cnt = 0;
+        for (int dx = -2; dx <= 2; ++dx) {
+            int xx = x + dx;
+            if (xx < 0 || xx >= W) continue;
+            buf[0] += avg[xx * 3 + 0];
+            buf[1] += avg[xx * 3 + 1];
+            buf[2] += avg[xx * 3 + 2];
+            ++cnt;
+        }
+        float inv_c = cnt > 0 ? 1.0f / (float)cnt : 0.0f;
+        tmp[x * 3 + 0] = buf[0] * inv_c;
+        tmp[x * 3 + 1] = buf[1] * inv_c;
+        tmp[x * 3 + 2] = buf[2] * inv_c;
+    }
+    for (int x = 0; x < W * 3; ++x) avg[x] -= tmp[x];   /* residual */
+    free(tmp);
+}
+
 int sss_generate(const SSSModel *m,
                  const char     *prompt,
                  uint32_t        seed,
@@ -248,218 +285,194 @@ int sss_generate(const SSSModel *m,
                  SSSImage       *out)
 {
     if (!m || !prompt || !out) return -1;
-    if (m->height != m->width) return -2;   /* engine assumes square */
+    if (m->height != m->width) return -2;       /* engine assumes square */
 
     int H = (int)m->height;
     int W = (int)m->width;
-    int NF = (int)m->nf;
-    int NF_LOW = (int)m->nf_low;
-    int NF_HIGH = NF - NF_LOW;
     if (detail <= 0.0f) detail = 1.0f;
 
     char *tokens[MAX_TOKENS];
     int ntok = 0;
     if (tokenise(prompt, tokens, &ntok) != 0) return -3;
 
-    int ic = best_cell_for_type(m, SSS_CE_COLOR, tokens, ntok);
-    int is = best_cell_for_type(m, SSS_CE_SHAPE, tokens, ntok);
+    int ic  = best_cell_for_type(m, SSS_CE_COLOR, tokens, ntok);
+    int is_ = best_cell_for_type(m, SSS_CE_SHAPE, tokens, ntok);
     int ifc = best_cell_for_type(m, SSS_CE_FACE,  tokens, ntok);
 
     const SSSCell *cc = (ic  >= 0) ? &m->cells[ic]  : NULL;
-    const SSSCell *cs = (is  >= 0) ? &m->cells[is]  : NULL;
+    const SSSCell *cs = (is_ >= 0) ? &m->cells[is_] : NULL;
     const SSSCell *cf = (ifc >= 0) ? &m->cells[ifc] : NULL;
 
-    /* Y half-spectrum: H rows × NF freqs × 3 channels. */
-    size_t y_n = (size_t)H * (size_t)NF * 3;
-    float *y_amp   = (float *)calloc(y_n, sizeof(float));
-    float *y_phase = (float *)calloc(y_n, sizeof(float));
-    /* X half-spectrum: W cols × NF freqs (column FFT of grayscale). */
-    size_t x_n = (size_t)W * (size_t)NF;
-    float *x_amp   = (float *)calloc(x_n, sizeof(float));
-    float *x_phase = (float *)calloc(x_n, sizeof(float));
-    if (!y_amp || !y_phase || !x_amp || !x_phase) {
-        free(y_amp); free(y_phase); free(x_amp); free(x_phase);
-        for (int i = 0; i < ntok; ++i) free(tokens[i]);
-        return -4;
-    }
+    int nc = (cc && cc->num_imgs > 0) ? (int)cc->num_imgs : 0;
+    int ns = (cs && cs->num_imgs > 0) ? (int)cs->num_imgs : 0;
+    if (nc > MAX_CANDS) nc = MAX_CANDS;
+    if (ns > MAX_CANDS) ns = MAX_CANDS;
 
     uint32_t rng = seed ? seed : 0xC0FFEE11u;
 
-    /* ─ Y assembly ─ */
-    for (int r = 0; r < H; ++r) {
-        for (int c = 0; c < 3; ++c) {
-            for (int k = 0; k < NF; ++k) {
-                size_t idx = ((size_t)r * NF + k) * 3 + c;
-                float amp = 0.0f, ph = 0.0f;
-                if (k < NF_LOW) {
-                    if (cc) {
-                        size_t cidx = ((size_t)r * NF_LOW + k) * 3 + c;
-                        amp = cc->amp[cidx];
-                        ph  = cc->phase[cidx];
-                    } else {
-                        amp = 0.05f * fabsf(rng_uniform(&rng));
-                        ph  = (float)M_PI * rng_uniform(&rng);
-                    }
-                    amp += 0.02f * rng_uniform(&rng);
-                    ph  += 0.05f * rng_uniform(&rng);
-                } else {
-                    int kh = k - NF_LOW;
-                    if (cf) {
-                        size_t fidx = ((size_t)r * NF_HIGH + kh) * 3 + c;
-                        amp = cf->amp[fidx] * detail;
-                        ph  = cf->phase[fidx];
-                    } else {
-                        amp = 0.01f * fabsf(rng_uniform(&rng)) * detail;
-                        ph  = (float)M_PI * rng_uniform(&rng);
-                    }
-                    amp += 0.005f * rng_uniform(&rng);
-                    ph  += 0.10f * rng_uniform(&rng);
-                }
-                if (amp < 0.0f) amp = 0.0f;
-                y_amp[idx]   = amp;
-                y_phase[idx] = ph;
-            }
-        }
+    /* Seed-driven candidate ordering: shuffle the index lists so that
+     * later rows still see the same pool but ties at row 0 break
+     * differently from one seed to the next. */
+    int c_idx[MAX_CANDS], s_idx[MAX_CANDS];
+    int total_c = (cc && cc->num_imgs > 0) ? (int)cc->num_imgs : 0;
+    int total_s = (cs && cs->num_imgs > 0) ? (int)cs->num_imgs : 0;
+    int pool_c[MAX_CANDS], pool_s[MAX_CANDS];
+    for (int i = 0; i < total_c; ++i) pool_c[i] = i;
+    for (int i = 0; i < total_s; ++i) pool_s[i] = i;
+    if (total_c > MAX_CANDS) {
+        rng_shuffle(pool_c, total_c, &rng);
+    } else if (total_c > 1) {
+        rng_shuffle(pool_c, total_c, &rng);
+    }
+    if (total_s > MAX_CANDS) {
+        rng_shuffle(pool_s, total_s, &rng);
+    } else if (total_s > 1) {
+        rng_shuffle(pool_s, total_s, &rng);
+    }
+    for (int i = 0; i < nc; ++i) c_idx[i] = pool_c[i];
+    for (int i = 0; i < ns; ++i) s_idx[i] = pool_s[i];
+
+    /* Cumulative scores (one per candidate). */
+    float c_scores[MAX_CANDS];
+    float s_scores[MAX_CANDS];
+    for (int i = 0; i < MAX_CANDS; ++i) c_scores[i] = s_scores[i] = 0.0f;
+
+    if (sss_image_alloc(out, H, W) != 0) {
+        for (int i = 0; i < ntok; ++i) free(tokens[i]);
+        return -4;
+    }
+    /* Blank canvas: flat neutral gray. */
+    for (size_t i = 0; i < (size_t)H * (size_t)W * 3; ++i) {
+        out->data[i] = 0.94f;
     }
 
-    /* ─ X assembly ─ */
-    for (int c = 0; c < W; ++c) {
-        for (int k = 0; k < NF; ++k) {
-            size_t idx = (size_t)c * NF + k;
-            float amp = 0.0f, ph = 0.0f;
-            if (cs) {
-                amp = cs->amp[idx];
-                ph  = cs->phase[idx];
-            } else {
-                amp = 0.05f * fabsf(rng_uniform(&rng));
-                ph  = (float)M_PI * rng_uniform(&rng);
-            }
-            amp += 0.02f * rng_uniform(&rng);
-            ph  += 0.05f * rng_uniform(&rng);
-            if (amp < 0.0f) amp = 0.0f;
-            x_amp[idx]   = amp;
-            x_phase[idx] = ph;
-        }
-    }
-
-    /* ─ Inverse FFT: rows for Y → RGB image ─ */
-    float *y_image = (float *)calloc((size_t)H * W * 3, sizeof(float));
-    float *row_amp   = (float *)malloc(NF * sizeof(float));
-    float *row_phase = (float *)malloc(NF * sizeof(float));
-    float *row_out   = (float *)malloc(W  * sizeof(float));
-    if (!y_image || !row_amp || !row_phase || !row_out) {
-        free(y_image); free(row_amp); free(row_phase); free(row_out);
-        free(y_amp); free(y_phase); free(x_amp); free(x_phase);
+    float *prev_row    = (float *)malloc((size_t)W * 3 * sizeof(float));
+    float *face_detail = (float *)malloc((size_t)W * 3 * sizeof(float));
+    float *out_row     = (float *)malloc((size_t)W * 3 * sizeof(float));
+    if (!prev_row || !face_detail || !out_row) {
+        free(prev_row); free(face_detail); free(out_row);
+        sss_image_free(out);
         for (int i = 0; i < ntok; ++i) free(tokens[i]);
         return -5;
     }
-    for (int r = 0; r < H; ++r) {
-        for (int c = 0; c < 3; ++c) {
-            for (int k = 0; k < NF; ++k) {
-                size_t idx = ((size_t)r * NF + k) * 3 + c;
-                row_amp[k]   = y_amp[idx];
-                row_phase[k] = y_phase[idx];
-            }
-            sss_irfft(row_amp, row_phase, NF, W, row_out);
-            for (int x = 0; x < W; ++x) {
-                y_image[((size_t)r * W + x) * 3 + c] = row_out[x];
-            }
-        }
-    }
+    /* prev_row starts as the gray canvas. */
+    for (int x = 0; x < W * 3; ++x) prev_row[x] = 0.94f;
 
-    /* ─ Inverse FFT: cols for X → grayscale structure ─ */
-    float *x_struct  = (float *)calloc((size_t)H * W, sizeof(float));
-    float *col_amp   = (float *)malloc(NF * sizeof(float));
-    float *col_phase = (float *)malloc(NF * sizeof(float));
-    float *col_out   = (float *)malloc(H  * sizeof(float));
-    if (!x_struct || !col_amp || !col_phase || !col_out) {
-        free(x_struct); free(col_amp); free(col_phase); free(col_out);
-        free(y_image); free(row_amp); free(row_phase); free(row_out);
-        free(y_amp); free(y_phase); free(x_amp); free(x_phase);
+    /* If we have no color cell, fall back to a single neutral gray
+     * "candidate" row so the loop still produces sensible output. */
+    float *fallback = (float *)malloc((size_t)W * 3 * sizeof(float));
+    if (!fallback) {
+        free(prev_row); free(face_detail); free(out_row);
+        sss_image_free(out);
         for (int i = 0; i < ntok; ++i) free(tokens[i]);
         return -6;
     }
-    for (int c = 0; c < W; ++c) {
-        for (int k = 0; k < NF; ++k) {
-            size_t idx = (size_t)c * NF + k;
-            col_amp[k]   = x_amp[idx];
-            col_phase[k] = x_phase[idx];
-        }
-        sss_irfft(col_amp, col_phase, NF, H, col_out);
-        for (int y = 0; y < H; ++y) {
-            x_struct[(size_t)y * W + c] = col_out[y];
-        }
-    }
-    free(row_amp); free(row_phase); free(row_out);
-    free(col_amp); free(col_phase); free(col_out);
-    free(y_amp); free(y_phase); free(x_amp); free(x_phase);
+    for (int x = 0; x < W * 3; ++x) fallback[x] = 0.94f;
 
-    /* Normalise x_struct to roughly [-0.5, 0.5] for use as shading. */
-    float xmin = 1e30f, xmax = -1e30f;
-    size_t HW = (size_t)H * W;
-    for (size_t i = 0; i < HW; ++i) {
-        if (x_struct[i] < xmin) xmin = x_struct[i];
-        if (x_struct[i] > xmax) xmax = x_struct[i];
-    }
-    float xrange = xmax - xmin;
-    if (xrange < 1e-6f) xrange = 1.0f;
-    for (size_t i = 0; i < HW; ++i) {
-        x_struct[i] = (x_struct[i] - xmin) / xrange - 0.5f;
-    }
+    for (int r = 0; r < H; ++r) {
+        /* Build face detail row (zeros if no face cell). */
+        build_face_detail(cf, H, W, r, face_detail);
 
-    /* Edge map: high-pass via 3-point Laplacian on x_struct. */
-    float *edge = (float *)calloc(HW, sizeof(float));
-    if (!edge) {
-        free(x_struct); free(y_image);
-        for (int i = 0; i < ntok; ++i) free(tokens[i]);
-        return -7;
-    }
-    for (int y = 1; y < H - 1; ++y) {
-        for (int x = 1; x < W - 1; ++x) {
-            float c  = x_struct[(size_t)y * W + x];
-            float u  = x_struct[(size_t)(y - 1) * W + x];
-            float d  = x_struct[(size_t)(y + 1) * W + x];
-            float l  = x_struct[(size_t)y * W + (x - 1)];
-            float rr = x_struct[(size_t)y * W + (x + 1)];
-            float e = fabsf(4.0f * c - u - d - l - rr);
-            edge[(size_t)y * W + x] = e;
-        }
-    }
-    /* Normalise edge to [0, 1]. */
-    float emax = 0.0f;
-    for (size_t i = 0; i < HW; ++i) if (edge[i] > emax) emax = edge[i];
-    if (emax < 1e-6f) emax = 1.0f;
-    for (size_t i = 0; i < HW; ++i) edge[i] /= emax;
+        /* ── Pick the best (color, shape) pair for this row ── */
+        const float *best_color_row = NULL;
+        const float *best_shape_row = NULL;
+        int best_ci = -1, best_si = -1;
+        float best_total = -1e30f;
 
-    /* Cross-compose: final = y_image * shade * (1 - 0.5 * edge). */
-    if (sss_image_alloc(out, H, W) != 0) {
-        free(edge); free(x_struct); free(y_image);
-        for (int i = 0; i < ntok; ++i) free(tokens[i]);
-        return -8;
-    }
-    for (int y = 0; y < H; ++y) {
-        for (int x = 0; x < W; ++x) {
-            size_t pi = (size_t)y * W + x;
-            float shade = 0.65f + 0.45f * (x_struct[pi] + 0.5f); /* roughly [0.65, 1.10] */
-            float em = 1.0f - 0.5f * edge[pi];
-            for (int c = 0; c < 3; ++c) {
-                float v = y_image[pi * 3 + c] * shade * em;
-                /* y_image carries an arbitrary FFT scale — recentre to [0,1]. */
-                v = 0.5f + 0.5f * v;
-                if (v < 0.0f) v = 0.0f;
-                if (v > 1.0f) v = 1.0f;
-                out->data[pi * 3 + c] = v;
+        if (nc == 0 && ns == 0) {
+            best_color_row = fallback;
+            best_shape_row = fallback;
+        } else if (nc == 0) {
+            best_color_row = fallback;
+            for (int j = 0; j < ns; ++j) {
+                const float *sr = cell_row(cs, H, W, s_idx[j], r);
+                float cont = -row_mse_rgb(sr, prev_row, W);
+                float bonus = logf(s_scores[j] + 1.0f);
+                float total = cont + bonus;
+                if (total > best_total) {
+                    best_total = total; best_si = j; best_shape_row = sr;
+                }
+            }
+        } else if (ns == 0) {
+            best_shape_row = fallback;
+            for (int i = 0; i < nc; ++i) {
+                const float *cr = cell_row(cc, H, W, c_idx[i], r);
+                float cont = -row_mse_rgb(cr, prev_row, W);
+                float bonus = logf(c_scores[i] + 1.0f);
+                float total = cont + bonus;
+                if (total > best_total) {
+                    best_total = total; best_ci = i; best_color_row = cr;
+                }
+            }
+        } else {
+            for (int i = 0; i < nc; ++i) {
+                const float *cr = cell_row(cc, H, W, c_idx[i], r);
+                float cont = -row_mse_rgb(cr, prev_row, W);
+                float c_bonus = logf(c_scores[i] + 1.0f);
+                for (int j = 0; j < ns; ++j) {
+                    const float *sr = cell_row(cs, H, W, s_idx[j], r);
+                    float agree = -row_mse_rgb(cr, sr, W);
+                    float s_bonus = logf(s_scores[j] + 1.0f);
+                    float total = agree + cont + c_bonus + s_bonus;
+                    if (total > best_total) {
+                        best_total = total;
+                        best_ci = i; best_si = j;
+                        best_color_row = cr; best_shape_row = sr;
+                    }
+                }
             }
         }
+
+        /* ── Compose: tint color row by shape brightness, add face detail. ── */
+        for (int x = 0; x < W; ++x) {
+            float cr0 = best_color_row[x * 3 + 0];
+            float cr1 = best_color_row[x * 3 + 1];
+            float cr2 = best_color_row[x * 3 + 2];
+            float sr0 = best_shape_row[x * 3 + 0];
+            float sr1 = best_shape_row[x * 3 + 1];
+            float sr2 = best_shape_row[x * 3 + 2];
+
+            float c_gray = (cr0 + cr1 + cr2) * (1.0f / 3.0f);
+            float s_gray = (sr0 + sr1 + sr2) * (1.0f / 3.0f);
+
+            float structure = s_gray / (c_gray + 1e-6f);
+            if (structure < 0.7f) structure = 0.7f;
+            if (structure > 1.3f) structure = 1.3f;
+
+            float v0 = cr0 * structure + face_detail[x * 3 + 0] * 0.3f * detail;
+            float v1 = cr1 * structure + face_detail[x * 3 + 1] * 0.3f * detail;
+            float v2 = cr2 * structure + face_detail[x * 3 + 2] * 0.3f * detail;
+            if (v0 < 0.0f) v0 = 0.0f;
+            if (v0 > 1.0f) v0 = 1.0f;
+            if (v1 < 0.0f) v1 = 0.0f;
+            if (v1 > 1.0f) v1 = 1.0f;
+            if (v2 < 0.0f) v2 = 0.0f;
+            if (v2 > 1.0f) v2 = 1.0f;
+            out_row[x * 3 + 0] = v0;
+            out_row[x * 3 + 1] = v1;
+            out_row[x * 3 + 2] = v2;
+        }
+
+        /* ── Accumulate: write to canvas, bump scores, update prev_row. ── */
+        memcpy(out->data + (size_t)r * W * 3, out_row,
+               (size_t)W * 3 * sizeof(float));
+        memcpy(prev_row, out_row, (size_t)W * 3 * sizeof(float));
+        if (best_ci >= 0) c_scores[best_ci] += 1.0f;
+        if (best_si >= 0) s_scores[best_si] += 1.0f;
     }
-    free(edge); free(x_struct); free(y_image);
+
+    free(prev_row);
+    free(face_detail);
+    free(out_row);
+    free(fallback);
     for (int i = 0; i < ntok; ++i) free(tokens[i]);
 
-    /* ─ Latent correction: 4 passes, both axes. Damps any single
-     *   row/column that disagrees with both of its neighbours. ─ */
-    float thresh = 0.18f;
+    /* ── Latent correction: 4 passes, both axes. Damps any single
+     *   row/column that disagrees sharply with both neighbours. ── */
+    size_t HW = (size_t)H * (size_t)W;
+    float thresh = 0.12f;
     float *tmp = (float *)malloc(HW * 3 * sizeof(float));
-    if (!tmp) return 0;            /* image already produced; skip smoothing */
+    if (!tmp) return 0;
     for (int pass = 0; pass < 4; ++pass) {
         memcpy(tmp, out->data, HW * 3 * sizeof(float));
         /* Row direction. */

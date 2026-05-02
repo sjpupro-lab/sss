@@ -1,10 +1,11 @@
-/* sss_gen — CLI for the spectrogram image engine.
+/* sss_gen — CLI for the sculpt image engine.
  *
- *   ./sss_gen MODEL.sss "빨간 원 그려줘" out.ppm [seed] [detail]
+ *   ./sss_gen MODEL.sss "red circle smile" out.ppm [seed] [detail]
  *
- * Loads a v8 .sss model (produced by scripts/sss_train.py),
- * generates an image from the prompt, and writes a PPM. seed
- * defaults to 1 (any non-zero value); detail defaults to 1.0.
+ * Loads a v9 .sss model (produced by scripts/sss_train.py),
+ * generates an image from the prompt by row-by-row candidate
+ * selection ("sculpt"), and writes a PPM. seed defaults to 1
+ * (any non-zero value); detail defaults to 1.0.
  */
 #include "sss_rowvae.h"
 
@@ -16,8 +17,8 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
         "usage: %s MODEL.sss PROMPT OUT.ppm [seed] [detail]\n"
-        "  seed   default 1     (any unsigned int; controls noise variation)\n"
-        "  detail default 1.0   (>1 = sharper high-frequency contribution)\n",
+        "  seed   default 1     (any unsigned int; permutes candidate order)\n"
+        "  detail default 1.0   (>1 = stronger face-detail contribution)\n",
         argv0);
 }
 
@@ -38,8 +39,8 @@ int main(int argc, char **argv)
         return 2;
     }
     fprintf(stderr,
-        "loaded %s: H=%u W=%u NF=%u NF_LOW=%u cells=%u\n",
-        model_path, m.height, m.width, m.nf, m.nf_low, m.num_cells);
+        "loaded %s: H=%u W=%u channels=%u cells=%u\n",
+        model_path, m.height, m.width, m.channels, m.num_cells);
 
     SSSImage img;
     memset(&img, 0, sizeof(img));
