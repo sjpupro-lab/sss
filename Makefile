@@ -44,7 +44,9 @@ CE_CORE_SRCS = $(CE_CORE_DIR)/ce_core.c \
                $(CE_CORE_DIR)/slig_material_harmonic.c \
                $(CE_CORE_DIR)/ce_hybrid_vae.c \
                $(CE_CORE_DIR)/ce_masked_train.c \
-               $(CE_CORE_DIR)/ce_residual_codebook.c
+               $(CE_CORE_DIR)/ce_residual_codebook.c \
+               $(CE_CORE_DIR)/sss_rowvae.c \
+               $(CE_CORE_DIR)/sss_io.c
 
 CE_CORE_OBJS = $(patsubst $(CE_CORE_DIR)/%.c,$(BUILD_DIR)/ce_core_%.o,$(CE_CORE_SRCS))
 
@@ -159,6 +161,16 @@ $(BUILD_DIR)/train_images_ce: tools/train_images_ce.c $(OBJS) | $(BUILD_DIR)
 
 $(BUILD_DIR)/gen_image_ce: tools/gen_image_ce.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+# Spectrogram-based image generator (sss_rowvae engine).
+$(BUILD_DIR)/sss_gen: tools/sss_gen.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+sss_gen: $(BUILD_DIR)/sss_gen
+	@echo "Built sss_gen. Pipeline:"
+	@echo "  python3 scripts/sss_train.py --labels data/sss_demo/labels.tsv \\"
+	@echo "      --root data/sss_demo --out build/models/demo.sss --size 64"
+	@echo "  ./build/sss_gen build/models/demo.sss \"red circle draw\" out.ppm 1 1.0"
 
 $(BUILD_DIR)/make_demo_dataset: tools/make_demo_dataset.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< -o $@
