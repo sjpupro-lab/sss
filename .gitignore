@@ -27,3 +27,7 @@ build/gpu_models/
 # Test scratch outputs
 /tmp/sss_v2_*
 /tmp/bench_*
+
+# Generated SSS 1k corpus — regenerate via data/sss_demo_1k/_make_dataset.py
+data/sss_demo_1k/*.ppm
+data/sss_demo_1k/labels.tsv

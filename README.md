@@ -474,6 +474,88 @@ generate under 0.1 s.
 
 ---
 
+## Spectrogram engine — `sss_rowvae`
+
+A second image path that stores **how to draw**, not pixels. For each
+morpheme it keeps the row/column FFT amplitudes (a spectrogram) of the
+training images that wore that label. Generation starts from noise,
+pulls three cells out of the model by 256-grid fingerprint
+(`COLOR` / `SHAPE` / `FACE`), assembles a Y and an X half-spectrum,
+inverse-FFTs both, cross-composes them, and runs four passes of
+row/column smoothing.
+
+| Cell type | Source       | What it stores                                      |
+| --------- | ------------ | --------------------------------------------------- |
+| `COLOR`   | Y, low band  | per-row, low-frequency amplitude per RGB channel    |
+| `FACE`    | Y, high band | per-row, high-frequency amplitude per RGB channel   |
+| `SHAPE`   | X, full band | per-column amplitude of the grayscale silhouette    |
+
+The C runtime ships its own real inverse FFT (no FFTW / no numpy at
+runtime) and uses an `xorshift32` PRNG so any `(seed, prompt)` pair is
+reproducible.
+
+### 1k synthetic-corpus run (3 colors × 3 shapes × 2 faces × 56 variants = 1008 images)
+
+```bash
+python3 data/sss_demo_1k/_make_dataset.py
+python3 scripts/sss_train.py \
+    --labels data/sss_demo_1k/labels.tsv \
+    --root   data/sss_demo_1k \
+    --out    build/models/demo1k.sss \
+    --size   64
+make build/sss_gen
+./build/sss_gen build/models/demo1k.sss "red circle smile draw" out.ppm 1 1.0
+```
+
+Training 1008 images takes **0.95 s** on a single core. Verification of
+the spec's three test criteria on the resulting model:
+
+```
+== Test 4: color isolation (circle+smile fixed) ==
+  red    R=0.926  G=0.840  B=0.840   →  R−B = +0.086
+  green  R=0.840  G=0.913  B=0.850   →  G−R = +0.073
+  blue   R=0.838  G=0.850  B=0.922   →  B−R = +0.083
+
+== Test 5: shape isolation (red+smile fixed) ==
+  red+circle vs red+square    pixel diff = 0.0274
+  red+circle vs red+triangle  pixel diff = 0.0254
+  red+square vs red+triangle  pixel diff = 0.0302
+
+== Test 3: seed-driven variation (same prompt) ==
+  seed1 vs seed42    diff = 0.0034
+  seed1 vs seed2026  diff = 0.0033
+
+== Compression / storage ==
+  dataset (1008 PPMs):    12108.8 KB
+  model (build/demo1k.sss):  173.2 KB
+  ratio: 69.9× (target was ≥3×)
+```
+
+Color tokens route to the right RGB channel, distinct shape tokens
+shift the output by a measurable margin, the seed perturbs detail
+without breaking colour or silhouette, and the model is **70× smaller
+than the dataset** because only per-label spectrogram means are kept.
+
+### Sample renders (8 prompts, model trained on 1008 images)
+
+![sss_rowvae sample grid](docs/sss_assets/samples_grid.png)
+
+Top row, left → right: `red circle smile`, `blue circle smile`,
+`green circle smile`, `red square smile`. Bottom row:
+`blue square sad`, `red triangle sad`, `blue triangle smile`,
+`green triangle smile`. All four images are generated from the same
+173 KB `.sss` file with the prompt as the only input.
+
+### Same prompt, four seeds — variation without label drift
+
+![seed variation row](docs/sss_assets/seed_variation.png)
+
+Prompt: `red circle smile draw` with `seed = 1, 2, 3, 4`. The colour
+remains red, the silhouette remains a circle, but high-frequency detail
+shifts because the engine jitters the FACE-band phase per seed.
+
+---
+
 ## Build & run
 
 ```bash
