@@ -39,6 +39,10 @@ grid(combo_imgs, cols=4).save(OUT / "samples_grid.png")
 seed_imgs = [upscale(load(f"seed_{i}.ppm")) for i in (1, 2, 3, 4)]
 grid(seed_imgs, cols=4).save(OUT / "seed_variation.png")
 
+# Convergence row: 1, 4, 8, 16, 24, 48 steps.
+conv_imgs = [upscale(load(f"conv_{k}.ppm")) for k in (1, 4, 8, 16, 24, 48)]
+grid(conv_imgs, cols=6).save(OUT / "convergence.png")
+
 # Single training-data sample for visual baseline.
 src_train = ROOT / "data" / "sss_demo_1k" / "red_circle_smile_000.ppm"
 if src_train.exists():

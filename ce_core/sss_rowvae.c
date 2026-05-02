@@ -1,15 +1,36 @@
 /* sss_rowvae.c — Spectrogram-based image generation engine.
  *
  * The model stores spectrograms (row-FFT amplitudes for color/face
- * cells, column-FFT amplitudes for shape cells), not pixels. To draw
- * an image we look up cells by 256-grid fingerprint, assemble Y and
- * X half-spectra with a touch of seeded noise, inverse-FFT them,
- * cross-multiply (color × shading × edge), and run a few passes of
- * row/column smoothing to suppress FFT ringing.
+ * cells, column-FFT amplitudes for shape cells), not pixels. The
+ * generator does NOT assemble those amplitudes directly into an
+ * image — instead it runs an iterative noise → measure-error →
+ * fix → repeat loop:
  *
- * No external FFT library is used — sss_irfft is a direct DFT-inverse
- * with the real-symmetry shortcut, which is fast enough for the
- * 64×64 / 128×128 sizes this engine targets.
+ *   image = noise (RGB float)
+ *   for step in range(steps):
+ *     for each row, each channel:
+ *       (measured_amp, phase) = rfft(row)
+ *       target_amp            = COLOR (low band) ∪ FACE (high band)
+ *       new_amp               = α * target + (1 − α) * measured
+ *       row                   = irfft(new_amp, phase)
+ *     for each column:
+ *       (measured_amp, phase) = rfft(grayscale_col)
+ *       target_amp            = SHAPE
+ *       new_amp               = α * target + (1 − α) * measured
+ *     apply grayscale delta to every channel (preserves chroma)
+ *     clamp to [0, 1]
+ *
+ * α decays linearly from ~0.95 down to ~0.30 across the schedule, so
+ * early passes pull hard toward the target spectrogram and later
+ * passes only nudge — the same Gerchberg–Saxton structure that
+ * recovers images from amplitude-only spectra. Phases evolve
+ * naturally from the seeded noise: same prompt + different seed
+ * yields different images, but each one ends up matching the cell
+ * amplitudes.
+ *
+ * No external FFT library is used — sss_rfft / sss_irfft are direct
+ * DFT pairs, fast enough for the 64×64 / 128×128 sizes this engine
+ * targets.
  */
 #include "sss_rowvae.h"
 
@@ -68,10 +89,27 @@ int sss_search(const SSSModel *m, uint32_t type, const float *fp)
         float d = fp_distance(fp, m->cells[i].fp);
         if (d < best_d) { best_d = d; best = (int)i; }
     }
-    /* Unit-vector distance is in [0, sqrt(2)]; treat anything past
-     * 1.2 as "no real match" so noise can take over for that slot. */
     if (best >= 0 && best_d > 1.2f) return -1;
     return best;
+}
+
+/* ── Forward real FFT ─────────────────────────────────────────
+ * Matches numpy.fft.rfft: X[k] = Σ_n x[n] * exp(-j*2π*k*n/N), no
+ * scaling on the forward pass. Out-arrays are nf = N/2+1 long. */
+void sss_rfft(const float *x, int N, float *amp, float *phase)
+{
+    int nf = N / 2 + 1;
+    float two_pi_over_N = 2.0f * (float)M_PI / (float)N;
+    for (int k = 0; k < nf; ++k) {
+        float re = 0.0f, im = 0.0f;
+        for (int n = 0; n < N; ++n) {
+            float ang = two_pi_over_N * (float)k * (float)n;
+            re += x[n] * cosf(ang);
+            im -= x[n] * sinf(ang);
+        }
+        amp[k]   = sqrtf(re * re + im * im);
+        phase[k] = atan2f(im, re);
+    }
 }
 
 /* ── Inverse real FFT ─────────────────────────────────────────
@@ -163,25 +201,7 @@ static float rng_uniform(uint32_t *s)        /* [-1, 1) */
     return ((float)(rng_next(s) >> 8) / 8388608.0f) - 1.0f;
 }
 
-/* ── Generation ──────────────────────────────────────────────
- * The pipeline:
- *   1. Tokenise the prompt on whitespace, strip command words.
- *   2. For each token compute its fingerprint and try to match
- *      it against COLOR / SHAPE / FACE cells. Per type, keep the
- *      single best hit.
- *   3. Build the Y half-spectrum (rows × nf × 3): low-band copy
- *      from COLOR, high-band copy (scaled by `detail`) from FACE,
- *      both blended with seeded noise. Phases pulled from the
- *      stored reference plus a small jitter (otherwise the same
- *      seed/labels always yield the same image — the task requires
- *      seed-driven variation).
- *   4. Build the X half-spectrum (cols × nf): from SHAPE.
- *   5. Inverse-FFT row-wise → y_image (RGB), col-wise → x_struct.
- *   6. Combine: shade × color, with an extracted edge term darkening
- *      structural boundaries.
- *   7. Two-axis median-style smoothing to kill ringing artefacts.
- */
-
+/* ── Tokeniser ─────────────────────────────────────────────── */
 static int is_command_word(const char *t)
 {
     static const char *cmds[] = {
@@ -194,9 +214,6 @@ static int is_command_word(const char *t)
     return 0;
 }
 
-/* Splits prompt on whitespace into up to MAX_TOKENS owned strings.
- * Caller must free each tokens[i] and the array slots are valid up
- * to *out_count. */
 static int tokenise(const char *prompt, char **tokens, int *out_count)
 {
     int n = 0;
@@ -211,17 +228,13 @@ static int tokenise(const char *prompt, char **tokens, int *out_count)
         if (!t) return -1;
         memcpy(t, start, len);
         t[len] = '\0';
-        if (!is_command_word(t)) {
-            tokens[n++] = t;
-        } else {
-            free(t);
-        }
+        if (!is_command_word(t)) tokens[n++] = t;
+        else                     free(t);
     }
     *out_count = n;
     return 0;
 }
 
-/* Best cell of `type` across all tokens (lower distance wins). */
 static int best_cell_for_type(const SSSModel *m,
                               uint32_t type,
                               char **tokens, int n)
@@ -241,14 +254,24 @@ static int best_cell_for_type(const SSSModel *m,
     return best;
 }
 
+/* ── Iterative generation ─────────────────────────────────────
+ * The key change vs. a single-pass spectrogram → image bake: we
+ * never construct a "target spectrogram" to inverse-FFT. Instead
+ * we measure the current image's actual spectrogram on every
+ * iteration, see where it disagrees with the cell targets
+ * (the "error"), and blend toward the target by α(step). Phases
+ * are not touched directly — they evolve through the projections,
+ * so different starting noise → different final images.
+ */
 int sss_generate(const SSSModel *m,
                  const char     *prompt,
                  uint32_t        seed,
                  float           detail,
+                 int             steps,
                  SSSImage       *out)
 {
     if (!m || !prompt || !out) return -1;
-    if (m->height != m->width) return -2;   /* engine assumes square */
+    if (m->height != m->width) return -2;
 
     int H = (int)m->height;
     int W = (int)m->width;
@@ -256,264 +279,141 @@ int sss_generate(const SSSModel *m,
     int NF_LOW = (int)m->nf_low;
     int NF_HIGH = NF - NF_LOW;
     if (detail <= 0.0f) detail = 1.0f;
+    if (steps   <= 0)   steps  = 24;
 
     char *tokens[MAX_TOKENS];
     int ntok = 0;
     if (tokenise(prompt, tokens, &ntok) != 0) return -3;
 
-    int ic = best_cell_for_type(m, SSS_CE_COLOR, tokens, ntok);
-    int is = best_cell_for_type(m, SSS_CE_SHAPE, tokens, ntok);
+    int ic  = best_cell_for_type(m, SSS_CE_COLOR, tokens, ntok);
+    int is  = best_cell_for_type(m, SSS_CE_SHAPE, tokens, ntok);
     int ifc = best_cell_for_type(m, SSS_CE_FACE,  tokens, ntok);
-
     const SSSCell *cc = (ic  >= 0) ? &m->cells[ic]  : NULL;
     const SSSCell *cs = (is  >= 0) ? &m->cells[is]  : NULL;
     const SSSCell *cf = (ifc >= 0) ? &m->cells[ifc] : NULL;
 
-    /* Y half-spectrum: H rows × NF freqs × 3 channels. */
-    size_t y_n = (size_t)H * (size_t)NF * 3;
-    float *y_amp   = (float *)calloc(y_n, sizeof(float));
-    float *y_phase = (float *)calloc(y_n, sizeof(float));
-    /* X half-spectrum: W cols × NF freqs (column FFT of grayscale). */
-    size_t x_n = (size_t)W * (size_t)NF;
-    float *x_amp   = (float *)calloc(x_n, sizeof(float));
-    float *x_phase = (float *)calloc(x_n, sizeof(float));
-    if (!y_amp || !y_phase || !x_amp || !x_phase) {
-        free(y_amp); free(y_phase); free(x_amp); free(x_phase);
+    if (sss_image_alloc(out, H, W) != 0) {
         for (int i = 0; i < ntok; ++i) free(tokens[i]);
         return -4;
     }
+    size_t HW = (size_t)H * (size_t)W;
 
+    /* Initial noise around mid-gray. */
     uint32_t rng = seed ? seed : 0xC0FFEE11u;
-
-    /* ─ Y assembly ─ */
-    for (int r = 0; r < H; ++r) {
-        for (int c = 0; c < 3; ++c) {
-            for (int k = 0; k < NF; ++k) {
-                size_t idx = ((size_t)r * NF + k) * 3 + c;
-                float amp = 0.0f, ph = 0.0f;
-                if (k < NF_LOW) {
-                    if (cc) {
-                        size_t cidx = ((size_t)r * NF_LOW + k) * 3 + c;
-                        amp = cc->amp[cidx];
-                        ph  = cc->phase[cidx];
-                    } else {
-                        amp = 0.05f * fabsf(rng_uniform(&rng));
-                        ph  = (float)M_PI * rng_uniform(&rng);
-                    }
-                    amp += 0.02f * rng_uniform(&rng);
-                    ph  += 0.05f * rng_uniform(&rng);
-                } else {
-                    int kh = k - NF_LOW;
-                    if (cf) {
-                        size_t fidx = ((size_t)r * NF_HIGH + kh) * 3 + c;
-                        amp = cf->amp[fidx] * detail;
-                        ph  = cf->phase[fidx];
-                    } else {
-                        amp = 0.01f * fabsf(rng_uniform(&rng)) * detail;
-                        ph  = (float)M_PI * rng_uniform(&rng);
-                    }
-                    amp += 0.005f * rng_uniform(&rng);
-                    ph  += 0.10f * rng_uniform(&rng);
-                }
-                if (amp < 0.0f) amp = 0.0f;
-                y_amp[idx]   = amp;
-                y_phase[idx] = ph;
-            }
-        }
+    for (size_t i = 0; i < HW * 3; ++i) {
+        out->data[i] = 0.5f + 0.20f * rng_uniform(&rng);
     }
 
-    /* ─ X assembly ─ */
-    for (int c = 0; c < W; ++c) {
-        for (int k = 0; k < NF; ++k) {
-            size_t idx = (size_t)c * NF + k;
-            float amp = 0.0f, ph = 0.0f;
-            if (cs) {
-                amp = cs->amp[idx];
-                ph  = cs->phase[idx];
-            } else {
-                amp = 0.05f * fabsf(rng_uniform(&rng));
-                ph  = (float)M_PI * rng_uniform(&rng);
-            }
-            amp += 0.02f * rng_uniform(&rng);
-            ph  += 0.05f * rng_uniform(&rng);
-            if (amp < 0.0f) amp = 0.0f;
-            x_amp[idx]   = amp;
-            x_phase[idx] = ph;
-        }
-    }
-
-    /* ─ Inverse FFT: rows for Y → RGB image ─ */
-    float *y_image = (float *)calloc((size_t)H * W * 3, sizeof(float));
-    float *row_amp   = (float *)malloc(NF * sizeof(float));
-    float *row_phase = (float *)malloc(NF * sizeof(float));
-    float *row_out   = (float *)malloc(W  * sizeof(float));
-    if (!y_image || !row_amp || !row_phase || !row_out) {
-        free(y_image); free(row_amp); free(row_phase); free(row_out);
-        free(y_amp); free(y_phase); free(x_amp); free(x_phase);
+    /* Workspaces. */
+    float *row_in    = (float *)malloc((size_t)W  * sizeof(float));
+    float *row_amp   = (float *)malloc((size_t)NF * sizeof(float));
+    float *row_phase = (float *)malloc((size_t)NF * sizeof(float));
+    float *row_out   = (float *)malloc((size_t)W  * sizeof(float));
+    float *col_in    = (float *)malloc((size_t)H  * sizeof(float));
+    float *col_amp   = (float *)malloc((size_t)NF * sizeof(float));
+    float *col_phase = (float *)malloc((size_t)NF * sizeof(float));
+    float *col_out   = (float *)malloc((size_t)H  * sizeof(float));
+    float *gray      = (float *)malloc(HW * sizeof(float));
+    float *new_gray  = (float *)malloc(HW * sizeof(float));
+    if (!row_in || !row_amp || !row_phase || !row_out
+     || !col_in || !col_amp || !col_phase || !col_out
+     || !gray   || !new_gray) {
+        free(row_in); free(row_amp); free(row_phase); free(row_out);
+        free(col_in); free(col_amp); free(col_phase); free(col_out);
+        free(gray);   free(new_gray);
         for (int i = 0; i < ntok; ++i) free(tokens[i]);
+        sss_image_free(out);
         return -5;
     }
-    for (int r = 0; r < H; ++r) {
-        for (int c = 0; c < 3; ++c) {
-            for (int k = 0; k < NF; ++k) {
-                size_t idx = ((size_t)r * NF + k) * 3 + c;
-                row_amp[k]   = y_amp[idx];
-                row_phase[k] = y_phase[idx];
-            }
-            sss_irfft(row_amp, row_phase, NF, W, row_out);
-            for (int x = 0; x < W; ++x) {
-                y_image[((size_t)r * W + x) * 3 + c] = row_out[x];
-            }
-        }
-    }
 
-    /* ─ Inverse FFT: cols for X → grayscale structure ─ */
-    float *x_struct  = (float *)calloc((size_t)H * W, sizeof(float));
-    float *col_amp   = (float *)malloc(NF * sizeof(float));
-    float *col_phase = (float *)malloc(NF * sizeof(float));
-    float *col_out   = (float *)malloc(H  * sizeof(float));
-    if (!x_struct || !col_amp || !col_phase || !col_out) {
-        free(x_struct); free(col_amp); free(col_phase); free(col_out);
-        free(y_image); free(row_amp); free(row_phase); free(row_out);
-        free(y_amp); free(y_phase); free(x_amp); free(x_phase);
-        for (int i = 0; i < ntok; ++i) free(tokens[i]);
-        return -6;
-    }
-    for (int c = 0; c < W; ++c) {
-        for (int k = 0; k < NF; ++k) {
-            size_t idx = (size_t)c * NF + k;
-            col_amp[k]   = x_amp[idx];
-            col_phase[k] = x_phase[idx];
-        }
-        sss_irfft(col_amp, col_phase, NF, H, col_out);
-        for (int y = 0; y < H; ++y) {
-            x_struct[(size_t)y * W + c] = col_out[y];
-        }
-    }
-    free(row_amp); free(row_phase); free(row_out);
-    free(col_amp); free(col_phase); free(col_out);
-    free(y_amp); free(y_phase); free(x_amp); free(x_phase);
+    for (int step = 0; step < steps; ++step) {
+        /* Cooling schedule: pull hard at the start, just nudge later. */
+        float t = (steps > 1) ? (float)step / (float)(steps - 1) : 0.0f;
+        float alpha = 0.95f - 0.65f * t;
 
-    /* Normalise x_struct to roughly [-0.5, 0.5] for use as shading. */
-    float xmin = 1e30f, xmax = -1e30f;
-    size_t HW = (size_t)H * W;
-    for (size_t i = 0; i < HW; ++i) {
-        if (x_struct[i] < xmin) xmin = x_struct[i];
-        if (x_struct[i] > xmax) xmax = x_struct[i];
-    }
-    float xrange = xmax - xmin;
-    if (xrange < 1e-6f) xrange = 1.0f;
-    for (size_t i = 0; i < HW; ++i) {
-        x_struct[i] = (x_struct[i] - xmin) / xrange - 0.5f;
-    }
-
-    /* Edge map: high-pass via 3-point Laplacian on x_struct. */
-    float *edge = (float *)calloc(HW, sizeof(float));
-    if (!edge) {
-        free(x_struct); free(y_image);
-        for (int i = 0; i < ntok; ++i) free(tokens[i]);
-        return -7;
-    }
-    for (int y = 1; y < H - 1; ++y) {
-        for (int x = 1; x < W - 1; ++x) {
-            float c  = x_struct[(size_t)y * W + x];
-            float u  = x_struct[(size_t)(y - 1) * W + x];
-            float d  = x_struct[(size_t)(y + 1) * W + x];
-            float l  = x_struct[(size_t)y * W + (x - 1)];
-            float rr = x_struct[(size_t)y * W + (x + 1)];
-            float e = fabsf(4.0f * c - u - d - l - rr);
-            edge[(size_t)y * W + x] = e;
-        }
-    }
-    /* Normalise edge to [0, 1]. */
-    float emax = 0.0f;
-    for (size_t i = 0; i < HW; ++i) if (edge[i] > emax) emax = edge[i];
-    if (emax < 1e-6f) emax = 1.0f;
-    for (size_t i = 0; i < HW; ++i) edge[i] /= emax;
-
-    /* Cross-compose: final = y_image * shade * (1 - 0.5 * edge). */
-    if (sss_image_alloc(out, H, W) != 0) {
-        free(edge); free(x_struct); free(y_image);
-        for (int i = 0; i < ntok; ++i) free(tokens[i]);
-        return -8;
-    }
-    for (int y = 0; y < H; ++y) {
-        for (int x = 0; x < W; ++x) {
-            size_t pi = (size_t)y * W + x;
-            float shade = 0.65f + 0.45f * (x_struct[pi] + 0.5f); /* roughly [0.65, 1.10] */
-            float em = 1.0f - 0.5f * edge[pi];
+        /* ── Y projection: row FFT, blend amps toward COLOR/FACE ── */
+        for (int r = 0; r < H; ++r) {
             for (int c = 0; c < 3; ++c) {
-                float v = y_image[pi * 3 + c] * shade * em;
-                /* y_image carries an arbitrary FFT scale — recentre to [0,1]. */
-                v = 0.5f + 0.5f * v;
-                if (v < 0.0f) v = 0.0f;
-                if (v > 1.0f) v = 1.0f;
-                out->data[pi * 3 + c] = v;
-            }
-        }
-    }
-    free(edge); free(x_struct); free(y_image);
-    for (int i = 0; i < ntok; ++i) free(tokens[i]);
-
-    /* ─ Latent correction: 4 passes, both axes. Damps any single
-     *   row/column that disagrees with both of its neighbours. ─ */
-    float thresh = 0.18f;
-    float *tmp = (float *)malloc(HW * 3 * sizeof(float));
-    if (!tmp) return 0;            /* image already produced; skip smoothing */
-    for (int pass = 0; pass < 4; ++pass) {
-        memcpy(tmp, out->data, HW * 3 * sizeof(float));
-        /* Row direction. */
-        for (int y = 1; y < H - 1; ++y) {
-            float du = 0.0f, dd = 0.0f;
-            for (int x = 0; x < W; ++x) {
-                for (int c = 0; c < 3; ++c) {
-                    du += fabsf(tmp[((size_t)y * W + x) * 3 + c]
-                              - tmp[((size_t)(y - 1) * W + x) * 3 + c]);
-                    dd += fabsf(tmp[((size_t)y * W + x) * 3 + c]
-                              - tmp[((size_t)(y + 1) * W + x) * 3 + c]);
-                }
-            }
-            du /= (float)(W * 3);
-            dd /= (float)(W * 3);
-            if (du > thresh && dd > thresh) {
                 for (int x = 0; x < W; ++x) {
-                    for (int c = 0; c < 3; ++c) {
-                        size_t idx = ((size_t)y * W + x) * 3 + c;
-                        out->data[idx] =
-                            0.6f * tmp[idx]
-                          + 0.2f * tmp[((size_t)(y - 1) * W + x) * 3 + c]
-                          + 0.2f * tmp[((size_t)(y + 1) * W + x) * 3 + c];
+                    row_in[x] = out->data[((size_t)r * W + x) * 3 + c];
+                }
+                sss_rfft(row_in, W, row_amp, row_phase);
+
+                for (int k = 0; k < NF; ++k) {
+                    float target;
+                    if (k < NF_LOW) {
+                        target = cc
+                            ? cc->amp[((size_t)r * NF_LOW + k) * 3 + c]
+                            : row_amp[k];
+                    } else {
+                        int kh = k - NF_LOW;
+                        target = cf
+                            ? cf->amp[((size_t)r * NF_HIGH + kh) * 3 + c] * detail
+                            : row_amp[k] * 0.5f;
                     }
+                    row_amp[k] = alpha * target + (1.0f - alpha) * row_amp[k];
+                }
+                sss_irfft(row_amp, row_phase, NF, W, row_out);
+
+                for (int x = 0; x < W; ++x) {
+                    out->data[((size_t)r * W + x) * 3 + c] = row_out[x];
                 }
             }
         }
-        memcpy(tmp, out->data, HW * 3 * sizeof(float));
-        /* Column direction. */
-        for (int x = 1; x < W - 1; ++x) {
-            float dl = 0.0f, dr = 0.0f;
+        for (size_t i = 0; i < HW * 3; ++i) {
+            if (out->data[i] < 0.0f) out->data[i] = 0.0f;
+            else if (out->data[i] > 1.0f) out->data[i] = 1.0f;
+        }
+
+        /* ── X projection: column FFT of grayscale, blend toward SHAPE,
+         *    then transfer the structural delta back to RGB ── */
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                size_t pi = (size_t)y * W + x;
+                gray[pi] = (out->data[pi * 3 + 0]
+                          + out->data[pi * 3 + 1]
+                          + out->data[pi * 3 + 2]) * (1.0f / 3.0f);
+            }
+        }
+        memcpy(new_gray, gray, HW * sizeof(float));
+
+        for (int x = 0; x < W; ++x) {
             for (int y = 0; y < H; ++y) {
-                for (int c = 0; c < 3; ++c) {
-                    dl += fabsf(tmp[((size_t)y * W + x) * 3 + c]
-                              - tmp[((size_t)y * W + (x - 1)) * 3 + c]);
-                    dr += fabsf(tmp[((size_t)y * W + x) * 3 + c]
-                              - tmp[((size_t)y * W + (x + 1)) * 3 + c]);
-                }
+                col_in[y] = gray[(size_t)y * W + x];
             }
-            dl /= (float)(H * 3);
-            dr /= (float)(H * 3);
-            if (dl > thresh && dr > thresh) {
-                for (int y = 0; y < H; ++y) {
-                    for (int c = 0; c < 3; ++c) {
-                        size_t idx = ((size_t)y * W + x) * 3 + c;
-                        out->data[idx] =
-                            0.6f * tmp[idx]
-                          + 0.2f * tmp[((size_t)y * W + (x - 1)) * 3 + c]
-                          + 0.2f * tmp[((size_t)y * W + (x + 1)) * 3 + c];
-                    }
-                }
+            sss_rfft(col_in, H, col_amp, col_phase);
+
+            for (int k = 0; k < NF; ++k) {
+                float target = cs
+                    ? cs->amp[(size_t)x * NF + k]
+                    : col_amp[k];
+                col_amp[k] = alpha * target + (1.0f - alpha) * col_amp[k];
             }
+            sss_irfft(col_amp, col_phase, NF, H, col_out);
+
+            for (int y = 0; y < H; ++y) {
+                new_gray[(size_t)y * W + x] = col_out[y];
+            }
+        }
+        for (int y = 0; y < H; ++y) {
+            for (int x = 0; x < W; ++x) {
+                size_t pi = (size_t)y * W + x;
+                float delta = new_gray[pi] - gray[pi];
+                /* 0.7 — partial luminance transfer keeps chroma alive. */
+                out->data[pi * 3 + 0] += delta * 0.7f;
+                out->data[pi * 3 + 1] += delta * 0.7f;
+                out->data[pi * 3 + 2] += delta * 0.7f;
+            }
+        }
+        for (size_t i = 0; i < HW * 3; ++i) {
+            if (out->data[i] < 0.0f) out->data[i] = 0.0f;
+            else if (out->data[i] > 1.0f) out->data[i] = 1.0f;
         }
     }
-    free(tmp);
+
+    free(row_in); free(row_amp); free(row_phase); free(row_out);
+    free(col_in); free(col_amp); free(col_phase); free(col_out);
+    free(gray);   free(new_gray);
+    for (int i = 0; i < ntok; ++i) free(tokens[i]);
     return 0;
 }

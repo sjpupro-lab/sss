@@ -68,6 +68,11 @@ void sss_model_free(SSSModel *m);
  * match threshold. */
 int  sss_search(const SSSModel *m, uint32_t type, const float *fp);
 
+/* Forward real FFT: rebuilds the (amp[0..nf-1], phase[0..nf-1])
+ * half-spectrum of an N-length real signal x. Matches numpy.fft.rfft
+ * convention (no scaling on the forward pass). nf must equal N/2+1. */
+void sss_rfft(const float *x, int N, float *amp, float *phase);
+
 /* Real inverse FFT: rebuilds an N-length real signal from the
  * (amp[0..nf-1], phase[0..nf-1]) half-spectrum produced by a real
  * FFT (numpy.fft.rfft). Implemented from scratch — no external
@@ -79,14 +84,24 @@ int  sss_image_alloc(SSSImage *img, int h, int w);
 void sss_image_free(SSSImage *img);
 int  sss_image_save_ppm(const SSSImage *img, const char *path);
 
-/* End-to-end generation. `prompt` is split on whitespace into
- * morphemes; each morpheme is matched against COLOR/SHAPE/FACE
- * cells. `seed` controls the noise PRNG. `detail` scales the
- * high-frequency contribution (1.0 = neutral, >1 = sharper). */
+/* End-to-end iterative generation:
+ *
+ *     image = noise
+ *     for step in range(steps):
+ *         measure  = rfft(image)
+ *         error    = target - measure
+ *         image    = irfft(measure + α(step) * error)
+ *
+ * The model's COLOR/SHAPE/FACE cells supply the targets, the prompt
+ * picks the cells via 256-grid fingerprint, `seed` initialises the
+ * noise PRNG (xorshift32), `detail` scales the high-frequency target,
+ * and `steps` controls how many refinement passes run (0 = engine
+ * default of 24). */
 int  sss_generate(const SSSModel *m,
                   const char     *prompt,
                   uint32_t        seed,
                   float           detail,
+                  int             steps,
                   SSSImage       *out);
 
 #ifdef __cplusplus

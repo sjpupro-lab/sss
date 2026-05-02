@@ -478,11 +478,23 @@ generate under 0.1 s.
 
 A second image path that stores **how to draw**, not pixels. For each
 morpheme it keeps the row/column FFT amplitudes (a spectrogram) of the
-training images that wore that label. Generation starts from noise,
-pulls three cells out of the model by 256-grid fingerprint
-(`COLOR` / `SHAPE` / `FACE`), assembles a Y and an X half-spectrum,
-inverse-FFTs both, cross-composes them, and runs four passes of
-row/column smoothing.
+training images that wore that label, and the runtime reaches the
+finished image by **iterating** noise → measure-error → fix:
+
+```
+image = noise
+for step in range(steps):
+    measured  = rfft(image)              # what does the image look like now?
+    error     = target_amp − measured    # where does it disagree with the cell?
+    image     = irfft(measured + α·error, current_phase)   # nudge toward target
+```
+
+That's the same Gerchberg–Saxton structure that recovers images from
+amplitude-only spectra. α decays linearly from 0.95 down to 0.30 across
+the schedule, so early passes pull hard toward the target spectrogram
+and later passes only nudge. Phases are never written directly — they
+evolve through the projections, which is what gives the same prompt
+genuinely different output for different seeds.
 
 | Cell type | Source       | What it stores                                      |
 | --------- | ------------ | --------------------------------------------------- |
@@ -490,9 +502,9 @@ row/column smoothing.
 | `FACE`    | Y, high band | per-row, high-frequency amplitude per RGB channel   |
 | `SHAPE`   | X, full band | per-column amplitude of the grayscale silhouette    |
 
-The C runtime ships its own real inverse FFT (no FFTW / no numpy at
-runtime) and uses an `xorshift32` PRNG so any `(seed, prompt)` pair is
-reproducible.
+The C runtime ships its own real forward and inverse FFT (`sss_rfft`,
+`sss_irfft`) — no FFTW, no numpy at runtime — and uses an `xorshift32`
+PRNG so any `(seed, prompt, steps)` triple is reproducible.
 
 ### 1k synthetic-corpus run (3 colors × 3 shapes × 2 faces × 56 variants = 1008 images)
 
@@ -504,26 +516,27 @@ python3 scripts/sss_train.py \
     --out    build/models/demo1k.sss \
     --size   64
 make build/sss_gen
-./build/sss_gen build/models/demo1k.sss "red circle smile draw" out.ppm 1 1.0
+./build/sss_gen build/models/demo1k.sss "red circle smile draw" out.ppm 1 1.0 24
 ```
 
-Training 1008 images takes **0.95 s** on a single core. Verification of
-the spec's three test criteria on the resulting model:
+Training 1008 images takes **0.95 s** on a single core. Iterative
+generation (24 steps, 64×64) takes **~0.29 s** per image. Verification
+of the spec's three test criteria on the resulting model:
 
 ```
 == Test 4: color isolation (circle+smile fixed) ==
-  red    R=0.926  G=0.840  B=0.840   →  R−B = +0.086
-  green  R=0.840  G=0.913  B=0.850   →  G−R = +0.073
-  blue   R=0.838  G=0.850  B=0.922   →  B−R = +0.083
+  red    R=0.939  G=0.729  B=0.728   →  R−B = +0.211
+  green  R=0.731  G=0.909  B=0.753   →  G−R = +0.179
+  blue   R=0.725  G=0.751  B=0.930   →  B−R = +0.205
 
 == Test 5: shape isolation (red+smile fixed) ==
-  red+circle vs red+square    pixel diff = 0.0274
-  red+circle vs red+triangle  pixel diff = 0.0254
-  red+square vs red+triangle  pixel diff = 0.0302
+  red+circle vs red+square    pixel diff = 0.0483
+  red+circle vs red+triangle  pixel diff = 0.0521
+  red+square vs red+triangle  pixel diff = 0.0714
 
 == Test 3: seed-driven variation (same prompt) ==
-  seed1 vs seed42    diff = 0.0034
-  seed1 vs seed2026  diff = 0.0033
+  seed1 vs seed42    diff = 0.1059
+  seed1 vs seed2026  diff = 0.1091
 
 == Compression / storage ==
   dataset (1008 PPMs):    12108.8 KB
@@ -531,10 +544,12 @@ the spec's three test criteria on the resulting model:
   ratio: 69.9× (target was ≥3×)
 ```
 
-Color tokens route to the right RGB channel, distinct shape tokens
-shift the output by a measurable margin, the seed perturbs detail
-without breaking colour or silhouette, and the model is **70× smaller
-than the dataset** because only per-label spectrogram means are kept.
+Versus the earlier single-pass spectrogram bake the iterative loop
+**~2.5× sharpens colour isolation** (R−B for red goes from +0.086 to
++0.211), **~2× sharpens shape isolation**, and **~30× increases
+seed-driven variation** (0.003 → 0.11) because the final phase comes
+from the seeded noise, not from a stored reference. The model itself
+is unchanged: 70× compression versus the source corpus.
 
 ### Sample renders (8 prompts, model trained on 1008 images)
 
@@ -543,16 +558,25 @@ than the dataset** because only per-label spectrogram means are kept.
 Top row, left → right: `red circle smile`, `blue circle smile`,
 `green circle smile`, `red square smile`. Bottom row:
 `blue square sad`, `red triangle sad`, `blue triangle smile`,
-`green triangle smile`. All four images are generated from the same
+`green triangle smile`. All eight images are generated from the same
 173 KB `.sss` file with the prompt as the only input.
+
+### Convergence trace — same prompt, growing step budget
+
+![convergence row](docs/sss_assets/convergence.png)
+
+Prompt: `red circle smile draw` with `steps = 1, 4, 8, 16, 24, 48`. The
+mean colour locks in by step ~4 (`R = 0.93±0.005` from there onward);
+the remaining iterations rearrange high-frequency detail without
+disturbing the channel means.
 
 ### Same prompt, four seeds — variation without label drift
 
 ![seed variation row](docs/sss_assets/seed_variation.png)
 
 Prompt: `red circle smile draw` with `seed = 1, 2, 3, 4`. The colour
-remains red, the silhouette remains a circle, but high-frequency detail
-shifts because the engine jitters the FACE-band phase per seed.
+remains red, the silhouette remains a circle, but the noise-driven
+phases give every seed a different texture (~0.11 mean pixel diff).
 
 ---
 
