@@ -141,16 +141,6 @@ static uint32_t rng_next(uint32_t *s)
     return x;
 }
 
-/* Fisher–Yates shuffle of `n` indices, deterministic per seed. */
-static void rng_shuffle(int *idx, int n, uint32_t *s)
-{
-    for (int i = n - 1; i > 0; --i) {
-        uint32_t r = rng_next(s);
-        int j = (int)(r % (uint32_t)(i + 1));
-        int tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
-    }
-}
-
 /* ── Generation ─────────────────────────────────────────────── */
 
 static int is_command_word(const char *t)
@@ -232,9 +222,11 @@ static inline const float *cell_row(const SSSCell *c, int H, int W,
 
 /* face_detail = high-frequency residual of a face row, mean-zero,
  * computed from the average of all face candidates at this row.
- * Stored in `out` (length W*3). */
+ * Stored in `out` (length W*3). `scratch` is a caller-supplied
+ * buffer of the same length, reused across rows so we don't
+ * malloc/free inside the per-row generation loop. */
 static void build_face_detail(const SSSCell *cf, int H, int W, int r,
-                              float *out)
+                              float *out, float *scratch)
 {
     if (!cf || cf->num_imgs == 0) {
         memset(out, 0, (size_t)W * 3 * sizeof(float));
@@ -253,11 +245,6 @@ static void build_face_detail(const SSSCell *cf, int H, int W, int r,
     /* High-pass: subtract a 1-D box blur (radius 2) along the row,
      * channel-wise, so the residual is mean-zero locally. */
     float buf[3];
-    float *tmp = (float *)malloc((size_t)W * 3 * sizeof(float));
-    if (!tmp) {
-        for (int x = 0; x < W * 3; ++x) avg[x] = 0.0f;
-        return;
-    }
     for (int x = 0; x < W; ++x) {
         buf[0] = buf[1] = buf[2] = 0.0f;
         int cnt = 0;
@@ -270,12 +257,11 @@ static void build_face_detail(const SSSCell *cf, int H, int W, int r,
             ++cnt;
         }
         float inv_c = cnt > 0 ? 1.0f / (float)cnt : 0.0f;
-        tmp[x * 3 + 0] = buf[0] * inv_c;
-        tmp[x * 3 + 1] = buf[1] * inv_c;
-        tmp[x * 3 + 2] = buf[2] * inv_c;
+        scratch[x * 3 + 0] = buf[0] * inv_c;
+        scratch[x * 3 + 1] = buf[1] * inv_c;
+        scratch[x * 3 + 2] = buf[2] * inv_c;
     }
-    for (int x = 0; x < W * 3; ++x) avg[x] -= tmp[x];   /* residual */
-    free(tmp);
+    for (int x = 0; x < W * 3; ++x) avg[x] -= scratch[x];   /* residual */
 }
 
 int sss_generate(const SSSModel *m,
@@ -303,34 +289,50 @@ int sss_generate(const SSSModel *m,
     const SSSCell *cs = (is_ >= 0) ? &m->cells[is_] : NULL;
     const SSSCell *cf = (ifc >= 0) ? &m->cells[ifc] : NULL;
 
-    int nc = (cc && cc->num_imgs > 0) ? (int)cc->num_imgs : 0;
-    int ns = (cs && cs->num_imgs > 0) ? (int)cs->num_imgs : 0;
-    if (nc > MAX_CANDS) nc = MAX_CANDS;
-    if (ns > MAX_CANDS) ns = MAX_CANDS;
+    int total_c = (cc && cc->num_imgs > 0) ? (int)cc->num_imgs : 0;
+    int total_s = (cs && cs->num_imgs > 0) ? (int)cs->num_imgs : 0;
+    int nc = total_c > MAX_CANDS ? MAX_CANDS : total_c;
+    int ns = total_s > MAX_CANDS ? MAX_CANDS : total_s;
 
     uint32_t rng = seed ? seed : 0xC0FFEE11u;
 
-    /* Seed-driven candidate ordering: shuffle the index lists so that
-     * later rows still see the same pool but ties at row 0 break
-     * differently from one seed to the next. */
+    /* Seed-driven candidate ordering: pick a uniform random sample of
+     * up to MAX_CANDS indices from each pool. The full index list
+     * lives on the heap (so a malformed model with thousands of
+     * images per cell can't blow the stack), and a partial Fisher–
+     * Yates writes only nc/ns positions before we copy them into the
+     * fixed-size c_idx/s_idx working sets. */
     int c_idx[MAX_CANDS], s_idx[MAX_CANDS];
-    int total_c = (cc && cc->num_imgs > 0) ? (int)cc->num_imgs : 0;
-    int total_s = (cs && cs->num_imgs > 0) ? (int)cs->num_imgs : 0;
-    int pool_c[MAX_CANDS], pool_s[MAX_CANDS];
-    for (int i = 0; i < total_c; ++i) pool_c[i] = i;
-    for (int i = 0; i < total_s; ++i) pool_s[i] = i;
-    if (total_c > MAX_CANDS) {
-        rng_shuffle(pool_c, total_c, &rng);
-    } else if (total_c > 1) {
-        rng_shuffle(pool_c, total_c, &rng);
+    int *full_c = NULL, *full_s = NULL;
+    if (total_c > 0) {
+        full_c = (int *)malloc((size_t)total_c * sizeof(int));
+        if (!full_c) {
+            for (int i = 0; i < ntok; ++i) free(tokens[i]);
+            return -7;
+        }
+        for (int i = 0; i < total_c; ++i) full_c[i] = i;
+        for (int i = 0; i < nc; ++i) {
+            int j = i + (int)(rng_next(&rng) % (uint32_t)(total_c - i));
+            int tmp = full_c[i]; full_c[i] = full_c[j]; full_c[j] = tmp;
+            c_idx[i] = full_c[i];
+        }
     }
-    if (total_s > MAX_CANDS) {
-        rng_shuffle(pool_s, total_s, &rng);
-    } else if (total_s > 1) {
-        rng_shuffle(pool_s, total_s, &rng);
+    if (total_s > 0) {
+        full_s = (int *)malloc((size_t)total_s * sizeof(int));
+        if (!full_s) {
+            free(full_c);
+            for (int i = 0; i < ntok; ++i) free(tokens[i]);
+            return -7;
+        }
+        for (int i = 0; i < total_s; ++i) full_s[i] = i;
+        for (int i = 0; i < ns; ++i) {
+            int j = i + (int)(rng_next(&rng) % (uint32_t)(total_s - i));
+            int tmp = full_s[i]; full_s[i] = full_s[j]; full_s[j] = tmp;
+            s_idx[i] = full_s[i];
+        }
     }
-    for (int i = 0; i < nc; ++i) c_idx[i] = pool_c[i];
-    for (int i = 0; i < ns; ++i) s_idx[i] = pool_s[i];
+    free(full_c);
+    free(full_s);
 
     /* Cumulative scores (one per candidate). */
     float c_scores[MAX_CANDS];
@@ -348,9 +350,10 @@ int sss_generate(const SSSModel *m,
 
     float *prev_row    = (float *)malloc((size_t)W * 3 * sizeof(float));
     float *face_detail = (float *)malloc((size_t)W * 3 * sizeof(float));
+    float *face_scratch = (float *)malloc((size_t)W * 3 * sizeof(float));
     float *out_row     = (float *)malloc((size_t)W * 3 * sizeof(float));
-    if (!prev_row || !face_detail || !out_row) {
-        free(prev_row); free(face_detail); free(out_row);
+    if (!prev_row || !face_detail || !face_scratch || !out_row) {
+        free(prev_row); free(face_detail); free(face_scratch); free(out_row);
         sss_image_free(out);
         for (int i = 0; i < ntok; ++i) free(tokens[i]);
         return -5;
@@ -362,7 +365,7 @@ int sss_generate(const SSSModel *m,
      * "candidate" row so the loop still produces sensible output. */
     float *fallback = (float *)malloc((size_t)W * 3 * sizeof(float));
     if (!fallback) {
-        free(prev_row); free(face_detail); free(out_row);
+        free(prev_row); free(face_detail); free(face_scratch); free(out_row);
         sss_image_free(out);
         for (int i = 0; i < ntok; ++i) free(tokens[i]);
         return -6;
@@ -371,7 +374,7 @@ int sss_generate(const SSSModel *m,
 
     for (int r = 0; r < H; ++r) {
         /* Build face detail row (zeros if no face cell). */
-        build_face_detail(cf, H, W, r, face_detail);
+        build_face_detail(cf, H, W, r, face_detail, face_scratch);
 
         /* ── Pick the best (color, shape) pair for this row ── */
         const float *best_color_row = NULL;
@@ -463,6 +466,7 @@ int sss_generate(const SSSModel *m,
 
     free(prev_row);
     free(face_detail);
+    free(face_scratch);
     free(out_row);
     free(fallback);
     for (int i = 0; i < ntok; ++i) free(tokens[i]);

@@ -23,9 +23,18 @@
  */
 #include "sss_rowvae.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Hard caps used to reject obviously malformed or hostile model files
+ * before we trust their length fields for allocation. The numbers are
+ * deliberately generous (the canonical sculpt resolution is 64) but
+ * still well below sizes that would overflow a 32-bit count. */
+#define SSS_MAX_DIM         1024u
+#define SSS_MAX_CELLS       4096u
+#define SSS_MAX_IMGS_CELL    256u
 
 static int read_u32(FILE *f, uint32_t *v)
 {
@@ -62,6 +71,11 @@ int sss_model_load(const char *path, SSSModel *out)
     if (out->channels != 3) {
         fclose(f); return -5;
     }
+    if (out->height == 0 || out->height > SSS_MAX_DIM
+     || out->width  == 0 || out->width  > SSS_MAX_DIM
+     || out->num_cells > SSS_MAX_CELLS) {
+        fclose(f); return -5;
+    }
 
     if (out->num_cells == 0) {
         fclose(f);
@@ -71,6 +85,8 @@ int sss_model_load(const char *path, SSSModel *out)
     out->cells = (SSSCell *)calloc(out->num_cells, sizeof(SSSCell));
     if (!out->cells) { fclose(f); return -6; }
 
+    /* height/width/channels are bounded above; this product cannot
+     * overflow size_t on any supported platform. */
     size_t pixels_per_img = (size_t)out->height * (size_t)out->width
                           * (size_t)out->channels;
 
@@ -109,11 +125,22 @@ int sss_model_load(const char *path, SSSModel *out)
         if (read_u32(f, &c->num_imgs)) {
             fclose(f); sss_model_free(out); return -10;
         }
+        if (c->num_imgs > SSS_MAX_IMGS_CELL) {
+            fclose(f); sss_model_free(out); return -11;
+        }
         if (c->num_imgs > 0) {
+            /* Reject any (num_imgs * pixels_per_img * sizeof(float))
+             * that would overflow size_t. With both factors clamped
+             * above this can't happen for legitimate files; the check
+             * is here so a corrupted on-disk count never reaches
+             * malloc with an under-sized request. */
+            if (pixels_per_img > SIZE_MAX / sizeof(float) / c->num_imgs) {
+                fclose(f); sss_model_free(out); return -12;
+            }
             size_t total = (size_t)c->num_imgs * pixels_per_img;
             c->imgs = (float *)malloc(total * sizeof(float));
             if (!c->imgs || read_floats(f, c->imgs, total)) {
-                fclose(f); sss_model_free(out); return -11;
+                fclose(f); sss_model_free(out); return -13;
             }
         }
     }
