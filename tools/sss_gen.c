@@ -5,11 +5,15 @@
  * Loads a v8 .sss model (produced by scripts/sss_train.py) and runs
  * the iterative noise → measure-error → fix → repeat loop until the
  * image matches the cell spectrograms picked by the prompt. Writes a
- * PPM. seed defaults to 1, detail to 1.0, steps to the engine default
- * (24).
+ * PPM. seed defaults to 1, detail to 1.0, steps to 24.
+ *
+ * Numeric arguments are parsed strictly (no `atoi`/`atof` silent-zero
+ * fallback): a typo or empty value fails fast so reproducibility is
+ * never quietly compromised.
  */
 #include "sss_rowvae.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,9 +23,45 @@ static void usage(const char *argv0)
     fprintf(stderr,
         "usage: %s MODEL.sss PROMPT OUT.ppm [seed] [detail] [steps]\n"
         "  seed    default 1     (any unsigned int; controls noise variation)\n"
-        "  detail  default 1.0   (>1 = sharper high-frequency contribution)\n"
-        "  steps   default 24    (refinement iterations)\n",
+        "  detail  default 1.0   (>0; >1 = sharper high-frequency contribution)\n"
+        "  steps   default 24    (positive int; refinement iterations)\n",
         argv0);
+}
+
+/* All three return 0 on success. The CLI fails loudly on bad input
+ * instead of silently falling back to defaults. */
+
+static int parse_uint_strict(const char *s, uint32_t *out)
+{
+    if (!s || !*s) return -1;
+    errno = 0;
+    char *endp = NULL;
+    unsigned long v = strtoul(s, &endp, 0);
+    if (errno != 0 || !endp || *endp != '\0' || v > 0xFFFFFFFFul) return -1;
+    *out = (uint32_t)v;
+    return 0;
+}
+
+static int parse_pos_int_strict(const char *s, int *out)
+{
+    if (!s || !*s) return -1;
+    errno = 0;
+    char *endp = NULL;
+    long v = strtol(s, &endp, 10);
+    if (errno != 0 || !endp || *endp != '\0' || v <= 0 || v > 100000) return -1;
+    *out = (int)v;
+    return 0;
+}
+
+static int parse_pos_float_strict(const char *s, float *out)
+{
+    if (!s || !*s) return -1;
+    errno = 0;
+    char *endp = NULL;
+    double v = strtod(s, &endp);
+    if (errno != 0 || !endp || *endp != '\0' || !(v > 0.0)) return -1;
+    *out = (float)v;
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -31,9 +71,22 @@ int main(int argc, char **argv)
     const char *model_path = argv[1];
     const char *prompt     = argv[2];
     const char *out_path   = argv[3];
-    uint32_t seed   = (argc >= 5) ? (uint32_t)strtoul(argv[4], NULL, 0) : 1u;
-    float    detail = (argc >= 6) ? (float)atof(argv[5]) : 1.0f;
-    int      steps  = (argc >= 7) ? atoi(argv[6])         : 24;
+    uint32_t seed   = 1u;
+    float    detail = 1.0f;
+    int      steps  = 24;
+
+    if (argc >= 5 && parse_uint_strict(argv[4], &seed) != 0) {
+        fprintf(stderr, "invalid seed: '%s' (expected unsigned int)\n", argv[4]);
+        return 1;
+    }
+    if (argc >= 6 && parse_pos_float_strict(argv[5], &detail) != 0) {
+        fprintf(stderr, "invalid detail: '%s' (expected positive number)\n", argv[5]);
+        return 1;
+    }
+    if (argc >= 7 && parse_pos_int_strict(argv[6], &steps) != 0) {
+        fprintf(stderr, "invalid steps: '%s' (expected positive int)\n", argv[6]);
+        return 1;
+    }
 
     SSSModel m;
     int rc = sss_model_load(model_path, &m);

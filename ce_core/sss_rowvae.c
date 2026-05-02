@@ -347,9 +347,14 @@ int sss_generate(const SSSModel *m,
                             : row_amp[k];
                     } else {
                         int kh = k - NF_LOW;
+                        /* No FACE match → leave the high band where it is.
+                         * (A `* 0.5f` factor here would compound across the
+                         * schedule and drive every iteration's high-freq
+                         * energy toward zero, making FACE de-facto required
+                         * for sharp output.) */
                         target = cf
                             ? cf->amp[((size_t)r * NF_HIGH + kh) * 3 + c] * detail
-                            : row_amp[k] * 0.5f;
+                            : row_amp[k];
                     }
                     row_amp[k] = alpha * target + (1.0f - alpha) * row_amp[k];
                 }
