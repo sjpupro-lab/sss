@@ -1,35 +1,46 @@
 #!/bin/bash
-# SSS Forge UI launcher: ensures binaries + demo model exist, then starts the
-# Python bridge server.
-#
-# Usage:  ./ui/start.sh [port]            # default port 8080, binds 127.0.0.1
-#         HOST=0.0.0.0 ./ui/start.sh 8080 # explicitly expose to LAN
-set -e
-cd "$(dirname "$0")/.."
-PORT=${1:-8080}
-HOST=${HOST:-127.0.0.1}
+# SSS Forge UI — Termux 원커맨드 런처
+# Usage: ./ui/start.sh [port]
 
-# Validate the port up front so a typo gives a clear error before we build.
-if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-    echo "[start.sh] error: invalid port '$PORT' (must be an integer 1..65535)" >&2
-    exit 2
+set -e
+cd "$(dirname "$0")/.."  # cd to sss/ root
+
+PORT=${1:-8080}
+
+echo "╔═══════════════════════════════════════╗"
+echo "║          SSS Forge Launcher           ║"
+echo "╚═══════════════════════════════════════╝"
+echo ""
+
+# ── 1. 빌드 확인 ──────────────────────────────
+if [ ! -f build/gen_image_ce ] || [ ! -f build/train_demo ] || [ ! -f build/chat ]; then
+    echo "[1/3] Building SSS engine..."
+    make all
+    make demo_tools
+    make chat
+    make stream
+    echo "      Build complete."
+else
+    echo "[1/3] Engine binaries found."
 fi
 
-# 1. Build (always — make is incremental, so this is cheap when up to date and
-#    avoids serving a stale binary if sources changed since the last build).
-echo "[start.sh] running incremental build…"
-make all
-make demo_tools
-make chat
-make stream
-
-# 2. Make sure there is a demo model to play with.
+# ── 2. 데모 모델 확인 ─────────────────────────
 mkdir -p build/models
 if [ ! -f build/models/demo.ces ]; then
-    echo "[start.sh] training demo model from data/demo …"
+    echo "[2/3] Training demo model..."
     ./build/train_demo data/demo build/models/demo
+    echo "      Demo model ready."
+else
+    echo "[2/3] Demo model found."
 fi
 
-# 3. Launch the UI server.
-echo "[start.sh] launching UI on http://${HOST}:${PORT}"
-exec python3 ui/server.py "$PORT" --host "$HOST"
+# ── 3. 서버 시작 ──────────────────────────────
+echo "[3/3] Starting server on port $PORT..."
+echo ""
+echo "  Open in browser:"
+echo "    http://localhost:$PORT"
+echo ""
+echo "  Press Ctrl+C to stop."
+echo ""
+
+python3 ui/server.py $PORT

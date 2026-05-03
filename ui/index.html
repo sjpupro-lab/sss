@@ -1,1265 +1,1140 @@
-<!doctype html>
-<html lang="en">
+<!DOCTYPE html>
+<html lang="ko">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>SSS Forge</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Noto+Sans+KR:wght@400;500;700&display=swap');
+
   :root {
-    --bg:        #0C0C0C;
-    --surface:   #161616;
-    --surface-2: #1d1d1d;
-    --border:    #2A2A2A;
-    --border-hi: #3a3a3a;
-    --fg:        #e6e6e6;
-    --fg-dim:    #888;
-    --fg-muted:  #555;
-    --accent:    #FF6B2B;
-    --accent-2:  #00E5FF;
-    --ok:        #4ADE80;
-    --warn:      #FBBF24;
-    --err:       #F87171;
-    --mono:      "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
-    --sans:      "Noto Sans KR", system-ui, -apple-system, sans-serif;
+    --bg: #0C0C0C;
+    --surface: #161616;
+    --surface2: #1E1E1E;
+    --border: #2A2A2A;
+    --border-active: #444;
+    --text: #A0A0A0;
+    --text-bright: #E8E8E8;
+    --accent: #FF6B2B;
+    --accent-dim: #FF6B2B22;
+    --accent2: #00E5FF;
+    --accent2-dim: #00E5FF22;
+    --green: #4ADE80;
+    --yellow: #FBBF24;
+    --red: #F87171;
+    --mono: 'JetBrains Mono', 'Courier New', monospace;
+    --sans: 'Noto Sans KR', sans-serif;
+    --radius: 10px;
   }
-  * { box-sizing: border-box; }
-  html, body {
-    margin: 0; padding: 0; background: var(--bg); color: var(--fg);
-    font-family: var(--mono); font-size: 14px; line-height: 1.45;
-    -webkit-font-smoothing: antialiased;
-  }
-  body { min-height: 100vh; }
 
-  /* ── header ──────────────────────────────────────────────────────────── */
-  header {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 14px 18px; border-bottom: 1px solid var(--border);
-    background: linear-gradient(180deg, #161616 0%, #0c0c0c 100%);
-    position: sticky; top: 0; z-index: 10;
-  }
-  header h1 {
-    margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 0.02em;
-  }
-  header h1 .accent { color: var(--accent); }
-  header .meta { color: var(--fg-dim); font-size: 11px; }
-  header .meta .dot { display: inline-block; width: 7px; height: 7px;
-    border-radius: 50%; background: var(--ok); margin: 0 6px 0 4px;
-    box-shadow: 0 0 6px var(--ok);
-  }
-  header .meta.bad .dot { background: var(--err); box-shadow: 0 0 6px var(--err); }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
 
-  /* ── tab bar ─────────────────────────────────────────────────────────── */
-  nav.tabs {
-    display: flex; overflow-x: auto; border-bottom: 1px solid var(--border);
+  body {
+    font-family: var(--mono);
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    overflow-x: hidden;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* ── Header ─────────────────────────────── */
+  .header {
+    padding: 14px 16px 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .header-title {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--text-bright);
+    letter-spacing: -0.5px;
+  }
+  .header-title span { color: var(--accent); }
+  .header-status {
+    font-size: 9px;
+    color: var(--green);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .header-status::before {
+    content: '';
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  /* ── Tabs ────────────────────────────────── */
+  .tabs {
+    display: flex;
+    gap: 2px;
+    padding: 12px 16px 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab {
+    padding: 8px 14px;
+    font-size: 11px;
+    font-weight: 600;
+    font-family: var(--mono);
+    color: var(--text);
+    background: transparent;
+    border: 1px solid transparent;
+    border-bottom: none;
+    border-radius: 8px 8px 0 0;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.15s;
+  }
+  .tab:hover { color: var(--text-bright); }
+  .tab.active {
+    color: var(--accent);
     background: var(--surface);
-    -webkit-overflow-scrolling: touch;
+    border-color: var(--border);
   }
-  nav.tabs button {
-    background: transparent; color: var(--fg-dim); border: none;
-    padding: 12px 18px; font-family: var(--mono); font-size: 13px;
-    cursor: pointer; white-space: nowrap; border-bottom: 2px solid transparent;
-    text-transform: uppercase; letter-spacing: 0.06em;
-  }
-  nav.tabs button.active {
-    color: var(--accent); border-bottom-color: var(--accent);
-    background: rgba(255, 107, 43, 0.06);
-  }
-  nav.tabs button:hover:not(.active) { color: var(--fg); }
 
-  main { padding: 16px; max-width: 1200px; margin: 0 auto; }
-  .panel { display: none; }
+  /* ── Content area ───────────────────────── */
+  .content {
+    margin: 0 16px 16px;
+    border: 1px solid var(--border);
+    border-radius: 0 var(--radius) var(--radius) var(--radius);
+    background: var(--surface);
+    min-height: 70vh;
+    overflow: hidden;
+  }
+
+  .panel { display: none; padding: 16px; }
   .panel.active { display: block; }
 
-  /* ── form atoms ──────────────────────────────────────────────────────── */
-  .row { display: flex; gap: 10px; flex-wrap: wrap; }
-  .row > * { flex: 1 1 auto; min-width: 0; }
-  label {
-    display: block; font-size: 11px; color: var(--fg-dim);
-    text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 4px;
-  }
-  input[type=text], input[type=number], select, textarea {
-    width: 100%; background: var(--surface); color: var(--fg);
-    border: 1px solid var(--border); padding: 10px 12px;
-    font-family: var(--mono); font-size: 13px; border-radius: 4px;
-  }
-  input[type=text]:focus, textarea:focus {
-    outline: none; border-color: var(--accent);
-  }
-  textarea { resize: vertical; min-height: 60px; }
-  .slider-wrap {
-    display: flex; align-items: center; gap: 8px;
-  }
-  .slider-wrap input[type=range] {
-    flex: 1; accent-color: var(--accent);
-  }
-  .slider-wrap .val {
-    min-width: 48px; text-align: right; color: var(--accent);
-    font-weight: 700; font-size: 12px;
-  }
-
-  button.primary, button.ghost, button.icon {
-    font-family: var(--mono); cursor: pointer; font-size: 13px;
-    padding: 10px 18px; border-radius: 4px; border: 1px solid var(--border);
-    background: var(--surface); color: var(--fg); letter-spacing: 0.04em;
-  }
-  button.primary {
-    background: var(--accent); color: #111; border-color: var(--accent);
-    font-weight: 700; text-transform: uppercase;
-  }
-  button.primary:hover { filter: brightness(1.1); }
-  button.ghost:hover { border-color: var(--border-hi); color: var(--accent); }
-  button:disabled { opacity: 0.4; cursor: not-allowed; }
-
-  .toggle {
-    display: inline-flex; align-items: center; gap: 8px; cursor: pointer;
-    user-select: none;
-  }
-  .toggle input { display: none; }
-  .toggle .switch {
-    width: 36px; height: 20px; background: var(--border);
-    border-radius: 12px; position: relative; transition: 0.15s;
-  }
-  .toggle .switch::after {
-    content: ""; position: absolute; top: 2px; left: 2px;
-    width: 16px; height: 16px; border-radius: 50%; background: var(--fg);
-    transition: 0.15s;
-  }
-  .toggle input:checked + .switch { background: var(--accent); }
-  .toggle input:checked + .switch::after { left: 18px; background: #fff; }
-
-  /* ── card ────────────────────────────────────────────────────────────── */
-  .card {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 6px; padding: 14px; margin-bottom: 14px;
-  }
-  .card h3 {
-    margin: 0 0 10px 0; font-size: 11px; color: var(--fg-dim);
-    text-transform: uppercase; letter-spacing: 0.1em; font-weight: 500;
-  }
-  .card h3 .accent { color: var(--accent); }
-
-  /* ── console ─────────────────────────────────────────────────────────── */
+  /* ── Log console ────────────────────────── */
   .console {
-    background: #050505; border: 1px solid var(--border); border-radius: 4px;
-    font-family: var(--mono); font-size: 12px; color: #b8b8b8;
-    padding: 10px 12px; max-height: 220px; overflow-y: auto;
-    white-space: pre-wrap; word-break: break-all; line-height: 1.55;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 10px;
+    line-height: 1.7;
+    max-height: 200px;
+    overflow-y: auto;
+    margin-bottom: 12px;
   }
-  .console .line { display: block; }
-  .console .line.err  { color: var(--err); }
-  .console .line.ok   { color: var(--ok); }
-  .console .line.sys  { color: var(--accent-2); }
-  .console::-webkit-scrollbar { width: 6px; }
-  .console::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 3px; }
+  .console::-webkit-scrollbar { width: 4px; }
+  .console::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  .log-line { color: var(--text); }
+  .log-line.info { color: var(--accent2); }
+  .log-line.success { color: var(--green); }
+  .log-line.error { color: var(--red); }
+  .log-line.dim { color: #555; }
 
-  /* ── image ───────────────────────────────────────────────────────────── */
-  .img-frame {
-    background: #050505; border: 1px solid var(--border); border-radius: 4px;
-    aspect-ratio: 1 / 1; display: flex; align-items: center; justify-content: center;
-    overflow: hidden; position: relative;
+  /* ── Input fields ───────────────────────── */
+  .field { margin-bottom: 12px; }
+  .field-label {
+    font-size: 9px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    margin-bottom: 6px;
   }
-  .img-frame img, .img-frame canvas {
-    width: 100%; height: 100%; image-rendering: pixelated;
-    image-rendering: -moz-crisp-edges;
+  .field-input {
+    width: 100%;
+    padding: 10px 12px;
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text-bright);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    outline: none;
+    transition: border-color 0.15s;
   }
-  .img-frame .placeholder { color: var(--fg-muted); font-size: 11px; }
+  .field-input:focus { border-color: var(--accent); }
+  .field-input::placeholder { color: #444; }
 
-  /* ── history grid ────────────────────────────────────────────────────── */
-  .history { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-  .history .img-frame { aspect-ratio: 1 / 1; cursor: pointer; }
-  .history .img-frame:hover { border-color: var(--accent); }
-
-  /* ── pipeline (Signal tab) ───────────────────────────────────────────── */
-  .pipeline {
-    display: flex; flex-direction: column; gap: 6px;
-  }
-  .stage {
-    display: flex; align-items: center; gap: 10px;
-    padding: 8px 12px; border: 1px solid var(--border); border-radius: 4px;
-    background: var(--surface-2); transition: 0.2s;
-  }
-  .stage .num {
-    width: 24px; height: 24px; border-radius: 50%;
-    background: var(--border); color: var(--fg-dim);
-    display: flex; align-items: center; justify-content: center;
-    font-weight: 700; font-size: 12px; flex: 0 0 auto;
-  }
-  .stage .label { flex: 1; font-size: 12px; }
-  .stage .status {
-    font-size: 10px; color: var(--fg-muted); text-transform: uppercase;
-    letter-spacing: 0.08em;
-  }
-  .stage.active {
-    border-color: var(--accent);
-    box-shadow: inset 0 0 0 1px var(--accent), 0 0 12px rgba(255, 107, 43, 0.18);
-    background: rgba(255, 107, 43, 0.06);
-  }
-  .stage.active .num { background: var(--accent); color: #111; }
-  .stage.active .status { color: var(--accent); }
-  .stage.active .spinner {
-    width: 12px; height: 12px; border-radius: 50%;
-    border: 2px solid var(--accent); border-top-color: transparent;
-    animation: spin 0.8s linear infinite;
-  }
-  .stage.done {
-    border-color: var(--ok); background: rgba(74, 222, 128, 0.05);
-  }
-  .stage.done .num { background: var(--ok); color: #111; }
-  .stage.done .status { color: var(--ok); }
-  @keyframes spin { to { transform: rotate(360deg); } }
-
-  /* ── morphemes / chips ───────────────────────────────────────────────── */
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
-  .chip {
-    font-family: var(--mono); font-size: 11px; padding: 4px 8px;
-    border: 1px solid var(--border); border-radius: 3px;
-    background: var(--surface-2);
-  }
-  .chip.ok    { color: var(--ok);     border-color: rgba(74,222,128,0.4);  background: rgba(74,222,128,0.08); }
-  .chip.cyan  { color: var(--accent-2); border-color: rgba(0,229,255,0.4); background: rgba(0,229,255,0.06); }
-  .chip.amber { color: var(--accent); border-color: rgba(255,107,43,0.4);  background: rgba(255,107,43,0.08); }
-
-  /* ── 3-way viz row ───────────────────────────────────────────────────── */
-  .viz-row {
-    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
-  }
-  @media (max-width: 720px) {
-    .viz-row { grid-template-columns: 1fr; }
-    .history { grid-template-columns: repeat(2, 1fr); }
-  }
-  .viz-row .img-frame { aspect-ratio: 1 / 1; }
-  .viz-row figcaption {
-    font-size: 10px; color: var(--fg-dim); text-align: center;
-    text-transform: uppercase; letter-spacing: 0.08em; margin-top: 4px;
-  }
-
-  /* ── dominance bars ──────────────────────────────────────────────────── */
-  .dom-bars { display: flex; flex-direction: column; gap: 6px; }
-  .dom-row {
-    display: flex; align-items: center; gap: 8px; font-size: 12px;
-  }
-  .dom-row .ch {
-    width: 14px; font-weight: 700; text-align: center;
-  }
-  .dom-row .bar-bg {
-    flex: 1; height: 10px; background: #050505; border-radius: 2px; overflow: hidden;
-  }
-  .dom-row .bar-fill { height: 100%; transition: width 0.3s; }
-  .dom-row .pct { width: 44px; text-align: right; color: var(--fg-dim); font-size: 11px; }
-
-  /* ── chat ────────────────────────────────────────────────────────────── */
-  .chat-log {
-    background: #050505; border: 1px solid var(--border); border-radius: 4px;
-    padding: 12px; min-height: 240px; max-height: 380px; overflow-y: auto;
+  /* ── Sliders ────────────────────────────── */
+  .slider-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
     margin-bottom: 10px;
   }
-  .msg { margin-bottom: 8px; line-height: 1.5; word-break: break-word; }
-  .msg.user { color: var(--accent); }
-  .msg.user::before { content: ">  "; color: var(--accent); font-weight: 700; }
-  .msg.ai {
-    color: #ddd; padding-left: 8px; border-left: 2px solid var(--accent-2);
-    white-space: pre-wrap;
+  .slider-label {
+    font-size: 10px;
+    color: var(--text);
+    min-width: 55px;
   }
-  .msg.system { color: var(--fg-muted); font-style: italic; font-size: 11px; }
+  .slider-value {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--accent);
+    min-width: 35px;
+    text-align: right;
+  }
+  input[type="range"] {
+    flex: 1;
+    -webkit-appearance: none;
+    height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    outline: none;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+  }
 
-  /* ── models grid ─────────────────────────────────────────────────────── */
-  .models { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); gap: 10px; }
+  /* ── Buttons ────────────────────────────── */
+  .btn {
+    padding: 10px 20px;
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 700;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.15s;
+    letter-spacing: 0.5px;
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: #fff;
+  }
+  .btn-primary:hover { filter: brightness(1.15); }
+  .btn-primary:active { transform: scale(0.97); }
+  .btn-primary:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+    transform: none;
+  }
+  .btn-secondary {
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn-secondary:hover { border-color: var(--accent); color: var(--text-bright); }
+
+  .btn-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 14px;
+  }
+
+  /* ── Image result ───────────────────────── */
+  .result-image {
+    width: 100%;
+    max-width: 256px;
+    aspect-ratio: 1;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 12px auto;
+    overflow: hidden;
+    position: relative;
+  }
+  .result-image img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    image-rendering: pixelated;
+  }
+  .result-image .placeholder {
+    font-size: 10px;
+    color: #333;
+    text-align: center;
+  }
+  .result-meta {
+    font-size: 9px;
+    color: #555;
+    text-align: center;
+    margin-top: 6px;
+  }
+
+  /* ── Gallery grid ───────────────────────── */
+  .gallery {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    margin-top: 12px;
+  }
+  .gallery-item {
+    aspect-ratio: 1;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    overflow: hidden;
+    cursor: pointer;
+    transition: border-color 0.15s;
+    position: relative;
+  }
+  .gallery-item:hover { border-color: var(--accent); }
+  .gallery-item img {
+    width: 100%; height: 100%;
+    object-fit: cover;
+    image-rendering: pixelated;
+  }
+  .gallery-item .label {
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    padding: 3px 5px;
+    background: rgba(0,0,0,0.7);
+    font-size: 8px;
+    color: var(--text);
+  }
+
+  /* ── Model cards ────────────────────────── */
   .model-card {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 6px; padding: 12px; cursor: pointer; transition: 0.15s;
+    padding: 12px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    transition: border-color 0.15s;
   }
   .model-card:hover { border-color: var(--accent); }
-  .model-card .name {
-    font-size: 13px; font-weight: 700; word-break: break-all;
+  .model-card.selected { border-color: var(--accent); background: var(--accent-dim); }
+  .model-name { font-size: 13px; font-weight: 700; color: var(--text-bright); }
+  .model-info { font-size: 9px; color: #555; margin-top: 2px; }
+  .model-badge {
+    font-size: 9px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 4px;
+    letter-spacing: 0.5px;
   }
-  .model-card .meta {
-    margin-top: 6px; font-size: 11px; color: var(--fg-dim);
-    display: flex; justify-content: space-between;
-  }
-  .badge {
-    display: inline-block; font-size: 10px; padding: 2px 6px;
-    border-radius: 3px; font-weight: 700; text-transform: uppercase;
-    letter-spacing: 0.05em;
-  }
-  .badge.ces  { background: rgba(74,222,128,0.15);  color: var(--ok); }
-  .badge.spai { background: rgba(0,229,255,0.15);   color: var(--accent-2); }
-  .badge.sss  { background: rgba(255,107,43,0.15);  color: var(--accent); }
+  .badge-ces { background: #1A2D0D; color: var(--green); }
+  .badge-spai { background: #0D2240; color: var(--accent2); }
+  .badge-sss { background: #2D1A0A; color: var(--accent); }
 
-  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-  @media (max-width: 720px) { .grid-2 { grid-template-columns: 1fr; } }
-
-  .toast {
-    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
-    background: var(--surface); border: 1px solid var(--accent);
-    color: var(--fg); padding: 10px 16px; border-radius: 4px;
-    font-size: 12px; opacity: 0; transition: opacity 0.2s;
-    z-index: 100; pointer-events: none;
+  /* ── Chat ────────────────────────────────── */
+  .chat-messages {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    min-height: 250px;
+    max-height: 400px;
+    overflow-y: auto;
+    margin-bottom: 12px;
   }
-  .toast.show { opacity: 1; }
+  .chat-msg {
+    margin-bottom: 10px;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .chat-msg.user {
+    color: var(--accent);
+  }
+  .chat-msg.user::before { content: '> '; color: var(--accent); font-weight: 700; }
+  .chat-msg.ai { color: var(--text-bright); padding-left: 8px; border-left: 2px solid var(--border); }
+  .chat-msg.system { color: #555; font-size: 10px; font-style: italic; }
+  .chat-input-row {
+    display: flex;
+    gap: 8px;
+  }
+  .chat-input-row .field-input { flex: 1; }
 
-  hr.sep { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
-  .sub  { font-size: 11px; color: var(--fg-dim); }
+  /* ── Spinner ────────────────────────────── */
+  .spinner {
+    display: inline-block;
+    width: 14px; height: 14px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+    vertical-align: middle;
+    margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Signal Canvas ──────────────────────── */
+  .pipe-stage {
+    padding: 8px 12px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 10px;
+    color: #555;
+    text-align: center;
+    transition: all 0.3s;
+    position: relative;
+  }
+  .pipe-stage.active {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--accent-dim);
+    box-shadow: 0 0 12px var(--accent-dim);
+  }
+  .pipe-stage.done {
+    border-color: var(--green);
+    color: var(--green);
+    background: rgba(74,222,128,0.08);
+  }
+  .pipe-stage.active::after {
+    content: '';
+    position: absolute;
+    right: 10px; top: 50%;
+    transform: translateY(-50%);
+    width: 8px; height: 8px;
+    border: 2px solid var(--accent);
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.5s linear infinite;
+  }
+  .pipe-arrow {
+    text-align: center;
+    color: #333;
+    font-size: 10px;
+    line-height: 1.2;
+  }
+  .sig-box {
+    padding: 10px 12px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 11px;
+  }
+  .morph-tag {
+    display: inline-block;
+    padding: 3px 10px;
+    margin: 3px 4px 3px 0;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    font-family: var(--sans);
+  }
+  .morph-tag.token { background: #1A2D0D; color: var(--green); border: 1px solid #2D4A1A; }
+  .morph-tag.pos { background: #0D2240; color: var(--accent2); border: 1px solid #1A3D6B; font-size: 9px; }
+  .morph-tag.cid { background: #2D1A0A; color: var(--accent); border: 1px solid #5C3A1A; font-size: 9px; font-family: var(--mono); }
+
+  /* ── Section dividers ───────────────────── */
+  .divider {
+    height: 1px;
+    background: var(--border);
+    margin: 16px 0;
+  }
+
+  .section-title {
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+  }
+
+  /* ── Toggle ─────────────────────────────── */
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+  }
+  .toggle-label { font-size: 11px; color: var(--text); }
+  .toggle {
+    width: 36px; height: 20px;
+    background: var(--border);
+    border-radius: 10px;
+    cursor: pointer;
+    position: relative;
+    transition: background 0.2s;
+  }
+  .toggle.on { background: var(--accent); }
+  .toggle::after {
+    content: '';
+    position: absolute;
+    top: 2px; left: 2px;
+    width: 16px; height: 16px;
+    border-radius: 50%;
+    background: var(--text-bright);
+    transition: transform 0.2s;
+  }
+  .toggle.on::after { transform: translateX(16px); }
 </style>
 </head>
 <body>
 
-<header>
-  <h1>SSS<span class="accent">_</span>FORGE</h1>
-  <span class="meta" id="health-meta"><span class="dot"></span>online</span>
-</header>
+<!-- ═══ Header ═══ -->
+<div class="header">
+  <div class="header-title"><span>SSS</span> Forge</div>
+  <div class="header-status" id="status">engine ready</div>
+</div>
 
-<nav class="tabs" id="tabs">
-  <button data-tab="generate" class="active">Generate</button>
-  <button data-tab="signal">Signal</button>
-  <button data-tab="train">Train</button>
-  <button data-tab="chat">Chat</button>
-  <button data-tab="models">Models</button>
-</nav>
+<!-- ═══ Tabs ═══ -->
+<div class="tabs">
+  <button class="tab active" data-tab="generate" onclick="switchTab('generate')">Generate</button>
+  <button class="tab" data-tab="signal" onclick="switchTab('signal')">Signal</button>
+  <button class="tab" data-tab="train" onclick="switchTab('train')">Train</button>
+  <button class="tab" data-tab="chat" onclick="switchTab('chat')">Chat</button>
+  <button class="tab" data-tab="models" onclick="switchTab('models')">Models</button>
+</div>
 
-<main>
+<!-- ═══ Content ═══ -->
+<div class="content">
 
-<!-- ============ GENERATE ============ -->
-<section class="panel active" id="panel-generate">
+  <!-- ── Generate Panel ─────────────────── -->
+  <div class="panel active" id="panel-generate">
+    <div class="field">
+      <div class="field-label">Prompt</div>
+      <input class="field-input" id="gen-prompt" type="text"
+             placeholder="describe what to generate..."
+             value="red apple">
+    </div>
 
-  <div class="card">
-    <h3>prompt<span class="accent">/</span>config</h3>
-    <label>Model (.ces)</label>
-    <select id="gen-model"></select>
+    <div class="section-title">Parameters</div>
+    <div class="slider-row">
+      <span class="slider-label">Steps</span>
+      <input type="range" id="gen-steps" min="4" max="100" value="50"
+             oninput="$('gen-steps-val').textContent=this.value">
+      <span class="slider-value" id="gen-steps-val">50</span>
+    </div>
+    <div class="slider-row">
+      <span class="slider-label">Wave</span>
+      <input type="range" id="gen-wave" min="0" max="500" value="200" step="10"
+             oninput="$('gen-wave-val').textContent=this.value">
+      <span class="slider-value" id="gen-wave-val">200</span>
+    </div>
+    <div class="slider-row">
+      <span class="slider-label">Guidance</span>
+      <input type="range" id="gen-guidance" min="0.5" max="4.0" value="1.0" step="0.1"
+             oninput="$('gen-guidance-val').textContent=parseFloat(this.value).toFixed(1)">
+      <span class="slider-value" id="gen-guidance-val">1.0</span>
+    </div>
+    <div class="slider-row">
+      <span class="slider-label">Seed</span>
+      <input type="range" id="gen-seed" min="0" max="999" value="0"
+             oninput="$('gen-seed-val').textContent=this.value">
+      <span class="slider-value" id="gen-seed-val">0</span>
+    </div>
 
-    <div style="height:10px"></div>
+    <div class="toggle-row">
+      <span class="toggle-label">Hybrid VAE</span>
+      <div class="toggle" id="gen-hybrid" onclick="this.classList.toggle('on')"></div>
+    </div>
 
-    <label>Prompt</label>
-    <input type="text" id="gen-prompt" placeholder="red apple" value="red apple" />
+    <div class="btn-row">
+      <button class="btn btn-primary" id="gen-btn" onclick="doGenerate()">
+        Generate
+      </button>
+      <button class="btn btn-secondary" onclick="randomSeed()">
+        Rand Seed
+      </button>
+    </div>
 
-    <hr class="sep">
+    <!-- Console -->
+    <div class="divider"></div>
+    <div class="console" id="gen-console">
+      <div class="log-line dim">ready. select a model and enter a prompt.</div>
+    </div>
 
-    <div class="grid-2">
-      <div>
-        <label>Steps <span class="sub" id="gen-steps-val">50</span></label>
-        <div class="slider-wrap">
-          <input type="range" id="gen-steps" min="4" max="100" value="50">
-          <span class="val" id="gen-steps-vbox">50</span>
-        </div>
+    <!-- Result -->
+    <div class="result-image" id="gen-result">
+      <div class="placeholder">256×256 output<br>will appear here</div>
+    </div>
+    <div class="result-meta" id="gen-meta"></div>
+
+    <!-- Gallery -->
+    <div class="section-title" style="margin-top:16px">History</div>
+    <div class="gallery" id="gen-gallery"></div>
+  </div>
+
+  <!-- ── Signal Canvas Panel ────────────── -->
+  <div class="panel" id="panel-signal">
+
+    <!-- Prompt -->
+    <div class="field">
+      <div class="field-label">Prompt</div>
+      <div style="display:flex;gap:8px">
+        <input class="field-input" id="sig-prompt" type="text" placeholder="prompt..." value="red apple" style="flex:1">
+        <button class="btn btn-primary" id="sig-btn" onclick="doVizGenerate()">Run</button>
       </div>
-      <div>
-        <label>Wave Iters <span class="sub" id="gen-wave-val">200</span></label>
-        <div class="slider-wrap">
-          <input type="range" id="gen-wave" min="0" max="500" value="200">
-          <span class="val" id="gen-wave-vbox">200</span>
-        </div>
+    </div>
+
+    <!-- Pipeline Flow -->
+    <div class="section-title">Pipeline Flow</div>
+    <div id="sig-pipeline" style="margin-bottom:16px">
+      <div class="pipe-stage" id="pipe-0" data-name="morpheme_tokenize">형태소 분석</div>
+      <div class="pipe-arrow">↓</div>
+      <div class="pipe-stage" id="pipe-1" data-name="ce_feed">CE Embedding</div>
+      <div class="pipe-arrow">↓</div>
+      <div class="pipe-stage" id="pipe-2" data-name="ce_search">canvas_id 투표</div>
+      <div class="pipe-arrow">↓</div>
+      <div class="pipe-stage" id="pipe-3" data-name="latent_init">Latent 초기화</div>
+      <div class="pipe-arrow">↓</div>
+      <div class="pipe-stage" id="pipe-4" data-name="denoise_loop">Denoise Loop</div>
+      <div class="pipe-arrow">↓</div>
+      <div class="pipe-stage" id="pipe-5" data-name="decode">CE Decode</div>
+      <div class="pipe-arrow">↓</div>
+      <div class="pipe-stage" id="pipe-6" data-name="wave_refine">Wave Refine</div>
+      <div class="pipe-arrow">↓</div>
+      <div class="pipe-stage done" id="pipe-7" data-name="output">Output 256×256</div>
+    </div>
+
+    <!-- Morpheme Routing -->
+    <div class="section-title">Morpheme → Canvas Routing</div>
+    <div id="sig-morphemes" class="sig-box" style="min-height:40px">
+      <span class="log-line dim">run generation to see routing</span>
+    </div>
+
+    <!-- Result + Heatmaps side by side -->
+    <div class="section-title" style="margin-top:14px">Output + Energy Map</div>
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <div style="flex:1">
+        <canvas id="sig-image" width="128" height="128" style="width:100%;border-radius:6px;border:1px solid var(--border);image-rendering:pixelated;background:var(--bg)"></canvas>
+        <div style="font-size:8px;color:#444;text-align:center;margin-top:4px">Generated</div>
       </div>
-      <div>
-        <label>Guidance</label>
-        <div class="slider-wrap">
-          <input type="range" id="gen-guidance" min="0.5" max="4.0" step="0.1" value="1.0">
-          <span class="val" id="gen-guidance-vbox">1.0</span>
-        </div>
+      <div style="flex:1">
+        <canvas id="sig-energy" width="16" height="16" style="width:100%;border-radius:6px;border:1px solid var(--border);image-rendering:pixelated;background:var(--bg)"></canvas>
+        <div style="font-size:8px;color:#444;text-align:center;margin-top:4px">Energy (16×16)</div>
       </div>
-      <div>
-        <label>Seed</label>
-        <div class="slider-wrap">
-          <input type="range" id="gen-seed" min="0" max="999" value="0">
-          <span class="val" id="gen-seed-vbox">0</span>
-        </div>
+      <div style="flex:1">
+        <canvas id="sig-edge" width="16" height="16" style="width:100%;border-radius:6px;border:1px solid var(--border);image-rendering:pixelated;background:var(--bg)"></canvas>
+        <div style="font-size:8px;color:#444;text-align:center;margin-top:4px">Edge (16×16)</div>
       </div>
     </div>
 
-    <div style="height:12px"></div>
-    <div class="row" style="align-items:center">
-      <label class="toggle" style="flex:0 0 auto">
-        <input type="checkbox" id="gen-hybrid">
-        <span class="switch"></span>
-        <span>Hybrid VAE</span>
-      </label>
-      <button class="ghost" id="gen-rand" style="flex:0 0 auto">Rand Seed</button>
-      <button class="primary" id="gen-go" style="flex:0 0 auto">Generate</button>
+    <!-- Color Histogram -->
+    <div class="section-title">Color Distribution</div>
+    <canvas id="sig-histogram" width="320" height="100" style="width:100%;height:80px;border-radius:6px;border:1px solid var(--border);background:var(--bg)"></canvas>
+
+    <!-- Wave Convergence -->
+    <div class="section-title" style="margin-top:14px">Wave Convergence</div>
+    <canvas id="sig-wave" width="320" height="80" style="width:100%;height:60px;border-radius:6px;border:1px solid var(--border);background:var(--bg)"></canvas>
+
+    <!-- Color Dominance -->
+    <div class="section-title" style="margin-top:14px">Dominance</div>
+    <div id="sig-dominance" style="display:flex;gap:4px;height:20px;border-radius:4px;overflow:hidden;border:1px solid var(--border)">
+      <div style="flex:1;background:#333"></div>
+    </div>
+
+    <!-- Console -->
+    <div class="divider"></div>
+    <div class="console" id="sig-console">
+      <div class="log-line dim">signal canvas ready.</div>
     </div>
   </div>
 
-  <div class="card">
-    <h3>console</h3>
-    <div class="console" id="gen-console"><span class="line sys">[ready]</span></div>
-  </div>
+  <!-- ── Train Panel ────────────────────── -->
+  <div class="panel" id="panel-train">
+    <div class="section-title">Image + Text Training</div>
 
-  <div class="card">
-    <h3>output</h3>
-    <div class="img-frame" id="gen-image"><span class="placeholder">no image yet</span></div>
-  </div>
+    <div class="field">
+      <div class="field-label">Dataset Path</div>
+      <input class="field-input" id="train-dataset" type="text"
+             placeholder="data/demo" value="data/demo">
+    </div>
+    <div class="field">
+      <div class="field-label">Output Model Name</div>
+      <input class="field-input" id="train-out" type="text"
+             placeholder="build/models/demo" value="build/models/my_model">
+    </div>
+    <div class="slider-row">
+      <span class="slider-label">Masked Epochs</span>
+      <input type="range" id="train-epochs" min="0" max="10" value="0"
+             oninput="$('train-epochs-val').textContent=this.value">
+      <span class="slider-value" id="train-epochs-val">0</span>
+    </div>
 
-  <div class="card">
-    <h3>history</h3>
-    <div class="history" id="gen-history"></div>
-  </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" id="train-btn" onclick="doTrain()">
+        Start Training
+      </button>
+    </div>
 
-</section>
+    <div class="divider"></div>
+    <div class="console" id="train-console">
+      <div class="log-line dim">training log will appear here.</div>
+    </div>
 
-<!-- ============ SIGNAL ============ -->
-<section class="panel" id="panel-signal">
-
-  <div class="card">
-    <h3>signal<span class="accent">/</span>visualizer</h3>
-    <label>Model (.ces)</label>
-    <select id="sig-model"></select>
-
-    <div style="height:10px"></div>
-
-    <label>Prompt</label>
-    <input type="text" id="sig-prompt" value="red apple" />
-
-    <div style="height:10px"></div>
-    <button class="primary" id="sig-go">Run</button>
-  </div>
-
-  <div class="card">
-    <h3>pipeline<span class="accent">/</span>flow</h3>
-    <div class="pipeline" id="sig-pipeline"></div>
-  </div>
-
-  <div class="card">
-    <h3>morpheme<span class="accent">/</span>routing</h3>
-    <div id="sig-morphemes" class="chips"><span class="sub">awaiting prompt…</span></div>
-    <hr class="sep">
-    <div class="row" style="align-items:center">
-      <span class="sub">canvas_id</span>
-      <span id="sig-canvas" class="chip amber">—</span>
-      <span class="sub">mean rgb</span>
-      <span id="sig-mean" class="chip cyan">—</span>
+    <div class="divider"></div>
+    <div class="section-title">Text Training</div>
+    <div class="field">
+      <div class="field-label">Text File</div>
+      <input class="field-input" id="train-text-input" type="text"
+             placeholder="data/wiki5k.txt" value="data/wiki5k.txt">
+    </div>
+    <div class="slider-row">
+      <span class="slider-label">Max Lines</span>
+      <input type="range" id="train-text-max" min="100" max="50000" value="5000" step="100"
+             oninput="$('train-text-max-val').textContent=this.value">
+      <span class="slider-value" id="train-text-max-val">5000</span>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="doTrainText()">
+        Train Text Model
+      </button>
+    </div>
+    <div class="console" id="train-text-console" style="margin-top:12px">
+      <div class="log-line dim">text training log here.</div>
     </div>
   </div>
 
-  <div class="card">
-    <h3>spatial<span class="accent">/</span>maps</h3>
-    <div class="viz-row">
-      <figure>
-        <div class="img-frame"><canvas id="sig-img" width="256" height="256"></canvas></div>
-        <figcaption>generated</figcaption>
-      </figure>
-      <figure>
-        <div class="img-frame"><canvas id="sig-energy" width="256" height="256"></canvas></div>
-        <figcaption>energy map</figcaption>
-      </figure>
-      <figure>
-        <div class="img-frame"><canvas id="sig-edge" width="256" height="256"></canvas></div>
-        <figcaption>edge map</figcaption>
-      </figure>
+  <!-- ── Chat Panel ─────────────────────── -->
+  <div class="panel" id="panel-chat">
+    <div class="section-title">Text Chat (REPL)</div>
+    <div class="field">
+      <div class="field-label">Model (.spai)</div>
+      <input class="field-input" id="chat-model" type="text"
+             placeholder="build/models/wiki5k.spai">
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="chat-messages" id="chat-messages">
+      <div class="chat-msg system">load a .spai model and start chatting.</div>
+    </div>
+
+    <div class="chat-input-row">
+      <input class="field-input" id="chat-input" type="text"
+             placeholder="type a message..."
+             onkeydown="if(event.key==='Enter')doChat()">
+      <button class="btn btn-primary" onclick="doChat()">Send</button>
     </div>
   </div>
 
-  <div class="card">
-    <h3>color<span class="accent">/</span>distribution</h3>
-    <canvas id="sig-hist" width="320" height="100" style="width:100%;height:100px;background:#050505;border-radius:3px"></canvas>
-  </div>
-
-  <div class="card">
-    <h3>wave<span class="accent">/</span>convergence</h3>
-    <canvas id="sig-wave" width="320" height="80" style="width:100%;height:80px;background:#050505;border-radius:3px"></canvas>
-  </div>
-
-  <div class="card">
-    <h3>dominance</h3>
-    <div class="dom-bars" id="sig-dominance">
-      <div class="dom-row"><span class="ch" style="color:var(--err)">R</span><div class="bar-bg"><div class="bar-fill" style="background:var(--err);width:0%"></div></div><span class="pct">0%</span></div>
-      <div class="dom-row"><span class="ch" style="color:var(--ok)">G</span><div class="bar-bg"><div class="bar-fill" style="background:var(--ok);width:0%"></div></div><span class="pct">0%</span></div>
-      <div class="dom-row"><span class="ch" style="color:var(--accent-2)">B</span><div class="bar-bg"><div class="bar-fill" style="background:var(--accent-2);width:0%"></div></div><span class="pct">0%</span></div>
+  <!-- ── Models Panel ───────────────────── -->
+  <div class="panel" id="panel-models">
+    <div class="section-title">Available Models</div>
+    <div id="model-list">
+      <div class="log-line dim" style="padding:20px;text-align:center">loading...</div>
+    </div>
+    <div class="btn-row" style="margin-top:14px">
+      <button class="btn btn-secondary" onclick="loadModels()">Refresh</button>
     </div>
   </div>
 
-  <div class="card">
-    <h3>console</h3>
-    <div class="console" id="sig-console"><span class="line sys">[ready]</span></div>
-  </div>
-</section>
-
-<!-- ============ TRAIN ============ -->
-<section class="panel" id="panel-train">
-
-  <div class="card">
-    <h3>image<span class="accent">/</span>train</h3>
-    <label>Dataset directory</label>
-    <input type="text" id="tr-dataset" value="data/demo">
-    <div style="height:10px"></div>
-    <label>Output base path</label>
-    <input type="text" id="tr-out" value="build/models/demo">
-    <div style="height:10px"></div>
-    <label>Masked epochs <span class="sub" id="tr-mep-val">0</span></label>
-    <div class="slider-wrap">
-      <input type="range" id="tr-mep" min="0" max="20" value="0">
-      <span class="val" id="tr-mep-vbox">0</span>
-    </div>
-    <div style="height:10px"></div>
-    <button class="primary" id="tr-go">Start Training</button>
-  </div>
-
-  <div class="card">
-    <h3>console</h3>
-    <div class="console" id="tr-console"><span class="line sys">[ready]</span></div>
-  </div>
-
-  <hr class="sep">
-
-  <div class="card">
-    <h3>text<span class="accent">/</span>train</h3>
-    <label>Input text file</label>
-    <input type="text" id="tt-input" value="data/sample_en.txt">
-    <div style="height:10px"></div>
-    <label>Output (.spai)</label>
-    <input type="text" id="tt-out" value="build/models/text.spai">
-    <div style="height:10px"></div>
-    <label>Max lines <span class="sub" id="tt-max-val">5000</span></label>
-    <div class="slider-wrap">
-      <input type="range" id="tt-max" min="100" max="50000" value="5000" step="100">
-      <span class="val" id="tt-max-vbox">5000</span>
-    </div>
-    <div style="height:10px"></div>
-    <button class="primary" id="tt-go">Start Text Training</button>
-  </div>
-
-  <div class="card">
-    <h3>console</h3>
-    <div class="console" id="tt-console"><span class="line sys">[ready]</span></div>
-  </div>
-
-</section>
-
-<!-- ============ CHAT ============ -->
-<section class="panel" id="panel-chat">
-
-  <div class="card">
-    <h3>chat<span class="accent">/</span>session</h3>
-    <label>Model (.spai)</label>
-    <select id="chat-model"></select>
-  </div>
-
-  <div class="card">
-    <h3>conversation</h3>
-    <div class="chat-log" id="chat-log">
-      <div class="msg system">load a .spai model to begin</div>
-    </div>
-    <div class="row">
-      <input type="text" id="chat-input" placeholder="type a message…" style="flex:1 1 auto" />
-      <button class="primary" id="chat-send" style="flex:0 0 auto">Send</button>
-    </div>
-  </div>
-
-</section>
-
-<!-- ============ MODELS ============ -->
-<section class="panel" id="panel-models">
-  <div class="card">
-    <h3>build<span class="accent">/</span>models<span class="accent">/</span></h3>
-    <div class="row" style="align-items:center;margin-bottom:10px">
-      <span class="sub" id="models-count">…</span>
-      <button class="ghost" id="models-refresh" style="flex:0 0 auto">Refresh</button>
-    </div>
-    <div class="models" id="models-list"></div>
-  </div>
-</section>
-
-</main>
-
-<div class="toast" id="toast"></div>
+</div>
 
 <script>
-//
-// ─── core utils ───────────────────────────────────────────────────────────
-//
-const $ = (sel) => document.querySelector(sel);
-const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+const API = window.location.origin;
+const $ = id => document.getElementById(id);
 
-function toast(msg, ms = 1800) {
-  const t = $("#toast");
-  t.textContent = msg;
-  t.classList.add("show");
-  clearTimeout(toast._h);
-  toast._h = setTimeout(() => t.classList.remove("show"), ms);
+let selectedModel = null;
+let gallery = [];
+
+// ── Tab switching ──────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.id === 'panel-' + name));
+  if (name === 'models') loadModels();
 }
 
-function consoleLine(box, text, kind) {
-  const el = document.createElement("span");
-  el.className = "line" + (kind ? " " + kind : "");
-  el.textContent = text;
-  box.appendChild(el);
-  box.scrollTop = box.scrollHeight;
+// ── Console logging ────────────────────────
+function log(consoleId, text, cls = '') {
+  const el = $(consoleId);
+  const line = document.createElement('div');
+  line.className = 'log-line ' + cls;
+  line.textContent = text;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
 }
-function consoleClear(box) { box.innerHTML = ""; }
-
-async function api(path, opts) {
-  const r = await fetch(path, opts || {});
-  const ct = r.headers.get("content-type") || "";
-  if (ct.includes("application/json")) return r.json();
-  return r.text();
+function clearConsole(id) {
+  $(id).innerHTML = '';
 }
 
-// SSE helper with polling fallback. onLine gets called per stdout line; onDone
-// receives the final job object (with .result).
-function streamJob(jobId, onLine, onDone) {
-  let closed = false;
-  let es;
-  try {
-    es = new EventSource("/api/stream/" + jobId);
-  } catch (e) { fallback(); return; }
-
+// ── SSE stream reader ──────────────────────
+function streamJob(jobId, consoleId, onDone) {
+  const es = new EventSource(API + '/api/stream/' + jobId);
   es.onmessage = (e) => {
-    try {
-      const data = JSON.parse(e.data);
-      if (data.done) {
-        closed = true; es.close();
-        onDone && onDone(data);
-      } else if (data.line !== undefined) {
-        onLine && onLine(data.line);
+    const data = JSON.parse(e.data);
+    if (data.done) {
+      es.close();
+      if (data.exit_code === 0) {
+        log(consoleId, '[done] exit 0', 'success');
+      } else {
+        log(consoleId, '[fail] exit ' + data.exit_code, 'error');
       }
-    } catch (err) { /* ignore parse errors */ }
+      if (onDone) onDone(data);
+    } else if (data.line !== undefined) {
+      const cls = data.line.includes('[ERROR]') ? 'error' :
+                  data.line.includes('[done]') || data.line.includes('PASS') ? 'success' :
+                  data.line.includes('morpheme') || data.line.includes('routed') ? 'info' : '';
+      log(consoleId, data.line, cls);
+    }
   };
   es.onerror = () => {
-    if (closed) return;
-    closed = true;
     es.close();
-    fallback();
+    log(consoleId, '[stream closed]', 'dim');
+    // Poll for final result
+    setTimeout(() => {
+      fetch(API + '/api/job/' + jobId)
+        .then(r => r.json())
+        .then(data => { if (onDone && data.done) onDone(data.result || data); });
+    }, 500);
   };
-
-  function fallback() {
-    const tick = async () => {
-      let prev = 0;
-      while (true) {
-        let job;
-        try { job = await api("/api/job/" + jobId); }
-        catch (e) { await new Promise(r => setTimeout(r, 500)); continue; }
-        if (job.error) { onDone && onDone({done: true, exit_code: -1, result: {error: job.error}}); return; }
-        if (Array.isArray(job.log)) {
-          for (let i = prev; i < job.log.length; i++) onLine && onLine(job.log[i]);
-          prev = job.log.length;
-        }
-        if (job.done) {
-          onDone && onDone({done: true, exit_code: job.exit_code, result: job.result});
-          return;
-        }
-        await new Promise(r => setTimeout(r, 400));
-      }
-    };
-    tick();
-  }
 }
 
-//
-// ─── tab switching ────────────────────────────────────────────────────────
-//
-$$("#tabs button").forEach(b => {
-  b.addEventListener("click", () => {
-    $$("#tabs button").forEach(x => x.classList.remove("active"));
-    b.classList.add("active");
-    $$(".panel").forEach(p => p.classList.remove("active"));
-    $("#panel-" + b.dataset.tab).classList.add("active");
-    if (b.dataset.tab === "models") refreshModels();
-  });
-});
+// ── Image Generation ───────────────────────
+async function doGenerate() {
+  const btn = $('gen-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Generating...';
+  clearConsole('gen-console');
+  log('gen-console', '$ gen_image_ce ...', 'info');
 
-//
-// ─── model lists ──────────────────────────────────────────────────────────
-//
-let MODELS = [];
-
-async function loadModels() {
-  try {
-    const data = await api("/api/models");
-    MODELS = data.models || [];
-  } catch (e) {
-    MODELS = [];
-    $("#health-meta").classList.add("bad");
-  }
-  populateModelSelects();
-  return MODELS;
-}
-
-function populateModelSelects() {
-  const ces  = MODELS.filter(m => m.ext === "ces");
-  const spai = MODELS.filter(m => m.ext === "spai");
-
-  function fill(sel, list, fallback) {
-    const cur = sel.value;
-    sel.innerHTML = "";
-    if (!list.length) {
-      const o = document.createElement("option");
-      o.value = ""; o.textContent = fallback;
-      sel.appendChild(o);
-      return;
-    }
-    list.forEach(m => {
-      const o = document.createElement("option");
-      o.value = m.rel; o.textContent = m.name + " (" + fmtSize(m.size) + ")";
-      sel.appendChild(o);
-    });
-    if (cur && list.find(m => m.rel === cur)) sel.value = cur;
-  }
-  fill($("#gen-model"),  ces,  "no .ces models");
-  fill($("#sig-model"),  ces,  "no .ces models");
-  fill($("#chat-model"), spai, "no .spai models");
-}
-
-function fmtSize(b) {
-  if (b > 1024*1024) return (b/1024/1024).toFixed(1) + "M";
-  if (b > 1024) return (b/1024).toFixed(0) + "K";
-  return b + "B";
-}
-
-//
-// ─── slider mirroring ─────────────────────────────────────────────────────
-//
-function bindSlider(rangeId, boxId, fmt) {
-  const r = $("#" + rangeId), b = $("#" + boxId);
-  const update = () => { b.textContent = fmt ? fmt(r.value) : r.value; };
-  r.addEventListener("input", update); update();
-}
-bindSlider("gen-steps", "gen-steps-vbox");
-bindSlider("gen-wave",  "gen-wave-vbox");
-bindSlider("gen-guidance", "gen-guidance-vbox", v => parseFloat(v).toFixed(1));
-bindSlider("gen-seed",  "gen-seed-vbox");
-bindSlider("tr-mep",    "tr-mep-vbox");
-bindSlider("tt-max",    "tt-max-vbox");
-
-$("#gen-rand").addEventListener("click", () => {
-  const v = Math.floor(Math.random() * 999);
-  $("#gen-seed").value = v; $("#gen-seed-vbox").textContent = v;
-});
-
-//
-// ─── Generate tab ─────────────────────────────────────────────────────────
-//
-const HISTORY = [];
-
-$("#gen-go").addEventListener("click", async () => {
-  const model = $("#gen-model").value;
-  if (!model) { toast("no model selected"); return; }
+  const prompt = $('gen-prompt').value || 'red';
   const body = {
-    model,
-    prompt:     $("#gen-prompt").value || "red apple",
-    seed:       parseInt($("#gen-seed").value, 10),
-    steps:      parseInt($("#gen-steps").value, 10),
-    wave_iters: parseInt($("#gen-wave").value, 10),
-    guidance:   parseFloat($("#gen-guidance").value),
-    hybrid:     $("#gen-hybrid").checked,
+    model: selectedModel || 'build/models/demo.ces',
+    prompt: prompt,
+    seed: parseInt($('gen-seed').value),
+    steps: parseInt($('gen-steps').value),
+    wave_iters: parseInt($('gen-wave').value),
+    guidance: parseFloat($('gen-guidance').value),
+    hybrid: $('gen-hybrid').classList.contains('on'),
   };
 
-  const box = $("#gen-console");
-  consoleClear(box);
-  consoleLine(box, "$ gen_image_ce \"" + body.prompt + "\" seed=" + body.seed
-              + " steps=" + body.steps + " wave=" + body.wave_iters
-              + (body.hybrid ? " --hybrid" : "") + " --guidance " + body.guidance.toFixed(1), "sys");
-
-  const frame = $("#gen-image");
-  frame.innerHTML = '<span class="placeholder">generating…</span>';
-  $("#gen-go").disabled = true;
-
-  let resp;
   try {
-    resp = await api("/api/generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
+    const res = await fetch(API + '/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
+    const { job_id } = await res.json();
+
+    streamJob(job_id, 'gen-console', (data) => {
+      btn.disabled = false;
+      btn.textContent = 'Generate';
+
+      if (data.image) {
+        $('gen-result').innerHTML = `<img src="${data.image}" alt="generated">`;
+        $('gen-meta').textContent = `${prompt} | seed:${body.seed} steps:${body.steps} wave:${body.wave_iters}`;
+        if (data.info) log('gen-console', data.info, 'success');
+
+        // Add to gallery
+        gallery.unshift({ src: data.image, prompt, seed: body.seed });
+        renderGallery();
+      }
+    });
   } catch (e) {
-    consoleLine(box, "[error] " + e, "err");
-    $("#gen-go").disabled = false;
+    log('gen-console', '[ERROR] ' + e.message, 'error');
+    btn.disabled = false;
+    btn.textContent = 'Generate';
+  }
+}
+
+function randomSeed() {
+  const seed = Math.floor(Math.random() * 999);
+  $('gen-seed').value = seed;
+  $('gen-seed-val').textContent = seed;
+}
+
+function renderGallery() {
+  const el = $('gen-gallery');
+  el.innerHTML = gallery.slice(0, 9).map((item, i) =>
+    `<div class="gallery-item" onclick="showGalleryItem(${i})">
+       <img src="${item.src}" alt="${item.prompt}">
+       <div class="label">${item.prompt} #${item.seed}</div>
+     </div>`
+  ).join('');
+}
+
+function showGalleryItem(i) {
+  const item = gallery[i];
+  $('gen-result').innerHTML = `<img src="${item.src}" alt="${item.prompt}">`;
+  $('gen-meta').textContent = `${item.prompt} | seed:${item.seed}`;
+}
+
+// ── Training ───────────────────────────────
+async function doTrain() {
+  const btn = $('train-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Training...';
+  clearConsole('train-console');
+
+  const body = {
+    dataset: $('train-dataset').value,
+    out_base: $('train-out').value,
+    masked_epochs: parseInt($('train-epochs').value),
+  };
+  log('train-console', `$ train_demo ${body.dataset} ${body.out_base}`, 'info');
+
+  try {
+    const res = await fetch(API + '/api/train', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const { job_id } = await res.json();
+
+    streamJob(job_id, 'train-console', (data) => {
+      btn.disabled = false;
+      btn.textContent = 'Start Training';
+      if (data.ces_exists) {
+        log('train-console', `model saved: ${body.out_base}.ces (${data.ces_size_kb}KB)`, 'success');
+        // Auto-select the new model
+        selectedModel = body.out_base + '.ces';
+        loadModels();
+      }
+    });
+  } catch (e) {
+    log('train-console', '[ERROR] ' + e.message, 'error');
+    btn.disabled = false;
+    btn.textContent = 'Start Training';
+  }
+}
+
+async function doTrainText() {
+  clearConsole('train-text-console');
+  const body = {
+    input: $('train-text-input').value,
+    max: parseInt($('train-text-max').value),
+    out: 'build/models/text_' + Date.now() + '.spai',
+  };
+  log('train-text-console', `$ stream_train --input ${body.input} --max ${body.max}`, 'info');
+
+  try {
+    const res = await fetch(API + '/api/train-text', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const { job_id } = await res.json();
+    streamJob(job_id, 'train-text-console', () => {
+      log('train-text-console', `model → ${body.out}`, 'success');
+      loadModels();
+    });
+  } catch (e) {
+    log('train-text-console', '[ERROR] ' + e.message, 'error');
+  }
+}
+
+// ── Chat ───────────────────────────────────
+async function doChat() {
+  const input = $('chat-input');
+  const msg = input.value.trim();
+  if (!msg) return;
+  input.value = '';
+
+  const model = $('chat-model').value;
+  if (!model) {
+    appendChat('system', 'model path를 먼저 입력하세요.');
     return;
   }
-  if (resp.error) {
-    consoleLine(box, "[error] " + resp.error, "err");
-    $("#gen-go").disabled = false;
-    return;
-  }
 
-  streamJob(resp.job_id,
-    (line) => consoleLine(box, line),
-    (final) => {
-      $("#gen-go").disabled = false;
-      const r = (final && final.result) || {};
-      if (r.error) {
-        consoleLine(box, "[error] " + r.error, "err");
-        frame.innerHTML = '<span class="placeholder">generation failed</span>';
-        return;
-      }
-      if (r.image) {
-        frame.innerHTML = '<img src="' + r.image + '">';
-        HISTORY.unshift(r.image);
-        if (HISTORY.length > 9) HISTORY.length = 9;
-        renderHistory();
-      }
-      consoleLine(box, "[done] exit=" + final.exit_code, "ok");
+  appendChat('user', msg);
+
+  try {
+    const res = await fetch(API + '/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, message: msg }),
     });
-});
-
-function renderHistory() {
-  const h = $("#gen-history");
-  h.innerHTML = "";
-  HISTORY.forEach((src, i) => {
-    const cell = document.createElement("div");
-    cell.className = "img-frame";
-    cell.innerHTML = '<img src="' + src + '">';
-    cell.addEventListener("click", () => {
-      $("#gen-image").innerHTML = '<img src="' + src + '">';
-    });
-    h.appendChild(cell);
-  });
-}
-
-//
-// ─── Signal tab ───────────────────────────────────────────────────────────
-//
-const PIPELINE_STAGES = [
-  { key: "morph",   label: "Morpheme Analysis" },
-  { key: "embed",   label: "CE Embedding" },
-  { key: "vote",    label: "Canvas Vote" },
-  { key: "init",    label: "Latent Init" },
-  { key: "denoise", label: "Denoise" },
-  { key: "decode",  label: "Decode" },
-  { key: "wave",    label: "Wave Refine" },
-  { key: "out",     label: "Output" },
-];
-
-function buildPipeline() {
-  const el = $("#sig-pipeline");
-  el.innerHTML = "";
-  PIPELINE_STAGES.forEach((st, i) => {
-    const s = document.createElement("div");
-    s.className = "stage";
-    s.dataset.key = st.key;
-    s.innerHTML =
-      '<div class="num">' + (i+1) + '</div>' +
-      '<div class="label">' + st.label + '</div>' +
-      '<div class="status">idle</div>';
-    el.appendChild(s);
-  });
-}
-buildPipeline();
-
-function setStage(key, status) {
-  const s = $('#sig-pipeline .stage[data-key="' + key + '"]');
-  if (!s) return;
-  s.classList.remove("active", "done");
-  if (status) s.classList.add(status);
-  // status text + spinner
-  const lbl = s.querySelector(".status");
-  if (status === "active") {
-    lbl.textContent = "running";
-    if (!s.querySelector(".spinner")) {
-      const sp = document.createElement("div"); sp.className = "spinner";
-      s.appendChild(sp);
+    const data = await res.json();
+    if (data.error) {
+      appendChat('system', 'Error: ' + data.error);
+    } else {
+      appendChat('ai', data.response);
     }
-  } else if (status === "done") {
-    lbl.textContent = "done";
-    const sp = s.querySelector(".spinner"); if (sp) sp.remove();
-  } else {
-    lbl.textContent = "idle";
-    const sp = s.querySelector(".spinner"); if (sp) sp.remove();
+  } catch (e) {
+    appendChat('system', 'Connection error: ' + e.message);
   }
 }
 
-function resetPipeline() { PIPELINE_STAGES.forEach(s => setStage(s.key, null)); }
-function markDone(key) { setStage(key, "done"); }
-function activate(key) { setStage(key, "active"); }
-
-// Map a log line to a pipeline transition.
-function pipelineForLine(line) {
-  // morphemes=2 ...  → morph done, embed active
-  if (/morphemes=/.test(line)) {
-    markDone("morph"); activate("embed"); return;
-  }
-  if (/routed canvas_id=/.test(line)) {
-    markDone("embed"); markDone("vote"); activate("init"); return;
-  }
-  if (/steps=\d+/.test(line) && /prompt="/.test(line)) {
-    activate("morph"); return;
-  }
-  if (/seed=/.test(line) && /steps=/.test(line)) {
-    activate("morph"); return;
-  }
-  if (/decode|decoded/i.test(line)) {
-    markDone("init"); markDone("denoise"); activate("decode"); return;
-  }
-  if (/wave|refine/i.test(line)) {
-    markDone("decode"); activate("wave"); return;
-  }
-  if (/mean RGB/.test(line)) {
-    markDone("init"); markDone("denoise"); markDone("decode"); activate("wave"); return;
-  }
-  if (/wrote/i.test(line) || /saved/i.test(line)) {
-    markDone("wave"); markDone("out");
-  }
+function appendChat(role, text) {
+  const el = $('chat-messages');
+  const div = document.createElement('div');
+  div.className = 'chat-msg ' + role;
+  div.textContent = text;
+  el.appendChild(div);
+  el.scrollTop = el.scrollHeight;
 }
 
-function renderMorphemes(morphemes, canvasId, meanRgb) {
-  const el = $("#sig-morphemes");
-  el.innerHTML = "";
-  if (!morphemes || !morphemes.length) {
-    el.innerHTML = '<span class="sub">no morphemes</span>';
-  } else {
-    morphemes.forEach(m => {
-      const t = document.createElement("span");
-      t.className = "chip ok"; t.textContent = m.surface;
-      el.appendChild(t);
-      const p = document.createElement("span");
-      p.className = "chip cyan"; p.textContent = m.pos;
-      el.appendChild(p);
-    });
-  }
-  $("#sig-canvas").textContent = canvasId || "—";
-  $("#sig-mean").textContent   = meanRgb
-    ? "(" + meanRgb.map(v => v.toFixed(0)).join(", ") + ")"
-    : "—";
-}
+// ── Models ─────────────────────────────────
+async function loadModels() {
+  try {
+    const res = await fetch(API + '/api/models');
+    const { models } = await res.json();
+    const el = $('model-list');
 
-function drawHeatmap(canvas, grid, scheme) {
-  // scheme: 'cyan' | 'amber'
-  const ctx = canvas.getContext("2d");
-  const W = canvas.width, H = canvas.height;
-  const N = grid.length;
-  const cw = W / N, ch = H / N;
-  ctx.fillStyle = "#050505"; ctx.fillRect(0,0,W,H);
-  for (let y = 0; y < N; y++) {
-    for (let x = 0; x < N; x++) {
-      const v = Math.max(0, Math.min(1, grid[y][x]));
-      let r,g,b;
-      if (scheme === "cyan") {
-        // cyan -> white
-        r = Math.floor(v * 200);
-        g = Math.floor(50 + v * 200);
-        b = Math.floor(120 + v * 135);
-      } else {
-        // amber -> hot
-        r = Math.floor(60 + v * 195);
-        g = Math.floor(20 + v * 130);
-        b = Math.floor(20 + v * 30);
-      }
-      ctx.fillStyle = "rgba(" + r + "," + g + "," + b + "," + (0.25 + 0.75*v) + ")";
-      ctx.fillRect(Math.floor(x*cw), Math.floor(y*ch),
-                   Math.ceil(cw),    Math.ceil(ch));
+    if (models.length === 0) {
+      el.innerHTML = '<div style="padding:20px;text-align:center;color:#555">no models found. train one first.</div>';
+      return;
     }
+
+    // Auto-select first .ces if none selected
+    if (!selectedModel) {
+      const ces = models.find(m => m.type === 'ces');
+      if (ces) selectedModel = ces.path;
+    }
+
+    el.innerHTML = models.map(m => {
+      const badgeCls = m.type === 'ces' ? 'badge-ces' : m.type === 'spai' ? 'badge-spai' : 'badge-sss';
+      const isSelected = m.path === selectedModel;
+      return `<div class="model-card ${isSelected ? 'selected' : ''}" onclick="selectModel('${m.path}', '${m.type}')">
+        <div>
+          <div class="model-name">${m.name}</div>
+          <div class="model-info">${m.size_kb} KB</div>
+        </div>
+        <span class="model-badge ${badgeCls}">.${m.type}</span>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    $('model-list').innerHTML = '<div style="padding:20px;color:var(--red)">server not responding</div>';
   }
 }
 
-function drawHistogram(canvas, hr, hg, hb) {
-  const ctx = canvas.getContext("2d");
-  const W = canvas.width, H = canvas.height;
-  ctx.clearRect(0, 0, W, H);
-  ctx.fillStyle = "#050505"; ctx.fillRect(0,0,W,H);
-  const N = hr.length;
-  const bw = W / N;
-  const all = hr.concat(hg, hb);
-  const m = Math.max(0.001, Math.max.apply(null, all));
-  const drawSet = (arr, color) => {
-    ctx.fillStyle = color;
-    arr.forEach((v, i) => {
-      const h = (v / m) * (H - 6);
-      ctx.fillRect(i * bw + 1, H - h, bw - 2, h);
+function selectModel(path, type) {
+  if (type === 'ces') {
+    selectedModel = path;
+  } else if (type === 'spai') {
+    $('chat-model').value = path;
+  }
+  loadModels();
+}
+
+// ── Signal Canvas ──────────────────────
+function setPipeStage(idx) {
+  for (let i = 0; i <= 7; i++) {
+    const el = document.getElementById('pipe-' + i);
+    el.classList.remove('active', 'done');
+    if (i < idx) el.classList.add('done');
+    else if (i === idx) el.classList.add('active');
+  }
+}
+
+async function doVizGenerate() {
+  const btn = $('sig-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+  clearConsole('sig-console');
+
+  const prompt = $('sig-prompt').value || 'red';
+  log('sig-console', '$ viz_generate "' + prompt + '"', 'info');
+  setPipeStage(0);
+
+  try {
+    const res = await fetch(API + '/api/viz-generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: selectedModel || 'build/models/demo.ces',
+        prompt,
+        seed: parseInt($('gen-seed')?.value || '0'),
+        steps: parseInt($('gen-steps')?.value || '50'),
+        wave_iters: parseInt($('gen-wave')?.value || '200'),
+      }),
     });
-  };
-  drawSet(hr, "rgba(248,113,113,0.55)");
-  drawSet(hg, "rgba(74,222,128,0.55)");
-  drawSet(hb, "rgba(0,229,255,0.55)");
-}
+    const { job_id } = await res.json();
 
-function drawWaveConvergence(canvas, iters) {
-  const ctx = canvas.getContext("2d");
-  const W = canvas.width, H = canvas.height;
-  ctx.clearRect(0, 0, W, H);
-  ctx.fillStyle = "#050505"; ctx.fillRect(0,0,W,H);
-  if (!iters || iters < 1) return;
-  const N = 200;
-  ctx.beginPath();
-  ctx.moveTo(0, H/2);
-  const pts = [];
-  for (let i = 0; i < N; i++) {
-    const t = i / (N - 1);
-    const decay = Math.exp(-3.0 * t);
-    const freq = 6 + (iters / 80);
-    const v = Math.sin(t * freq * Math.PI * 2) * decay;
-    const x = t * W;
-    const y = H/2 - v * (H/2 - 4);
-    pts.push([x,y]);
+    setTimeout(() => setPipeStage(1), 200);
+    setTimeout(() => setPipeStage(2), 500);
+
+    const es = new EventSource(API + '/api/stream/' + job_id);
+    let stageIdx = 2;
+
+    es.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.line) {
+        log('sig-console', data.line, data.line.includes('routed') ? 'info' : '');
+        if (data.line.includes('routed') && stageIdx < 4) { setPipeStage(3); stageIdx = 4; }
+        if (data.line.includes('steps=') && stageIdx < 5) { setPipeStage(4); stageIdx = 5; }
+        if (data.line.includes('mean RGB') && stageIdx < 7) { setPipeStage(6); stageIdx = 7; }
+      }
+      if (data.done) {
+        es.close();
+        for (let i = 0; i <= 7; i++) { const el = document.getElementById('pipe-'+i); el.classList.remove('active'); el.classList.add('done'); }
+        setTimeout(async () => {
+          const jr = await fetch(API + '/api/job/' + job_id);
+          const jd = await jr.json();
+          const r = jd.result || {};
+          if (r.image) drawResultImage(r.image);
+          if (r.morphemes) drawMorphemes(r.morphemes, r.canvas_id);
+          if (r.analysis) { drawEnergyMap(r.analysis.energy_map); drawEdgeMap(r.analysis.edge_map); drawHistogram(r.analysis); drawDominance(r.analysis.dominance); }
+          drawWaveConvergence(r.wave_iters || 200);
+          log('sig-console', '[done] visualization complete', 'success');
+          btn.disabled = false; btn.textContent = 'Run';
+        }, 300);
+      }
+    };
+    es.onerror = () => { es.close(); btn.disabled = false; btn.textContent = 'Run'; };
+  } catch (e) {
+    log('sig-console', '[ERROR] ' + e.message, 'error');
+    btn.disabled = false; btn.textContent = 'Run';
   }
-  ctx.beginPath();
-  ctx.moveTo(pts[0][0], pts[0][1]);
-  for (const [x,y] of pts) ctx.lineTo(x, y);
-  ctx.strokeStyle = "rgba(0,229,255,0.85)";
-  ctx.lineWidth = 1.5;
-  ctx.stroke();
-  // fill under
-  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
-  ctx.fillStyle = "rgba(0,229,255,0.15)"; ctx.fill();
 }
 
-function drawImageToCanvas(canvas, dataUri) {
-  const img = new Image();
-  img.onload = () => {
-    const ctx = canvas.getContext("2d");
-    ctx.imageSmoothingEnabled = false;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-  };
+function drawResultImage(dataUri) {
+  const c = $('sig-image'), ctx = c.getContext('2d'), img = new Image();
+  img.onload = () => { c.width = img.width; c.height = img.height; ctx.imageSmoothingEnabled = false; ctx.drawImage(img, 0, 0); };
   img.src = dataUri;
 }
 
-function setDominance(d) {
-  const rows = $$("#sig-dominance .dom-row");
-  const vals = [d.r || 0, d.g || 0, d.b || 0];
-  rows.forEach((row, i) => {
-    const pct = vals[i] * 100;
-    row.querySelector(".bar-fill").style.width = pct.toFixed(1) + "%";
-    row.querySelector(".pct").textContent = pct.toFixed(1) + "%";
-  });
+function drawMorphemes(morphemes, canvasId) {
+  const el = $('sig-morphemes');
+  if (!morphemes.length) { el.innerHTML = '<span class="log-line dim">no morphemes</span>'; return; }
+  let h = '';
+  morphemes.forEach(m => { h += `<span class="morph-tag token">${m.token}</span><span class="morph-tag pos">${m.pos}</span> `; });
+  if (canvasId) h += `<br><span class="morph-tag cid" style="margin-top:6px">→ ${canvasId}</span>`;
+  el.innerHTML = h;
 }
 
-$("#sig-go").addEventListener("click", async () => {
-  const model = $("#sig-model").value;
-  if (!model) { toast("no model selected"); return; }
-  const body = {
-    model,
-    prompt:     $("#sig-prompt").value || "red apple",
-    seed:       0,
-    steps:      50,
-    wave_iters: 200,
-    guidance:   1.0,
-    hybrid:     false,
-  };
-  resetPipeline();
-  activate("morph");
-  const box = $("#sig-console");
-  consoleClear(box);
-  consoleLine(box, "$ viz-generate \"" + body.prompt + "\"", "sys");
-  $("#sig-go").disabled = true;
-  let resp;
-  try {
-    resp = await api("/api/viz-generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  } catch (e) {
-    consoleLine(box, "[error] " + e, "err");
-    $("#sig-go").disabled = false; return;
-  }
-  if (resp.error) {
-    consoleLine(box, "[error] " + resp.error, "err");
-    $("#sig-go").disabled = false; return;
-  }
-  streamJob(resp.job_id,
-    (line) => { consoleLine(box, line); pipelineForLine(line); },
-    (final) => {
-      $("#sig-go").disabled = false;
-      const r = (final && final.result) || {};
-      if (r.error) {
-        consoleLine(box, "[error] " + r.error, "err");
-        return;
-      }
-      // make sure all stages end as done
-      ["morph","embed","vote","init","denoise","decode","wave","out"].forEach(markDone);
-      renderMorphemes(r.morphemes, r.canvas_id, r.mean_rgb);
-      if (r.image) drawImageToCanvas($("#sig-img"), r.image);
-      const a = r.analysis || {};
-      if (a.energy_map) drawHeatmap($("#sig-energy"), a.energy_map, "cyan");
-      if (a.edge_map)   drawHeatmap($("#sig-edge"),   a.edge_map,   "amber");
-      if (a.hist_r)     drawHistogram($("#sig-hist"), a.hist_r, a.hist_g, a.hist_b);
-      drawWaveConvergence($("#sig-wave"), body.wave_iters);
-      if (a.dominance)  setDominance(a.dominance);
-      consoleLine(box, "[done] exit=" + final.exit_code, "ok");
-    });
-});
-
-//
-// ─── Train tab ────────────────────────────────────────────────────────────
-//
-$("#tr-go").addEventListener("click", async () => {
-  const body = {
-    dataset:      $("#tr-dataset").value,
-    out_base:     $("#tr-out").value,
-    masked_epochs: parseInt($("#tr-mep").value, 10),
-  };
-  const box = $("#tr-console");
-  consoleClear(box);
-  consoleLine(box, "$ train_demo " + body.dataset + " " + body.out_base
-              + (body.masked_epochs > 0 ? " --masked-epochs " + body.masked_epochs : ""), "sys");
-  $("#tr-go").disabled = true;
-  let resp;
-  try {
-    resp = await api("/api/train", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  } catch (e) {
-    consoleLine(box, "[error] " + e, "err");
-    $("#tr-go").disabled = false;
-    return;
-  }
-  if (resp.error) {
-    consoleLine(box, "[error] " + resp.error, "err");
-    $("#tr-go").disabled = false; return;
-  }
-  streamJob(resp.job_id,
-    (line) => consoleLine(box, line),
-    (final) => {
-      $("#tr-go").disabled = false;
-      consoleLine(box, "[done] exit=" + final.exit_code,
-                  final.exit_code === 0 ? "ok" : "err");
-      loadModels();
-    });
-});
-
-$("#tt-go").addEventListener("click", async () => {
-  const body = {
-    input: $("#tt-input").value,
-    max:   parseInt($("#tt-max").value, 10),
-    out:   $("#tt-out").value,
-  };
-  const box = $("#tt-console");
-  consoleClear(box);
-  consoleLine(box, "$ stream_train --input " + body.input + " --max " + body.max + " --save " + body.out, "sys");
-  $("#tt-go").disabled = true;
-  let resp;
-  try {
-    resp = await api("/api/train-text", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-  } catch (e) {
-    consoleLine(box, "[error] " + e, "err");
-    $("#tt-go").disabled = false;
-    return;
-  }
-  if (resp.error) {
-    consoleLine(box, "[error] " + resp.error, "err");
-    $("#tt-go").disabled = false; return;
-  }
-  streamJob(resp.job_id,
-    (line) => consoleLine(box, line),
-    (final) => {
-      $("#tt-go").disabled = false;
-      consoleLine(box, "[done] exit=" + final.exit_code,
-                  final.exit_code === 0 ? "ok" : "err");
-      loadModels();
-    });
-});
-
-//
-// ─── Chat tab ─────────────────────────────────────────────────────────────
-//
-function chatPush(kind, text) {
-  const box = $("#chat-log");
-  const m = document.createElement("div");
-  m.className = "msg " + kind;
-  m.textContent = text;
-  box.appendChild(m);
-  box.scrollTop = box.scrollHeight;
-}
-
-async function sendChat() {
-  const model = $("#chat-model").value;
-  if (!model) { toast("no .spai model"); return; }
-  const msg = $("#chat-input").value.trim();
-  if (!msg) return;
-  $("#chat-input").value = "";
-  chatPush("user", msg);
-  chatPush("system", "thinking…");
-  $("#chat-send").disabled = true;
-
-  const removePlaceholder = () => {
-    const log = $("#chat-log");
-    if (log.lastChild && log.lastChild.classList
-        && log.lastChild.classList.contains("system")) {
-      log.removeChild(log.lastChild);
+function drawHeatmap(cid, map, colorFn) {
+  const c = $(cid), ctx = c.getContext('2d');
+  const rows = map.length, cols = map[0].length;
+  c.width = cols; c.height = rows;
+  let mn = Infinity, mx = -Infinity;
+  map.forEach(r => r.forEach(v => { mn = Math.min(mn, v); mx = Math.max(mx, v); }));
+  const rng = mx - mn || 1;
+  for (let y = 0; y < rows; y++)
+    for (let x = 0; x < cols; x++) {
+      const t = (map[y][x] - mn) / rng;
+      const [r,g,b] = colorFn(t);
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      ctx.fillRect(x, y, 1, 1);
     }
-  };
-
-  let resp;
-  try {
-    resp = await api("/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model, message: msg }),
-    });
-  } catch (e) {
-    removePlaceholder();
-    chatPush("system", "[error] " + e);
-    $("#chat-send").disabled = false;
-    return;
-  }
-  removePlaceholder();
-  if (resp.error) {
-    chatPush("system", "[error] " + resp.error);
-    $("#chat-send").disabled = false; return;
-  }
-  streamJob(resp.job_id, () => {}, (final) => {
-    $("#chat-send").disabled = false;
-    const r = (final && final.result) || {};
-    if (r.error) chatPush("system", "[error] " + r.error);
-    else         chatPush("ai", r.reply || "(no reply)");
-  });
 }
-$("#chat-send").addEventListener("click", sendChat);
-$("#chat-input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") { e.preventDefault(); sendChat(); }
-});
 
-//
-// ─── Models tab ───────────────────────────────────────────────────────────
-//
-async function refreshModels() {
-  await loadModels();
-  const list = $("#models-list");
-  list.innerHTML = "";
-  $("#models-count").textContent = MODELS.length + " files";
-  MODELS.forEach(m => {
-    const c = document.createElement("div");
-    c.className = "model-card";
-    const name = document.createElement("div");
-    name.className = "name";
-    name.textContent = m.name;
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    const badge = document.createElement("span");
-    badge.className = "badge " + (m.ext === "ces" || m.ext === "spai" || m.ext === "sss"
-                                   ? m.ext : "");
-    badge.textContent = (m.ext || "").toUpperCase();
-    const size = document.createElement("span");
-    size.textContent = fmtSize(m.size);
-    meta.appendChild(badge);
-    meta.appendChild(size);
-    c.appendChild(name);
-    c.appendChild(meta);
-    c.addEventListener("click", () => {
-      if (m.ext === "ces") {
-        $("#gen-model").value = m.rel;
-        $("#sig-model").value = m.rel;
-        toast("set generate/signal model: " + m.name);
-        $$("#tabs button").forEach(x => x.classList.remove("active"));
-        $$("#tabs button[data-tab=generate]")[0].classList.add("active");
-        $$(".panel").forEach(p => p.classList.remove("active"));
-        $("#panel-generate").classList.add("active");
-      } else if (m.ext === "spai") {
-        $("#chat-model").value = m.rel;
-        toast("set chat model: " + m.name);
-        $$("#tabs button").forEach(x => x.classList.remove("active"));
-        $$("#tabs button[data-tab=chat]")[0].classList.add("active");
-        $$(".panel").forEach(p => p.classList.remove("active"));
-        $("#panel-chat").classList.add("active");
-      } else {
-        toast("selected " + m.name);
-      }
-    });
-    list.appendChild(c);
-  });
-  if (!MODELS.length) {
-    list.innerHTML = '<span class="sub">no models. run training first.</span>';
-  }
+function drawEnergyMap(m) { drawHeatmap('sig-energy', m, t => [Math.floor(t*t*255), Math.floor(t*200+20), Math.floor((1-t)*100+t*255)]); }
+function drawEdgeMap(m) { drawHeatmap('sig-edge', m, t => [Math.floor(t*255), Math.floor(t*107), Math.floor(t*43)]); }
+
+function drawHistogram(a) {
+  const c = $('sig-histogram'), ctx = c.getContext('2d');
+  const W = c.width = 320, H = c.height = 100;
+  ctx.clearRect(0,0,W,H);
+  const chs = [{d:a.hist_r,c:'rgba(248,113,113,0.6)'},{d:a.hist_g,c:'rgba(74,222,128,0.6)'},{d:a.hist_b,c:'rgba(96,165,250,0.6)'}];
+  const mx = Math.max(...chs.flatMap(c=>c.d));
+  const bw = W/16;
+  chs.forEach(ch => { ctx.fillStyle=ch.c; ch.d.forEach((v,i) => { const bh=(v/mx)*(H-10); ctx.fillRect(i*bw+2,H-bh,bw-4,bh); }); });
 }
-$("#models-refresh").addEventListener("click", refreshModels);
 
-//
-// ─── boot ─────────────────────────────────────────────────────────────────
-//
+function drawDominance(d) {
+  $('sig-dominance').innerHTML = `
+    <div style="flex:${Math.max(d.r*100,5)};background:rgba(248,113,113,0.7);display:flex;align-items:center;justify-content:center;font-size:8px;color:#fff;font-weight:700">${Math.round(d.r*100)}%</div>
+    <div style="flex:${Math.max(d.g*100,5)};background:rgba(74,222,128,0.7);display:flex;align-items:center;justify-content:center;font-size:8px;color:#fff;font-weight:700">${Math.round(d.g*100)}%</div>
+    <div style="flex:${Math.max(d.b*100,5)};background:rgba(96,165,250,0.7);display:flex;align-items:center;justify-content:center;font-size:8px;color:#fff;font-weight:700">${Math.round(d.b*100)}%</div>`;
+}
+
+function drawWaveConvergence(iters) {
+  const c = $('sig-wave'), ctx = c.getContext('2d');
+  const W = c.width = 320, H = c.height = 80;
+  ctx.clearRect(0,0,W,H);
+  const pts = [];
+  for (let i = 0; i < 50; i++) { const t=i/49; pts.push(Math.exp(-t*2.5)+Math.sin(t*Math.PI*3)*Math.exp(-t*3)*0.3); }
+  ctx.strokeStyle='#00E5FF'; ctx.lineWidth=1.5; ctx.beginPath();
+  pts.forEach((v,i) => { const x=(i/49)*W, y=H-8-v*(H-16); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
+  ctx.stroke(); ctx.lineTo(W,H); ctx.lineTo(0,H); ctx.closePath();
+  ctx.fillStyle='rgba(0,229,255,0.08)'; ctx.fill();
+  ctx.fillStyle='#444'; ctx.font='9px JetBrains Mono';
+  ctx.fillText('0',4,H-2); ctx.fillText(iters+' iters',W-55,H-2);
+}
+
+// ── Init ───────────────────────────────────
 loadModels();
 </script>
 
