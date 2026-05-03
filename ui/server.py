@@ -8,13 +8,12 @@ Server-Sent Events for live stdout streaming. Pure Python 3 stdlib — no
 external packages, no Pillow. PPMs are encoded to PNG inline using zlib.
 """
 
+import argparse
 import base64
 import http.server
 import json
 import os
-import queue
 import re
-import shlex
 import socketserver
 import struct
 import subprocess
@@ -23,7 +22,8 @@ import threading
 import time
 import uuid
 import zlib
-from urllib.parse import urlparse, parse_qs
+from collections import OrderedDict
+from urllib.parse import urlparse
 
 ROOT       = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 BUILD_DIR  = os.path.join(ROOT, "build")
@@ -33,9 +33,11 @@ TMP_DIR    = os.path.join(BUILD_DIR, "ui_tmp")
 os.makedirs(TMP_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
 
-# job_id -> dict(proc, log[list[str]], done, exit_code, result, lock, cv)
-JOBS      = {}
+# job_id -> dict(proc, log[list[str]], done, exit_code, result, cv)
+# Bounded LRU: when we exceed JOBS_MAX, the oldest *finished* job is evicted.
+JOBS      = OrderedDict()
 JOBS_LOCK = threading.Lock()
+JOBS_MAX  = 64
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,12 +202,20 @@ def _new_job():
         "done":      False,
         "exit_code": None,
         "result":    {},
-        "lock":      threading.Lock(),
         "cv":        threading.Condition(),
         "started":   time.time(),
     }
     with JOBS_LOCK:
         JOBS[jid] = job
+        # Evict the oldest *finished* job if we're over the cap. Running jobs
+        # are kept so streaming clients don't lose their handle mid-flight.
+        while len(JOBS) > JOBS_MAX:
+            for old_id, old_job in list(JOBS.items()):
+                if old_job["done"]:
+                    JOBS.pop(old_id, None)
+                    break
+            else:
+                break  # nothing finished yet — nothing to evict
     return job
 
 
@@ -223,6 +233,8 @@ def _run_job(cmd, cwd=None, stdin_data=None, on_done=None, env=None):
                 stderr=subprocess.STDOUT,
                 bufsize=1,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 env=env,
             )
             job["proc"] = proc
@@ -319,9 +331,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # ── helpers ────────────────────────────────────────────────────────────
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        # Same-origin only by default. The UI is served from the same origin
+        # so it doesn't need CORS at all; emitting `*` here would let any
+        # other website drive-by-request our local execution endpoints.
+        # If the operator wants cross-origin access they can pass --cors *.
+        origin_policy = getattr(self.server, "cors_origin", None)
+        if origin_policy:
+            self.send_header("Access-Control-Allow-Origin", origin_policy)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def _send_json(self, obj, status=200):
         body = json.dumps(obj).encode("utf-8")
@@ -347,14 +365,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _read_json(self):
+        """Returns (body_dict, error_response_or_None). Callers should bail if
+        an error response was already produced."""
         n = int(self.headers.get("Content-Length", "0"))
         if n <= 0:
-            return {}
+            return {}, None
         raw = self.rfile.read(n)
         try:
-            return json.loads(raw.decode("utf-8"))
-        except Exception:
-            return {}
+            obj = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            self._send_json({"error": "invalid JSON: %s" % e}, 400)
+            return None, True
+        if not isinstance(obj, dict):
+            self._send_json({"error": "JSON body must be an object"}, 400)
+            return None, True
+        return obj, None
 
     # ── routing ────────────────────────────────────────────────────────────
     def do_OPTIONS(self):
@@ -382,7 +407,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         url  = urlparse(self.path)
         p    = url.path
-        body = self._read_json()
+        body, err = self._read_json()
+        if err:
+            return  # error response already sent
         if p == "/api/generate":
             return self._post_generate(body, with_viz=False)
         if p == "/api/viz-generate":
@@ -405,15 +432,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         guidance   = float(body.get("guidance", 1.0))
         hybrid     = bool(body.get("hybrid", False))
 
-        if not model or not os.path.isfile(_resolve_model(model)):
-            return self._send_json({"error": "model not found: %s" % model}, 400)
+        model_path = _resolve_model(model)
+        if not model_path:
+            return self._send_json({"error": "model not found in build/models/: %s" % model}, 400)
         if not prompt:
             return self._send_json({"error": "prompt is required"}, 400)
 
         out_path = os.path.join(TMP_DIR, "gen_%s.ppm" % uuid.uuid4().hex[:10])
         cmd = [
             os.path.join(BUILD_DIR, "gen_image_ce"),
-            _resolve_model(model),
+            model_path,
             prompt,
             out_path,
             str(seed),
@@ -442,36 +470,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self._send_json({"job_id": job["id"], "cmd": cmd})
 
     def _post_train(self, body):
-        dataset      = body.get("dataset") or "data/demo"
-        out_base     = body.get("out_base") or "build/models/demo"
+        dataset       = body.get("dataset") or "data/demo"
+        out_base      = body.get("out_base") or "build/models/demo"
         masked_epochs = int(body.get("masked_epochs", 0))
-        ds_abs = dataset if os.path.isabs(dataset) else os.path.join(ROOT, dataset)
-        if not os.path.isdir(ds_abs):
-            return self._send_json({"error": "dataset dir not found: %s" % dataset}, 400)
-        os.makedirs(os.path.dirname(out_base if os.path.isabs(out_base)
-                                    else os.path.join(ROOT, out_base)), exist_ok=True)
-        cmd = [os.path.join(BUILD_DIR, "train_demo"), dataset, out_base]
-        env = os.environ.copy()
+
+        # Confine dataset to ROOT (any path under the repo is fine to read).
+        ds_abs = _confine(dataset, ROOT)
+        if not ds_abs or not os.path.isdir(ds_abs):
+            return self._send_json({"error": "dataset dir not found or outside repo: %s" % dataset}, 400)
+
+        # Confine output base to build/models/ so a malicious request cannot
+        # write artifacts elsewhere on disk.
+        out_abs = _confine(out_base, MODELS_DIR)
+        if not out_abs:
+            return self._send_json({"error": "out_base must be inside build/models/: %s" % out_base}, 400)
+        os.makedirs(os.path.dirname(out_abs) or MODELS_DIR, exist_ok=True)
+
+        cmd = [os.path.join(BUILD_DIR, "train_demo"), ds_abs, out_abs]
         if masked_epochs > 0:
-            env["SSS_MASKED_EPOCHS"] = str(masked_epochs)
-        job = _run_job(cmd, env=env)
+            cmd += ["--masked-epochs", str(masked_epochs)]
+        job = _run_job(cmd)
         return self._send_json({"job_id": job["id"], "cmd": cmd})
 
     def _post_train_text(self, body):
         text_in = body.get("input") or "data/sample_en.txt"
         max_n   = int(body.get("max", 5000))
         out     = body.get("out") or "build/models/stream_auto.spai"
-        in_abs = text_in if os.path.isabs(text_in) else os.path.join(ROOT, text_in)
-        if not os.path.isfile(in_abs):
-            return self._send_json({"error": "input file not found: %s" % text_in}, 400)
-        out_dir = os.path.dirname(out if os.path.isabs(out) else os.path.join(ROOT, out))
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
+
+        in_abs = _confine(text_in, ROOT)
+        if not in_abs or not os.path.isfile(in_abs):
+            return self._send_json({"error": "input file not found or outside repo: %s" % text_in}, 400)
+
+        out_abs = _confine(out, MODELS_DIR)
+        if not out_abs:
+            return self._send_json({"error": "out must be inside build/models/: %s" % out}, 400)
+        os.makedirs(os.path.dirname(out_abs) or MODELS_DIR, exist_ok=True)
+
         cmd = [
             os.path.join(BUILD_DIR, "stream_train"),
-            "--input", text_in,
+            "--input", in_abs,
             "--max", str(max_n),
-            "--save", out,
+            "--save", out_abs,
             "--verify",
         ]
         job = _run_job(cmd)
@@ -485,8 +524,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not message:
             return self._send_json({"error": "message is required"}, 400)
         model_abs = _resolve_model(model)
-        if not os.path.isfile(model_abs):
-            return self._send_json({"error": "model not found: %s" % model}, 400)
+        if not model_abs:
+            return self._send_json({"error": "model not found in build/models/: %s" % model}, 400)
         cmd = [os.path.join(BUILD_DIR, "chat"), "--load", model_abs]
         # Single-turn: feed the message + :q on stdin so the REPL exits.
         stdin_data = message.rstrip("\n") + "\n:q\n"
@@ -531,13 +570,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             while True:
                 with job["cv"]:
-                    while idx >= len(job["log"]) and not job["done"]:
-                        job["cv"].wait(timeout=10.0)
+                    got_event = job["cv"].wait_for(
+                        lambda: idx < len(job["log"]) or job["done"],
+                        timeout=15.0,
+                    )
                     new = job["log"][idx:]
                     idx = len(job["log"])
                     done = job["done"]
                     exit_code = job["exit_code"]
                     result = dict(job["result"]) if done else None
+                if not got_event and not new and not done:
+                    # SSE comment heartbeat — keeps proxies and browsers from
+                    # closing the connection during long quiet stretches.
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    continue
                 for ln in new:
                     payload = json.dumps({"line": ln})
                     self.wfile.write(("data: %s\n\n" % payload).encode("utf-8"))
@@ -580,18 +627,56 @@ def list_models():
     return out
 
 
+def _confine(path, base):
+    """Resolve `path` against `base` and verify it does not escape it.
+
+    Accepts either a relative path or an absolute path; either way the resolved
+    result must live inside `base`. Also strips a leading `build/models/` or
+    `data/` segment that matches the base, so callers can pass either a bare
+    name or the full repo-relative path that /api/models surfaces.
+    Returns the realpath on success, None on rejection.
+    """
+    if not path:
+        return None
+    base_real = os.path.realpath(base)
+    base_rel  = os.path.relpath(base_real, ROOT)
+
+    if os.path.isabs(path):
+        candidate = path
+    else:
+        norm = path.replace("\\", "/")
+        if norm.startswith("./"):
+            norm = norm[2:]
+        # Strip a redundant repo-relative prefix so passing "build/models/x"
+        # while base is build/models/ doesn't produce build/models/build/models/x.
+        prefix = base_rel.replace(os.sep, "/") + "/"
+        if norm.startswith(prefix):
+            norm = norm[len(prefix):]
+        candidate = os.path.join(base_real, norm)
+    real = os.path.realpath(candidate)
+    if real != base_real and not real.startswith(base_real + os.sep):
+        return None
+    return real
+
+
 def _resolve_model(s):
-    """Accept either an absolute path, a path relative to repo root, or a bare
-    filename inside build/models/."""
-    if os.path.isabs(s) and os.path.isfile(s):
-        return s
-    cand = os.path.join(ROOT, s)
-    if os.path.isfile(cand):
-        return cand
-    cand2 = os.path.join(MODELS_DIR, s)
-    if os.path.isfile(cand2):
-        return cand2
-    return cand  # let the caller surface the not-found error
+    """Resolve a user-supplied model identifier to an absolute path inside
+    build/models/. Rejects absolute paths, traversal, and anything outside the
+    models directory. Returns None on failure so the caller emits a 4xx."""
+    if not s or not isinstance(s, str):
+        return None
+    # Strip a leading "build/models/" so callers can pass either a bare
+    # filename or the rel path returned by /api/models.
+    name = s
+    rel_prefix = "build/models/"
+    if name.startswith(rel_prefix):
+        name = name[len(rel_prefix):]
+    if os.path.isabs(name) or ".." in name.replace("\\", "/").split("/"):
+        return None
+    real = _confine(name, MODELS_DIR)
+    if real and os.path.isfile(real):
+        return real
+    return None
 
 
 def _extract_chat_reply(lines):
@@ -635,12 +720,36 @@ class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+def _parse_port(s):
+    try:
+        p = int(s)
+    except (TypeError, ValueError):
+        raise SystemExit("[ui] invalid port: %r (must be an integer 1..65535)" % s)
+    if not (1 <= p <= 65535):
+        raise SystemExit("[ui] invalid port: %d (must be 1..65535)" % p)
+    return p
+
+
 def main():
-    port = 8080
-    if len(sys.argv) > 1:
-        port = int(sys.argv[1])
-    addr = ("0.0.0.0", port)
+    parser = argparse.ArgumentParser(prog="sss-forge-ui",
+        description="SSS Forge UI bridge server.")
+    parser.add_argument("port", nargs="?", default="8080",
+        help="TCP port to listen on (default 8080)")
+    parser.add_argument("--host", default="127.0.0.1",
+        help="interface to bind (default 127.0.0.1; pass 0.0.0.0 to expose to "
+             "the LAN — note: the API is unauthenticated and runs local "
+             "binaries, so only do this on a trusted network)")
+    parser.add_argument("--cors", default=None,
+        help="value for Access-Control-Allow-Origin. Off by default since the "
+             "UI is same-origin; pass an explicit origin or '*' to enable.")
+    args = parser.parse_args()
+    port = _parse_port(args.port)
+    addr = (args.host, port)
     httpd = ThreadingServer(addr, Handler)
+    httpd.cors_origin = args.cors
+    if args.host == "0.0.0.0":
+        print("[ui] WARNING: binding 0.0.0.0 exposes an unauthenticated API "
+              "that can run local binaries. Only do this on a trusted network.")
     print("[ui] sss forge serving on http://%s:%d  (root=%s)" % (addr[0], addr[1], ROOT))
     try:
         httpd.serve_forever()

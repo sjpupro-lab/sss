@@ -1078,13 +1078,21 @@ $("#tr-go").addEventListener("click", async () => {
   };
   const box = $("#tr-console");
   consoleClear(box);
-  consoleLine(box, "$ train_demo " + body.dataset + " " + body.out_base, "sys");
+  consoleLine(box, "$ train_demo " + body.dataset + " " + body.out_base
+              + (body.masked_epochs > 0 ? " --masked-epochs " + body.masked_epochs : ""), "sys");
   $("#tr-go").disabled = true;
-  const resp = await api("/api/train", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  let resp;
+  try {
+    resp = await api("/api/train", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    consoleLine(box, "[error] " + e, "err");
+    $("#tr-go").disabled = false;
+    return;
+  }
   if (resp.error) {
     consoleLine(box, "[error] " + resp.error, "err");
     $("#tr-go").disabled = false; return;
@@ -1109,11 +1117,18 @@ $("#tt-go").addEventListener("click", async () => {
   consoleClear(box);
   consoleLine(box, "$ stream_train --input " + body.input + " --max " + body.max + " --save " + body.out, "sys");
   $("#tt-go").disabled = true;
-  const resp = await api("/api/train-text", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  let resp;
+  try {
+    resp = await api("/api/train-text", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    consoleLine(box, "[error] " + e, "err");
+    $("#tt-go").disabled = false;
+    return;
+  }
   if (resp.error) {
     consoleLine(box, "[error] " + resp.error, "err");
     $("#tt-go").disabled = false; return;
@@ -1149,14 +1164,29 @@ async function sendChat() {
   chatPush("user", msg);
   chatPush("system", "thinking…");
   $("#chat-send").disabled = true;
-  const resp = await api("/api/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, message: msg }),
-  });
-  // remove "thinking" placeholder
-  const log = $("#chat-log");
-  if (log.lastChild) log.removeChild(log.lastChild);
+
+  const removePlaceholder = () => {
+    const log = $("#chat-log");
+    if (log.lastChild && log.lastChild.classList
+        && log.lastChild.classList.contains("system")) {
+      log.removeChild(log.lastChild);
+    }
+  };
+
+  let resp;
+  try {
+    resp = await api("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, message: msg }),
+    });
+  } catch (e) {
+    removePlaceholder();
+    chatPush("system", "[error] " + e);
+    $("#chat-send").disabled = false;
+    return;
+  }
+  removePlaceholder();
   if (resp.error) {
     chatPush("system", "[error] " + resp.error);
     $("#chat-send").disabled = false; return;
@@ -1164,7 +1194,8 @@ async function sendChat() {
   streamJob(resp.job_id, () => {}, (final) => {
     $("#chat-send").disabled = false;
     const r = (final && final.result) || {};
-    chatPush("ai", r.reply || "(no reply)");
+    if (r.error) chatPush("system", "[error] " + r.error);
+    else         chatPush("ai", r.reply || "(no reply)");
   });
 }
 $("#chat-send").addEventListener("click", sendChat);
@@ -1183,12 +1214,21 @@ async function refreshModels() {
   MODELS.forEach(m => {
     const c = document.createElement("div");
     c.className = "model-card";
-    c.innerHTML =
-      '<div class="name">' + m.name + '</div>' +
-      '<div class="meta">' +
-        '<span class="badge ' + m.ext + '">' + m.ext.toUpperCase() + '</span>' +
-        '<span>' + fmtSize(m.size) + '</span>' +
-      '</div>';
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = m.name;
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const badge = document.createElement("span");
+    badge.className = "badge " + (m.ext === "ces" || m.ext === "spai" || m.ext === "sss"
+                                   ? m.ext : "");
+    badge.textContent = (m.ext || "").toUpperCase();
+    const size = document.createElement("span");
+    size.textContent = fmtSize(m.size);
+    meta.appendChild(badge);
+    meta.appendChild(size);
+    c.appendChild(name);
+    c.appendChild(meta);
     c.addEventListener("click", () => {
       if (m.ext === "ces") {
         $("#gen-model").value = m.rel;
