@@ -162,7 +162,7 @@ $(BUILD_DIR)/train_images_ce: tools/train_images_ce.c $(OBJS) | $(BUILD_DIR)
 $(BUILD_DIR)/gen_image_ce: tools/gen_image_ce.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
-# Sculpt-based image generator (sss_rowvae engine).
+# Spectrogram-based image generator (sss_rowvae engine).
 $(BUILD_DIR)/sss_gen: tools/sss_gen.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 

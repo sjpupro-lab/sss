@@ -1,20 +1,16 @@
-/* sss_rowvae.h — Sculpt-based image generation engine.
+/* sss_rowvae.h — Spectrogram-based image generation engine.
  *
- * Each CE cell stores a *pool of training images* for one attribute
- * (color / shape / face). Generation is row-by-row: at each row the
- * engine looks at every candidate's row pattern, picks the pair that
- * best agrees with itself and the previous row, composes one output
- * row from the chosen color × shape pair, and accumulates a score
- * that biases later rows toward the same candidate. There is no
- * spectrogram, no FFT, no noise base — the canvas starts as a flat
- * neutral gray and is sculpted row by row.
+ * Stores "how to draw" as row/column FFT amplitudes (a spectrogram),
+ * not pixels. Generation starts from noise and is shaped by the
+ * spectrogram patterns associated with each morpheme.
  *
- *   COLOR cell  → pool of training images whose color label matches
- *   SHAPE cell  → pool of training images whose shape label matches
- *   FACE  cell  → pool of training images whose face label matches
+ *   COLOR cell  → low-frequency Y spectrogram per RGB channel
+ *   SHAPE cell  → X spectrogram (column FFT) of grayscale structure
+ *   FACE  cell  → high-frequency Y spectrogram per RGB channel
  *
  * The 256-grid fingerprint is a search key only (morpheme bytes →
- * 256 floats). It indexes which cell to load, never the pixels.
+ * 256 floats). Generation reads cells out of the model and
+ * inverse-FFTs them into an image.
  */
 #ifndef SSS_ROWVAE_H
 #define SSS_ROWVAE_H
@@ -26,8 +22,8 @@
 extern "C" {
 #endif
 
-#define SSS_MAGIC      0x53535839u   /* "SSX9" little-endian */
-#define SSS_VERSION    9u
+#define SSS_MAGIC      0x53535838u   /* "SSX8" little-endian */
+#define SSS_VERSION    8u
 #define SSS_FP_LEN     256
 #define SSS_LABEL_MAX  64
 
@@ -41,13 +37,16 @@ typedef struct {
     uint32_t type;                 /* SSSCellType */
     char     label[SSS_LABEL_MAX];
     float    fp[SSS_FP_LEN];       /* fingerprint = search key */
-    uint32_t num_imgs;             /* number of training images in pool */
-    float   *imgs;                 /* num_imgs × H × W × C floats, [0,1] */
+    uint32_t amp_len;
+    float   *amp;
+    uint32_t phase_len;
+    float   *phase;
 } SSSCell;
 
 typedef struct {
     uint32_t height, width;        /* must be equal (square) */
-    uint32_t channels;             /* always 3 */
+    uint32_t nf;                   /* width/2 + 1 */
+    uint32_t nf_low;               /* nf/3, low-frequency cutoff */
     uint32_t num_cells;
     SSSCell *cells;
 } SSSModel;
@@ -69,20 +68,42 @@ void sss_model_free(SSSModel *m);
  * match threshold. */
 int  sss_search(const SSSModel *m, uint32_t type, const float *fp);
 
+/* Forward real FFT: rebuilds the (amp[0..nf-1], phase[0..nf-1])
+ * half-spectrum of an N-length real signal x. Matches numpy.fft.rfft
+ * convention (no scaling on the forward pass). nf must equal N/2+1. */
+void sss_rfft(const float *x, int N, float *amp, float *phase);
+
+/* Real inverse FFT: rebuilds an N-length real signal from the
+ * (amp[0..nf-1], phase[0..nf-1]) half-spectrum produced by a real
+ * FFT (numpy.fft.rfft). Implemented from scratch — no external
+ * FFT library. */
+void sss_irfft(const float *amp, const float *phase, int nf, int N, float *out);
+
 /* Image helpers. */
 int  sss_image_alloc(SSSImage *img, int h, int w);
 void sss_image_free(SSSImage *img);
 int  sss_image_save_ppm(const SSSImage *img, const char *path);
 
-/* End-to-end generation. `prompt` is split on whitespace into
- * morphemes; each morpheme is matched against COLOR/SHAPE/FACE
- * cells. `seed` permutes the candidate iteration order so the same
- * prompt can produce slight variations. `detail` scales the
- * face-row contribution (1.0 = neutral, >1 = sharper). */
+/* End-to-end iterative generation:
+ *
+ *     image = noise
+ *     for step in range(steps):
+ *         measure  = rfft(image)
+ *         error    = target - measure
+ *         image    = irfft(measure + α(step) * error)
+ *
+ * The model's COLOR/SHAPE/FACE cells supply the targets, the prompt
+ * picks the cells via 256-grid fingerprint, `seed` initialises the
+ * noise PRNG (xorshift32), `detail` scales the high-frequency target
+ * (must be > 0), and `steps` is a positive integer iteration count
+ * (24 is the typical schedule; the library defensively falls back to
+ * 24 if a non-positive value slips through, but new callers should
+ * pass an explicit positive value). */
 int  sss_generate(const SSSModel *m,
                   const char     *prompt,
                   uint32_t        seed,
                   float           detail,
+                  int             steps,
                   SSSImage       *out);
 
 #ifdef __cplusplus
