@@ -442,18 +442,13 @@ int sss_generate(const SSSModel *m,
             if (structure < 0.7f) structure = 0.7f;
             if (structure > 1.3f) structure = 1.3f;
 
-            float v0 = cr0 * structure + face_detail[x * 3 + 0] * 0.3f * detail;
-            float v1 = cr1 * structure + face_detail[x * 3 + 1] * 0.3f * detail;
-            float v2 = cr2 * structure + face_detail[x * 3 + 2] * 0.3f * detail;
-            if (v0 < 0.0f) v0 = 0.0f;
-            if (v0 > 1.0f) v0 = 1.0f;
-            if (v1 < 0.0f) v1 = 0.0f;
-            if (v1 > 1.0f) v1 = 1.0f;
-            if (v2 < 0.0f) v2 = 0.0f;
-            if (v2 > 1.0f) v2 = 1.0f;
-            out_row[x * 3 + 0] = v0;
-            out_row[x * 3 + 1] = v1;
-            out_row[x * 3 + 2] = v2;
+            /* Keep raw float range here. prev_row feeds row_mse_rgb on the
+             * next iteration, and clamping would collapse values >1.0 / <0.0
+             * to identical numbers, hiding real continuity differences.
+             * Final [0,1]→[0,255] clamp lives in sss_image_save_ppm. */
+            out_row[x * 3 + 0] = cr0 * structure + face_detail[x * 3 + 0] * 0.3f * detail;
+            out_row[x * 3 + 1] = cr1 * structure + face_detail[x * 3 + 1] * 0.3f * detail;
+            out_row[x * 3 + 2] = cr2 * structure + face_detail[x * 3 + 2] * 0.3f * detail;
         }
 
         /* ── Accumulate: write to canvas, bump scores, update prev_row. ── */
