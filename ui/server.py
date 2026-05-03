@@ -8,8 +8,13 @@ C 엔진 바이너리를 HTTP API로 노출하는 브릿지 서버.
 Routes:
   GET  /                  → UI (index.html)
   GET  /api/models        → 사용 가능한 모델 목록
-  POST /api/generate      → 이미지 생성 (gen_image_ce)
-  POST /api/train         → 학습 실행 (train_demo)
+  GET  /api/browse        → 서버 디렉토리 탐색 (ROOT 하위만)
+  POST /api/generate      → 이미지 생성 (.ces→gen_image_ce, .sss→sss_gen)
+  POST /api/viz-generate  → 시각화용 생성 (분석 데이터 포함)
+  POST /api/train         → CE 엔진 학습 실행 (train_demo)
+  POST /api/train-sss     → 스펙트로그램 학습 (scripts/sss_train.py)
+  POST /api/train-text    → 텍스트 학습 (stream_train)
+  POST /api/upload        → 학습 데이터 업로드 (multipart)
   POST /api/chat          → 텍스트 대화 (chat 바이너리)
   GET  /api/stream/<id>   → SSE: 실행 중인 작업 로그 스트림
 """
@@ -34,8 +39,11 @@ ROOT = Path(__file__).resolve().parent.parent  # sss/
 BUILD = ROOT / "build"
 MODELS = BUILD / "models"
 UI_DIR = Path(__file__).resolve().parent  # sss/ui/
+DATA_DIR = ROOT / "data"
+UPLOADS_DIR = DATA_DIR / "uploads"
 
 MODELS.mkdir(parents=True, exist_ok=True)
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ─── 작업 저장소 (진행 중인 프로세스 로그) ─────────────────────
 jobs = {}  # job_id → { "proc": Popen, "log": [str], "done": bool, "result": dict }
@@ -203,6 +211,68 @@ def analyze_ppm(ppm_path):
     }
 
 
+# ─── 경로 유효성 (ROOT 하위만 허용) ────────────────────────
+def safe_under_root(p):
+    """경로가 ROOT 하위인지 확인. 통과 시 resolved Path, 아니면 None."""
+    try:
+        target = Path(p).expanduser().resolve()
+    except Exception:
+        return None
+    root = ROOT.resolve()
+    try:
+        target.relative_to(root)
+        return target
+    except ValueError:
+        return None
+
+
+# ─── multipart/form-data 파서 (stdlib only) ─────────────────
+def parse_multipart(body_bytes, boundary):
+    """간단한 multipart 파서.
+    Returns: list of dicts with keys: name, filename, content_type, data (bytes)."""
+    boundary_bytes = ("--" + boundary).encode("latin-1")
+    parts = body_bytes.split(boundary_bytes)
+    result = []
+    for raw in parts:
+        if not raw or raw in (b"--\r\n", b"--", b"\r\n"):
+            continue
+        if raw.startswith(b"\r\n"):
+            raw = raw[2:]
+        if raw.endswith(b"\r\n"):
+            raw = raw[:-2]
+        sep = raw.find(b"\r\n\r\n")
+        if sep < 0:
+            continue
+        header_block = raw[:sep].decode("latin-1", errors="replace")
+        data = raw[sep + 4:]
+        if data.endswith(b"\r\n"):
+            data = data[:-2]
+
+        name = None
+        filename = None
+        content_type = "application/octet-stream"
+        for line in header_block.split("\r\n"):
+            low = line.lower()
+            if low.startswith("content-disposition:"):
+                for tok in line.split(";"):
+                    tok = tok.strip()
+                    if tok.startswith("name="):
+                        name = tok[5:].strip().strip('"')
+                    elif tok.startswith("filename="):
+                        filename = tok[9:].strip().strip('"')
+            elif low.startswith("content-type:"):
+                content_type = line.split(":", 1)[1].strip()
+        if name is None:
+            continue
+        result.append({
+            "name": name,
+            "filename": filename,
+            "content_type": content_type,
+            "data": data,
+        })
+    return result
+
+
 # ─── 모델 스캔 ───────────────────────────────────────────────
 def scan_models():
     """build/models/ 내의 .ces, .spai, .sss 파일 목록."""
@@ -297,6 +367,54 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json({"models": scan_models()})
             return
 
+        # Filesystem browser (ROOT-restricted)
+        if path == "/api/browse":
+            params = parse_qs(parsed.query)
+            req_dir = params.get("dir", [str(DATA_DIR)])[0]
+            target = safe_under_root(req_dir)
+            if target is None:
+                self.send_json({"error": "access denied"}, 403)
+                return
+            if not target.exists() or not target.is_dir():
+                self.send_json({"error": f"not a directory: {req_dir}"}, 400)
+                return
+            entries = []
+            try:
+                items = sorted(target.iterdir(),
+                               key=lambda p: (not p.is_dir(), p.name.lower()))
+            except PermissionError:
+                self.send_json({"error": "permission denied"}, 403)
+                return
+            for item in items:
+                try:
+                    is_dir = item.is_dir()
+                    size_kb = round(item.stat().st_size / 1024, 1) if not is_dir else 0
+                except OSError:
+                    continue
+                entries.append({
+                    "name": item.name,
+                    "is_dir": is_dir,
+                    "size_kb": size_kb,
+                    "rel": str(item.relative_to(ROOT)),
+                })
+            root = ROOT.resolve()
+            parent = None
+            if target != root:
+                parent_path = target.parent.resolve()
+                try:
+                    parent_path.relative_to(root)
+                    parent = str(parent_path)
+                except ValueError:
+                    parent = None
+            self.send_json({
+                "path": str(target),
+                "rel_path": str(target.relative_to(root)) if target != root else "",
+                "parent": parent,
+                "root": str(root),
+                "entries": entries,
+            })
+            return
+
         # Job log stream (SSE)
         if path.startswith("/api/stream/"):
             job_id = path.split("/")[-1]
@@ -353,10 +471,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             model = body.get("model", str(MODELS / "demo.ces"))
             prompt = body.get("prompt", "red")
             seed = str(body.get("seed", 0))
-            steps = str(body.get("steps", 50))
-            wave = str(body.get("wave_iters", 200))
-            hybrid = body.get("hybrid", False)
-            guidance = str(body.get("guidance", 1.0))
 
             if not Path(model).exists():
                 self.send_json({"error": f"model not found: {model}"}, 400)
@@ -365,22 +479,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
             out_name = f"gen_{uuid.uuid4().hex[:6]}.ppm"
             out_path = BUILD / out_name
 
-            cmd = [
-                str(BUILD / "gen_image_ce"),
-                model, prompt, str(out_path),
-                seed, steps, wave,
-            ]
-            if hybrid:
-                cmd += ["--hybrid", "--guidance", guidance]
+            if model.endswith(".sss"):
+                bin_path = BUILD / "sss_gen"
+                if not bin_path.exists():
+                    self.send_json({"error": "sss_gen binary not found — run `make sss_gen`"}, 400)
+                    return
+                detail = f"{float(body.get('detail', 1.0)):.3f}"
+                steps = str(int(body.get("steps", 24)))
+                cmd = [
+                    str(bin_path),
+                    model, prompt, str(out_path),
+                    seed, detail, steps,
+                ]
+            else:
+                bin_path = BUILD / "gen_image_ce"
+                if not bin_path.exists():
+                    self.send_json({"error": "gen_image_ce binary not found — run `make gen_image_ce`"}, 400)
+                    return
+                steps = str(int(body.get("steps", 50)))
+                wave = str(int(body.get("wave_iters", 200)))
+                hybrid = bool(body.get("hybrid", False))
+                guidance = f"{float(body.get('guidance', 1.0)):.3f}"
+                cmd = [
+                    str(bin_path),
+                    model, prompt, str(out_path),
+                    seed, steps, wave,
+                ]
+                if hybrid:
+                    cmd += ["--hybrid", "--guidance", guidance]
 
             def on_done(job):
                 if out_path.exists():
                     data_uri = ppm_to_base64(str(out_path))
                     job["result"]["image"] = data_uri
                     job["result"]["ppm_path"] = str(out_path)
-                    # Parse mean RGB from log
+                    # Parse summary line from log (gen_image_ce uses "mean RGB",
+                    # sss_gen uses "wrote ... (WxH, prompt=..., seed=..., detail=..., steps=...)")
                     for line in job["log"]:
-                        if "mean RGB" in line:
+                        if "mean RGB" in line or line.startswith("wrote "):
                             job["result"]["info"] = line
 
             job_id = start_job(cmd, on_done=on_done)
@@ -476,8 +612,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             model = body.get("model", str(MODELS / "demo.ces"))
             prompt = body.get("prompt", "red")
             seed = str(body.get("seed", 0))
-            steps = str(body.get("steps", 50))
-            wave = str(body.get("wave_iters", 200))
 
             if not Path(model).exists():
                 self.send_json({"error": f"model not found: {model}"}, 400)
@@ -486,10 +620,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             out_name = f"viz_{uuid.uuid4().hex[:6]}.ppm"
             out_path = BUILD / out_name
 
-            cmd = [
-                str(BUILD / "gen_image_ce"),
-                model, prompt, str(out_path), seed, steps, wave,
-            ]
+            if model.endswith(".sss"):
+                bin_path = BUILD / "sss_gen"
+                if not bin_path.exists():
+                    self.send_json({"error": "sss_gen binary not found — run `make sss_gen`"}, 400)
+                    return
+                detail = f"{float(body.get('detail', 1.0)):.3f}"
+                steps = str(int(body.get("steps", 24)))
+                wave = "0"  # sss_gen has no wave param; report 0 to UI
+                cmd = [
+                    str(bin_path),
+                    model, prompt, str(out_path), seed, detail, steps,
+                ]
+            else:
+                bin_path = BUILD / "gen_image_ce"
+                if not bin_path.exists():
+                    self.send_json({"error": "gen_image_ce binary not found — run `make gen_image_ce`"}, 400)
+                    return
+                steps = str(int(body.get("steps", 50)))
+                wave = str(int(body.get("wave_iters", 200)))
+                cmd = [
+                    str(bin_path),
+                    model, prompt, str(out_path), seed, steps, wave,
+                ]
 
             def on_done(job):
                 if out_path.exists():
@@ -527,6 +680,111 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             job_id = start_job(cmd, on_done=on_done)
             self.send_json({"job_id": job_id})
+            return
+
+        # ── Spectrogram (.sss) training ───────────────────────
+        if path == "/api/train-sss":
+            body = self.read_body()
+            labels = body.get("labels")
+            root_dir = body.get("root")
+            out_model = body.get("out", str(MODELS / "custom.sss"))
+            size = str(int(body.get("size", 64)))
+
+            if not labels or not root_dir:
+                self.send_json({"error": "labels and root are required"}, 400)
+                return
+            if not Path(labels).exists():
+                self.send_json({"error": f"labels file not found: {labels}"}, 400)
+                return
+            if not Path(root_dir).is_dir():
+                self.send_json({"error": f"root dir not found: {root_dir}"}, 400)
+                return
+            # Ensure out_model has .sss extension
+            if not out_model.endswith(".sss"):
+                out_model += ".sss"
+            Path(out_model).parent.mkdir(parents=True, exist_ok=True)
+
+            cmd = [
+                "python3", str(ROOT / "scripts" / "sss_train.py"),
+                "--labels", labels,
+                "--root", root_dir,
+                "--out", out_model,
+                "--size", size,
+            ]
+
+            def on_done(job):
+                p = Path(out_model)
+                job["result"]["sss_exists"] = p.exists()
+                if p.exists():
+                    job["result"]["sss_size_kb"] = round(p.stat().st_size / 1024, 1)
+                    job["result"]["sss_path"] = str(p)
+
+            job_id = start_job(cmd, on_done=on_done)
+            self.send_json({"job_id": job_id})
+            return
+
+        # ── File upload (multipart) ───────────────────────────
+        if path == "/api/upload":
+            ctype = self.headers.get("Content-Type", "")
+            if "multipart/form-data" not in ctype:
+                self.send_json({"error": "Content-Type must be multipart/form-data"}, 400)
+                return
+            boundary = None
+            for tok in ctype.split(";"):
+                tok = tok.strip()
+                if tok.lower().startswith("boundary="):
+                    boundary = tok[9:].strip().strip('"')
+            if not boundary:
+                self.send_json({"error": "boundary missing"}, 400)
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            if length <= 0:
+                self.send_json({"error": "empty body"}, 400)
+                return
+            raw = self.rfile.read(length)
+            try:
+                parts = parse_multipart(raw, boundary)
+            except Exception as e:
+                self.send_json({"error": f"multipart parse failed: {e}"}, 400)
+                return
+
+            session = "sess_" + uuid.uuid4().hex[:8]
+            session_name = None
+            for p in parts:
+                if p["name"] == "session" and not p["filename"]:
+                    session_name = p["data"].decode("utf-8", errors="replace").strip()
+            if session_name:
+                # sanitize
+                safe = "".join(c for c in session_name if c.isalnum() or c in "._-")[:40]
+                if safe:
+                    session = safe
+            target_dir = UPLOADS_DIR / session
+            target_dir.mkdir(parents=True, exist_ok=True)
+
+            saved = []
+            labels_path = None
+            for p in parts:
+                fname = p["filename"]
+                if not fname:
+                    continue
+                # strip path components
+                fname = Path(fname).name
+                if not fname:
+                    continue
+                dst = target_dir / fname
+                with open(dst, "wb") as f:
+                    f.write(p["data"])
+                saved.append({"name": fname, "size": len(p["data"])})
+                if p["name"] == "labels" or fname.endswith(".tsv") or fname == "labels.txt":
+                    labels_path = str(dst)
+
+            self.send_json({
+                "dir": str(target_dir),
+                "rel_dir": str(target_dir.relative_to(ROOT)),
+                "labels": labels_path,
+                "rel_labels": str(Path(labels_path).relative_to(ROOT)) if labels_path else None,
+                "files": saved,
+            })
             return
 
         self.send_json({"error": "not found"}, 404)

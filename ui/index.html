@@ -497,35 +497,56 @@
              value="red apple">
     </div>
 
-    <div class="section-title">Parameters</div>
-    <div class="slider-row">
-      <span class="slider-label">Steps</span>
-      <input type="range" id="gen-steps" min="4" max="100" value="50"
-             oninput="$('gen-steps-val').textContent=this.value">
-      <span class="slider-value" id="gen-steps-val">50</span>
+    <div class="section-title">Parameters <span id="gen-engine-label" style="color:#666;font-weight:400;letter-spacing:0">(.ces)</span></div>
+
+    <!-- .ces-only parameters (gen_image_ce) -->
+    <div id="gen-params-ces">
+      <div class="slider-row">
+        <span class="slider-label">Steps</span>
+        <input type="range" id="gen-steps" min="4" max="100" value="50"
+               oninput="$('gen-steps-val').textContent=this.value">
+        <span class="slider-value" id="gen-steps-val">50</span>
+      </div>
+      <div class="slider-row">
+        <span class="slider-label">Wave</span>
+        <input type="range" id="gen-wave" min="0" max="500" value="200" step="10"
+               oninput="$('gen-wave-val').textContent=this.value">
+        <span class="slider-value" id="gen-wave-val">200</span>
+      </div>
+      <div class="slider-row">
+        <span class="slider-label">Guidance</span>
+        <input type="range" id="gen-guidance" min="0.5" max="4.0" value="1.0" step="0.1"
+               oninput="$('gen-guidance-val').textContent=parseFloat(this.value).toFixed(1)">
+        <span class="slider-value" id="gen-guidance-val">1.0</span>
+      </div>
+      <div class="toggle-row">
+        <span class="toggle-label">Hybrid VAE</span>
+        <div class="toggle" id="gen-hybrid" onclick="this.classList.toggle('on')"></div>
+      </div>
     </div>
-    <div class="slider-row">
-      <span class="slider-label">Wave</span>
-      <input type="range" id="gen-wave" min="0" max="500" value="200" step="10"
-             oninput="$('gen-wave-val').textContent=this.value">
-      <span class="slider-value" id="gen-wave-val">200</span>
+
+    <!-- .sss-only parameters (sss_gen) -->
+    <div id="gen-params-sss" style="display:none">
+      <div class="slider-row">
+        <span class="slider-label">Steps</span>
+        <input type="range" id="gen-sss-steps" min="4" max="100" value="24"
+               oninput="$('gen-sss-steps-val').textContent=this.value">
+        <span class="slider-value" id="gen-sss-steps-val">24</span>
+      </div>
+      <div class="slider-row">
+        <span class="slider-label">Detail</span>
+        <input type="range" id="gen-sss-detail" min="0.1" max="3.0" value="1.0" step="0.1"
+               oninput="$('gen-sss-detail-val').textContent=parseFloat(this.value).toFixed(1)">
+        <span class="slider-value" id="gen-sss-detail-val">1.0</span>
+      </div>
     </div>
-    <div class="slider-row">
-      <span class="slider-label">Guidance</span>
-      <input type="range" id="gen-guidance" min="0.5" max="4.0" value="1.0" step="0.1"
-             oninput="$('gen-guidance-val').textContent=parseFloat(this.value).toFixed(1)">
-      <span class="slider-value" id="gen-guidance-val">1.0</span>
-    </div>
+
+    <!-- shared -->
     <div class="slider-row">
       <span class="slider-label">Seed</span>
       <input type="range" id="gen-seed" min="0" max="999" value="0"
              oninput="$('gen-seed-val').textContent=this.value">
       <span class="slider-value" id="gen-seed-val">0</span>
-    </div>
-
-    <div class="toggle-row">
-      <span class="toggle-label">Hybrid VAE</span>
-      <div class="toggle" id="gen-hybrid" onclick="this.classList.toggle('on')"></div>
     </div>
 
     <div class="btn-row">
@@ -632,56 +653,174 @@
 
   <!-- ── Train Panel ────────────────────── -->
   <div class="panel" id="panel-train">
-    <div class="section-title">Image + Text Training</div>
 
-    <div class="field">
-      <div class="field-label">Dataset Path</div>
-      <input class="field-input" id="train-dataset" type="text"
-             placeholder="data/demo" value="data/demo">
-    </div>
-    <div class="field">
-      <div class="field-label">Output Model Name</div>
-      <input class="field-input" id="train-out" type="text"
-             placeholder="build/models/demo" value="build/models/my_model">
-    </div>
-    <div class="slider-row">
-      <span class="slider-label">Masked Epochs</span>
-      <input type="range" id="train-epochs" min="0" max="10" value="0"
-             oninput="$('train-epochs-val').textContent=this.value">
-      <span class="slider-value" id="train-epochs-val">0</span>
+    <!-- Subtab selector -->
+    <div class="tabs" style="padding:0 0 12px 0;border-bottom:1px solid var(--border);margin-bottom:14px">
+      <button class="tab active" data-subtab="ces" onclick="switchTrainTab('ces')">CE Engine (.ces)</button>
+      <button class="tab" data-subtab="sss" onclick="switchTrainTab('sss')">Spectrogram (.sss)</button>
+      <button class="tab" data-subtab="text" onclick="switchTrainTab('text')">Text (.spai)</button>
     </div>
 
-    <div class="btn-row">
-      <button class="btn btn-primary" id="train-btn" onclick="doTrain()">
-        Start Training
-      </button>
+    <!-- ── CE Engine subtab ── -->
+    <div class="train-sub active" id="train-sub-ces">
+      <div class="section-title">CE Engine Training</div>
+
+      <div class="field">
+        <div class="field-label">Dataset Path</div>
+        <input class="field-input" id="train-dataset" type="text"
+               placeholder="data/demo" value="data/demo">
+      </div>
+      <div class="field">
+        <div class="field-label">Output Model Name</div>
+        <input class="field-input" id="train-out" type="text"
+               placeholder="build/models/demo" value="build/models/my_model">
+      </div>
+      <div class="slider-row">
+        <span class="slider-label">Masked Epochs</span>
+        <input type="range" id="train-epochs" min="0" max="10" value="0"
+               oninput="$('train-epochs-val').textContent=this.value">
+        <span class="slider-value" id="train-epochs-val">0</span>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-primary" id="train-btn" onclick="doTrain()">
+          Start Training
+        </button>
+      </div>
+
+      <div class="divider"></div>
+      <div class="console" id="train-console">
+        <div class="log-line dim">training log will appear here.</div>
+      </div>
     </div>
 
-    <div class="divider"></div>
-    <div class="console" id="train-console">
-      <div class="log-line dim">training log will appear here.</div>
+    <!-- ── Spectrogram subtab ── -->
+    <div class="train-sub" id="train-sub-sss" style="display:none">
+      <div class="section-title">Spectrogram (.sss) Training</div>
+      <div class="log-line dim" style="font-size:10px;margin-bottom:10px">
+        Trains via <code>scripts/sss_train.py</code> using row/column FFT cells.
+      </div>
+
+      <!-- Quick presets -->
+      <div class="section-title">Quick Presets</div>
+      <div class="btn-row" style="flex-wrap:wrap;margin-top:0">
+        <button class="btn btn-secondary" onclick="setSssDataset('data/sss_demo','data/sss_demo/labels.tsv')">SSS Demo (18)</button>
+        <button class="btn btn-secondary" onclick="setSssDataset('data/sanrio','data/sanrio/labels.tsv')">Sanrio (25)</button>
+        <button class="btn btn-secondary" onclick="setSssDataset('data/sss_demo_1k','data/sss_demo_1k/labels.tsv')">SSS Demo 1k</button>
+      </div>
+
+      <div class="divider"></div>
+
+      <!-- Method 1: Server filesystem -->
+      <div class="section-title">Dataset (Server Path)</div>
+      <div class="field">
+        <div class="field-label">Image Root Dir</div>
+        <div style="display:flex;gap:6px">
+          <input class="field-input" id="sss-root" type="text"
+                 placeholder="data/sss_demo" value="data/sss_demo" style="flex:1">
+          <button class="btn btn-secondary" onclick="openFileBrowser('root')">Browse</button>
+        </div>
+      </div>
+      <div class="field">
+        <div class="field-label">Labels TSV</div>
+        <div style="display:flex;gap:6px">
+          <input class="field-input" id="sss-labels" type="text"
+                 placeholder="data/sss_demo/labels.tsv" value="data/sss_demo/labels.tsv" style="flex:1">
+          <button class="btn btn-secondary" onclick="openFileBrowser('labels')">Browse</button>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
+      <!-- Method 2: Upload -->
+      <div class="section-title">Or Upload Files</div>
+      <div class="field">
+        <div class="field-label">Images (multi-select)</div>
+        <input type="file" id="sss-upload-images" multiple accept="image/*,.ppm" class="field-input">
+      </div>
+      <div class="field">
+        <div class="field-label">labels.tsv</div>
+        <input type="file" id="sss-upload-labels" accept=".tsv,.txt" class="field-input">
+      </div>
+      <div class="field">
+        <div class="field-label">Upload Session Name (optional)</div>
+        <input class="field-input" id="sss-upload-session" type="text"
+               placeholder="my_dataset (-> data/uploads/my_dataset/)">
+      </div>
+      <div class="btn-row" style="margin-top:8px">
+        <button class="btn btn-secondary" id="sss-upload-btn" onclick="doSssUpload()">Upload</button>
+      </div>
+      <div class="log-line dim" style="font-size:9px;margin-top:8px">
+        labels.tsv format: <code>img.ppm&lt;TAB&gt;color&lt;TAB&gt;shape&lt;TAB&gt;face</code>
+      </div>
+
+      <div class="divider"></div>
+
+      <!-- Common params -->
+      <div class="section-title">Train Parameters</div>
+      <div class="field">
+        <div class="field-label">Output Model Name</div>
+        <input class="field-input" id="sss-out" type="text"
+               placeholder="build/models/my_model" value="build/models/my_sss">
+      </div>
+      <div class="slider-row">
+        <span class="slider-label">Size</span>
+        <input type="range" id="sss-size" min="32" max="128" value="64" step="32"
+               oninput="$('sss-size-val').textContent=this.value">
+        <span class="slider-value" id="sss-size-val">64</span>
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-primary" id="sss-train-btn" onclick="doTrainSSS()">
+          Train Spectrogram Model
+        </button>
+      </div>
+
+      <div class="divider"></div>
+      <div class="console" id="train-sss-console">
+        <div class="log-line dim">spectrogram training log will appear here.</div>
+      </div>
     </div>
 
-    <div class="divider"></div>
-    <div class="section-title">Text Training</div>
-    <div class="field">
-      <div class="field-label">Text File</div>
-      <input class="field-input" id="train-text-input" type="text"
-             placeholder="data/wiki5k.txt" value="data/wiki5k.txt">
+    <!-- ── Text subtab ── -->
+    <div class="train-sub" id="train-sub-text" style="display:none">
+      <div class="section-title">Text Training</div>
+      <div class="field">
+        <div class="field-label">Text File</div>
+        <input class="field-input" id="train-text-input" type="text"
+               placeholder="data/wiki5k.txt" value="data/wiki5k.txt">
+      </div>
+      <div class="slider-row">
+        <span class="slider-label">Max Lines</span>
+        <input type="range" id="train-text-max" min="100" max="50000" value="5000" step="100"
+               oninput="$('train-text-max-val').textContent=this.value">
+        <span class="slider-value" id="train-text-max-val">5000</span>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="doTrainText()">
+          Train Text Model
+        </button>
+      </div>
+      <div class="console" id="train-text-console" style="margin-top:12px">
+        <div class="log-line dim">text training log here.</div>
+      </div>
     </div>
-    <div class="slider-row">
-      <span class="slider-label">Max Lines</span>
-      <input type="range" id="train-text-max" min="100" max="50000" value="5000" step="100"
-             oninput="$('train-text-max-val').textContent=this.value">
-      <span class="slider-value" id="train-text-max-val">5000</span>
-    </div>
-    <div class="btn-row">
-      <button class="btn btn-primary" onclick="doTrainText()">
-        Train Text Model
-      </button>
-    </div>
-    <div class="console" id="train-text-console" style="margin-top:12px">
-      <div class="log-line dim">text training log here.</div>
+  </div>
+
+  <!-- ── File Browser Modal ─────────────── -->
+  <div id="file-browser-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:9999;align-items:center;justify-content:center;padding:16px">
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);width:100%;max-width:520px;max-height:85vh;display:flex;flex-direction:column;overflow:hidden">
+      <div style="padding:12px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
+        <div class="section-title" style="margin:0">Browse Files</div>
+        <button class="btn btn-secondary" style="padding:4px 10px;font-size:11px" onclick="closeFileBrowser()">✕</button>
+      </div>
+      <div style="padding:8px 14px;background:var(--bg);border-bottom:1px solid var(--border);font-size:10px;color:var(--text);word-break:break-all" id="fb-path">data/</div>
+      <div style="padding:8px 14px;border-bottom:1px solid var(--border);display:flex;gap:6px">
+        <button class="btn btn-secondary" style="font-size:11px;padding:6px 10px" onclick="fbUp()">↑ Parent</button>
+        <button class="btn btn-secondary" style="font-size:11px;padding:6px 10px" onclick="fbHome()">⌂ data/</button>
+        <button class="btn btn-primary" style="font-size:11px;padding:6px 10px;margin-left:auto" onclick="fbSelectDir()">Select Dir</button>
+      </div>
+      <div id="fb-list" style="flex:1;overflow-y:auto;padding:6px"></div>
     </div>
   </div>
 
@@ -780,24 +919,40 @@ function streamJob(jobId, consoleId, onDone) {
   };
 }
 
+// ── Param UI switching by model type ───────
+function isSssModel(path) { return !!path && path.toLowerCase().endsWith('.sss'); }
+function updateParamsUI() {
+  const sss = isSssModel(selectedModel);
+  $('gen-params-ces').style.display = sss ? 'none' : '';
+  $('gen-params-sss').style.display = sss ? '' : 'none';
+  $('gen-engine-label').textContent = sss ? '(.sss → sss_gen)' : '(.ces → gen_image_ce)';
+}
+
 // ── Image Generation ───────────────────────
 async function doGenerate() {
   const btn = $('gen-btn');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>Generating...';
   clearConsole('gen-console');
-  log('gen-console', '$ gen_image_ce ...', 'info');
 
   const prompt = $('gen-prompt').value || 'red';
+  const sss = isSssModel(selectedModel);
   const body = {
     model: selectedModel || 'build/models/demo.ces',
     prompt: prompt,
     seed: parseInt($('gen-seed').value),
-    steps: parseInt($('gen-steps').value),
-    wave_iters: parseInt($('gen-wave').value),
-    guidance: parseFloat($('gen-guidance').value),
-    hybrid: $('gen-hybrid').classList.contains('on'),
   };
+  if (sss) {
+    body.steps = parseInt($('gen-sss-steps').value);
+    body.detail = parseFloat($('gen-sss-detail').value);
+    log('gen-console', `$ sss_gen ${body.model} "${prompt}" out.ppm ${body.seed} ${body.detail.toFixed(3)} ${body.steps}`, 'info');
+  } else {
+    body.steps = parseInt($('gen-steps').value);
+    body.wave_iters = parseInt($('gen-wave').value);
+    body.guidance = parseFloat($('gen-guidance').value);
+    body.hybrid = $('gen-hybrid').classList.contains('on');
+    log('gen-console', `$ gen_image_ce ${body.model} "${prompt}" out.ppm ${body.seed} ${body.steps} ${body.wave_iters}` + (body.hybrid ? ` --hybrid --guidance ${body.guidance}` : ''), 'info');
+  }
 
   try {
     const res = await fetch(API + '/api/generate', {
@@ -805,7 +960,13 @@ async function doGenerate() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    const { job_id } = await res.json();
+    const data0 = await res.json();
+    if (data0.error) {
+      log('gen-console', '[ERROR] ' + data0.error, 'error');
+      btn.disabled = false; btn.textContent = 'Generate';
+      return;
+    }
+    const job_id = data0.job_id;
 
     streamJob(job_id, 'gen-console', (data) => {
       btn.disabled = false;
@@ -813,7 +974,10 @@ async function doGenerate() {
 
       if (data.image) {
         $('gen-result').innerHTML = `<img src="${data.image}" alt="generated">`;
-        $('gen-meta').textContent = `${prompt} | seed:${body.seed} steps:${body.steps} wave:${body.wave_iters}`;
+        const meta = sss
+          ? `${prompt} | seed:${body.seed} steps:${body.steps} detail:${body.detail.toFixed(1)}`
+          : `${prompt} | seed:${body.seed} steps:${body.steps} wave:${body.wave_iters}`;
+        $('gen-meta').textContent = meta;
         if (data.info) log('gen-console', data.info, 'success');
 
         // Add to gallery
@@ -967,11 +1131,12 @@ async function loadModels() {
       return;
     }
 
-    // Auto-select first .ces if none selected
+    // Auto-select first .ces or .sss if none selected
     if (!selectedModel) {
-      const ces = models.find(m => m.type === 'ces');
-      if (ces) selectedModel = ces.path;
+      const m0 = models.find(m => m.type === 'ces') || models.find(m => m.type === 'sss');
+      if (m0) selectedModel = m0.path;
     }
+    updateParamsUI();
 
     el.innerHTML = models.map(m => {
       const badgeCls = m.type === 'ces' ? 'badge-ces' : m.type === 'spai' ? 'badge-spai' : 'badge-sss';
@@ -990,8 +1155,9 @@ async function loadModels() {
 }
 
 function selectModel(path, type) {
-  if (type === 'ces') {
+  if (type === 'ces' || type === 'sss') {
     selectedModel = path;
+    updateParamsUI();
   } else if (type === 'spai') {
     $('chat-model').value = path;
   }
@@ -1019,18 +1185,31 @@ async function doVizGenerate() {
   setPipeStage(0);
 
   try {
+    const sss = isSssModel(selectedModel);
+    const vizBody = {
+      model: selectedModel || 'build/models/demo.ces',
+      prompt,
+      seed: parseInt($('gen-seed')?.value || '0'),
+    };
+    if (sss) {
+      vizBody.steps = parseInt($('gen-sss-steps')?.value || '24');
+      vizBody.detail = parseFloat($('gen-sss-detail')?.value || '1.0');
+    } else {
+      vizBody.steps = parseInt($('gen-steps')?.value || '50');
+      vizBody.wave_iters = parseInt($('gen-wave')?.value || '200');
+    }
     const res = await fetch(API + '/api/viz-generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: selectedModel || 'build/models/demo.ces',
-        prompt,
-        seed: parseInt($('gen-seed')?.value || '0'),
-        steps: parseInt($('gen-steps')?.value || '50'),
-        wave_iters: parseInt($('gen-wave')?.value || '200'),
-      }),
+      body: JSON.stringify(vizBody),
     });
-    const { job_id } = await res.json();
+    const j0 = await res.json();
+    if (j0.error) {
+      log('sig-console', '[ERROR] ' + j0.error, 'error');
+      btn.disabled = false; btn.textContent = 'Run';
+      return;
+    }
+    const job_id = j0.job_id;
 
     setTimeout(() => setPipeStage(1), 200);
     setTimeout(() => setPipeStage(2), 500);
@@ -1134,8 +1313,188 @@ function drawWaveConvergence(iters) {
   ctx.fillText('0',4,H-2); ctx.fillText(iters+' iters',W-55,H-2);
 }
 
+// ── Train subtabs ──────────────────────────
+function switchTrainTab(name) {
+  document.querySelectorAll('#panel-train .tab').forEach(t =>
+    t.classList.toggle('active', t.dataset.subtab === name));
+  document.querySelectorAll('.train-sub').forEach(p =>
+    p.style.display = (p.id === 'train-sub-' + name) ? '' : 'none');
+}
+
+// ── Spectrogram dataset preset ─────────────
+function setSssDataset(rootDir, labelsPath) {
+  $('sss-root').value = rootDir;
+  $('sss-labels').value = labelsPath;
+  log('train-sss-console', `[preset] root=${rootDir} labels=${labelsPath}`, 'info');
+}
+
+// ── Spectrogram training ───────────────────
+async function doTrainSSS() {
+  const btn = $('sss-train-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Training...';
+  clearConsole('train-sss-console');
+
+  const body = {
+    labels: $('sss-labels').value.trim(),
+    root: $('sss-root').value.trim(),
+    out: $('sss-out').value.trim(),
+    size: parseInt($('sss-size').value),
+  };
+  log('train-sss-console', `$ python3 scripts/sss_train.py --labels ${body.labels} --root ${body.root} --out ${body.out} --size ${body.size}`, 'info');
+
+  try {
+    const res = await fetch(API + '/api/train-sss', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data0 = await res.json();
+    if (data0.error) {
+      log('train-sss-console', '[ERROR] ' + data0.error, 'error');
+      btn.disabled = false; btn.textContent = 'Train Spectrogram Model';
+      return;
+    }
+    streamJob(data0.job_id, 'train-sss-console', (data) => {
+      btn.disabled = false;
+      btn.textContent = 'Train Spectrogram Model';
+      if (data.sss_exists) {
+        log('train-sss-console', `model saved: ${data.sss_path} (${data.sss_size_kb}KB)`, 'success');
+        selectedModel = data.sss_path;
+        updateParamsUI();
+        loadModels();
+      }
+    });
+  } catch (e) {
+    log('train-sss-console', '[ERROR] ' + e.message, 'error');
+    btn.disabled = false; btn.textContent = 'Train Spectrogram Model';
+  }
+}
+
+// ── Spectrogram dataset upload ─────────────
+async function doSssUpload() {
+  const btn = $('sss-upload-btn');
+  const imgs = $('sss-upload-images').files;
+  const lbl = $('sss-upload-labels').files[0];
+  if (!imgs.length && !lbl) {
+    log('train-sss-console', '[ERROR] select images and/or a labels file', 'error');
+    return;
+  }
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Uploading...';
+
+  const fd = new FormData();
+  for (let i = 0; i < imgs.length; i++) fd.append('image_' + i, imgs[i], imgs[i].name);
+  if (lbl) fd.append('labels', lbl, lbl.name);
+  const sess = $('sss-upload-session').value.trim();
+  if (sess) fd.append('session', sess);
+
+  try {
+    const res = await fetch(API + '/api/upload', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (data.error) {
+      log('train-sss-console', '[ERROR] ' + data.error, 'error');
+    } else {
+      log('train-sss-console', `[upload] ${data.files.length} file(s) → ${data.rel_dir}`, 'success');
+      $('sss-root').value = data.rel_dir;
+      if (data.rel_labels) $('sss-labels').value = data.rel_labels;
+    }
+  } catch (e) {
+    log('train-sss-console', '[ERROR] ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Upload';
+  }
+}
+
+// ── File Browser Modal ─────────────────────
+let fbCurrentPath = null;
+let fbTargetField = null;  // 'root' or 'labels'
+
+async function openFileBrowser(target) {
+  fbTargetField = target;
+  const initial = target === 'labels'
+    ? ($('sss-labels').value || 'data')
+    : ($('sss-root').value || 'data');
+  // If a file path, browse its dir
+  let startPath = initial;
+  if (initial.endsWith('.tsv') || initial.endsWith('.txt')) {
+    const idx = initial.lastIndexOf('/');
+    startPath = idx >= 0 ? initial.slice(0, idx) : 'data';
+  }
+  $('file-browser-modal').style.display = 'flex';
+  await fbLoad(startPath);
+}
+
+function closeFileBrowser() {
+  $('file-browser-modal').style.display = 'none';
+}
+
+async function fbLoad(dir) {
+  try {
+    const res = await fetch(API + '/api/browse?dir=' + encodeURIComponent(dir));
+    const data = await res.json();
+    if (data.error) {
+      $('fb-list').innerHTML = `<div style="padding:12px;color:var(--red);font-size:11px">${data.error}</div>`;
+      return;
+    }
+    fbCurrentPath = data.path;
+    $('fb-path').textContent = data.rel_path ? (data.rel_path + '/') : '/';
+    const items = [];
+    if (data.parent) {
+      items.push(`<div class="fb-item" style="padding:8px 10px;border-bottom:1px solid var(--border);cursor:pointer;font-size:11px;color:var(--text)" onclick="fbLoad('${data.parent.replace(/'/g, "\\'")}')">📁 ../</div>`);
+    }
+    data.entries.forEach(e => {
+      const icon = e.is_dir ? '📁' : '📄';
+      const sizeStr = e.is_dir ? '' : ` <span style="color:#555;float:right">${e.size_kb} KB</span>`;
+      const action = e.is_dir
+        ? `fbLoad('${e.rel.replace(/'/g, "\\'")}')`
+        : `fbPickFile('${e.rel.replace(/'/g, "\\'")}')`;
+      const color = e.is_dir ? 'var(--text-bright)' : 'var(--text)';
+      items.push(`<div class="fb-item" style="padding:8px 10px;border-bottom:1px solid var(--border);cursor:pointer;font-size:11px;color:${color}" onclick="${action}">${icon} ${e.name}${sizeStr}</div>`);
+    });
+    if (!items.length) items.push('<div style="padding:12px;color:#555;font-size:11px">empty</div>');
+    $('fb-list').innerHTML = items.join('');
+  } catch (e) {
+    $('fb-list').innerHTML = `<div style="padding:12px;color:var(--red);font-size:11px">${e.message}</div>`;
+  }
+}
+
+function fbUp() {
+  if (!fbCurrentPath) return;
+  fetch(API + '/api/browse?dir=' + encodeURIComponent(fbCurrentPath))
+    .then(r => r.json())
+    .then(data => { if (data.parent) fbLoad(data.parent); });
+}
+function fbHome() { fbLoad('data'); }
+
+function fbPickFile(rel) {
+  if (fbTargetField === 'labels') {
+    $('sss-labels').value = rel;
+  } else {
+    // root expects a directory; if user clicked a file in target=root, take its parent
+    const idx = rel.lastIndexOf('/');
+    $('sss-root').value = idx >= 0 ? rel.slice(0, idx) : rel;
+  }
+  closeFileBrowser();
+}
+
+function fbSelectDir() {
+  if (!fbCurrentPath) return;
+  // Convert absolute path back to a rel path under ROOT.
+  fetch(API + '/api/browse?dir=' + encodeURIComponent(fbCurrentPath))
+    .then(r => r.json())
+    .then(data => {
+      const rel = data.rel_path || '.';
+      if (fbTargetField === 'labels') $('sss-labels').value = rel;
+      else $('sss-root').value = rel;
+      closeFileBrowser();
+    });
+}
+
 // ── Init ───────────────────────────────────
 loadModels();
+updateParamsUI();
 </script>
 
 </body>
