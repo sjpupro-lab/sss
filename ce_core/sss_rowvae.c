@@ -264,6 +264,27 @@ static void build_face_detail(const SSSCell *cf, int H, int W, int r,
     for (int x = 0; x < W * 3; ++x) avg[x] -= scratch[x];   /* residual */
 }
 
+/* Save the current canvas state as a PPM frame.
+ * path must be writable; H/W must match out->height/width. */
+static void save_frame_ppm(const SSSImage *out, int H, int W, const char *path)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P6\n%d %d\n255\n", W, H);
+    size_t n = (size_t)H * (size_t)W;
+    unsigned char *buf = (unsigned char *)malloc(n * 3);
+    if (!buf) { fclose(f); return; }
+    for (size_t i = 0; i < n; ++i) {
+        float v;
+        v = out->data[i*3+0]; buf[i*3+0] = (v<=0.f)?0:(v>=1.f)?255:(unsigned char)(v*255.f+.5f);
+        v = out->data[i*3+1]; buf[i*3+1] = (v<=0.f)?0:(v>=1.f)?255:(unsigned char)(v*255.f+.5f);
+        v = out->data[i*3+2]; buf[i*3+2] = (v<=0.f)?0:(v>=1.f)?255:(unsigned char)(v*255.f+.5f);
+    }
+    fwrite(buf, 1, n*3, f);
+    free(buf);
+    fclose(f);
+}
+
 int sss_generate(const SSSModel *m,
                  const char     *prompt,
                  uint32_t        seed,
@@ -372,7 +393,42 @@ int sss_generate(const SSSModel *m,
     }
     for (int x = 0; x < W * 3; ++x) fallback[x] = 0.94f;
 
+    /* frame_dir: if SSS_FRAME_DIR env var is set, save per-row frames there. */
+    const char *frame_dir = getenv("SSS_FRAME_DIR");
+    /* anim_mode: SSS_ANIM_MODE=freq → detail oscillates; =morph → prompt switches mid-way */
+    const char *anim_mode = getenv("SSS_ANIM_MODE");
+    /* SSS_PROMPT2: second prompt for morph mode (switches at row H/2) */
+    const char *prompt2   = getenv("SSS_PROMPT2");
+    /* For morph mode: pre-resolve second prompt's cells */
+    int ic2 = ic, is2 = is_, ifc2 = ifc;
+    if (anim_mode && strcmp(anim_mode, "morph") == 0 && prompt2) {
+        char *tok2[MAX_TOKENS]; int ntok2 = 0;
+        if (tokenise(prompt2, tok2, &ntok2) == 0) {
+            ic2  = best_cell_for_type(m, SSS_CE_COLOR, tok2, ntok2);
+            is2  = best_cell_for_type(m, SSS_CE_SHAPE, tok2, ntok2);
+            ifc2 = best_cell_for_type(m, SSS_CE_FACE,  tok2, ntok2);
+            for (int i = 0; i < ntok2; ++i) free(tok2[i]);
+        }
+    }
+
     for (int r = 0; r < H; ++r) {
+        /* ── Morph: switch cells at the halfway row ── */
+        if (anim_mode && strcmp(anim_mode, "morph") == 0 && r == H / 2) {
+            cc  = (ic2  >= 0) ? &m->cells[ic2]  : NULL;
+            cs  = (is2  >= 0) ? &m->cells[is2]  : NULL;
+            cf  = (ifc2 >= 0) ? &m->cells[ifc2] : NULL;
+            total_c = (cc && cc->num_imgs > 0) ? (int)cc->num_imgs : 0;
+            total_s = (cs && cs->num_imgs > 0) ? (int)cs->num_imgs : 0;
+            nc = total_c > MAX_CANDS ? MAX_CANDS : total_c;
+            ns = total_s > MAX_CANDS ? MAX_CANDS : total_s;
+        }
+        /* ── Freq: oscillate detail with sinf ── */
+        float cur_detail = detail;
+        if (anim_mode && strcmp(anim_mode, "freq") == 0) {
+            float t = (float)r / (float)(H > 1 ? H - 1 : 1);
+            cur_detail = 0.2f + 0.8f * (0.5f + 0.5f * sinf(t * (float)M_PI * 3.0f));
+        }
+
         /* Build face detail row (zeros if no face cell). */
         build_face_detail(cf, H, W, r, face_detail, face_scratch);
 
@@ -446,9 +502,9 @@ int sss_generate(const SSSModel *m,
              * next iteration, and clamping would collapse values >1.0 / <0.0
              * to identical numbers, hiding real continuity differences.
              * Final [0,1]→[0,255] clamp lives in sss_image_save_ppm. */
-            out_row[x * 3 + 0] = cr0 * structure + face_detail[x * 3 + 0] * 0.3f * detail;
-            out_row[x * 3 + 1] = cr1 * structure + face_detail[x * 3 + 1] * 0.3f * detail;
-            out_row[x * 3 + 2] = cr2 * structure + face_detail[x * 3 + 2] * 0.3f * detail;
+            out_row[x * 3 + 0] = cr0 * structure + face_detail[x * 3 + 0] * 0.3f * cur_detail;
+            out_row[x * 3 + 1] = cr1 * structure + face_detail[x * 3 + 1] * 0.3f * cur_detail;
+            out_row[x * 3 + 2] = cr2 * structure + face_detail[x * 3 + 2] * 0.3f * cur_detail;
         }
 
         /* ── Accumulate: write to canvas, bump scores, update prev_row. ── */
@@ -457,6 +513,13 @@ int sss_generate(const SSSModel *m,
         memcpy(prev_row, out_row, (size_t)W * 3 * sizeof(float));
         if (best_ci >= 0) c_scores[best_ci] += 1.0f;
         if (best_si >= 0) s_scores[best_si] += 1.0f;
+
+        /* ── Frame dump: save current canvas state after each row ── */
+        if (frame_dir) {
+            char fpath[512];
+            snprintf(fpath, sizeof(fpath), "%s/frame_%04d.ppm", frame_dir, r);
+            save_frame_ppm(out, H, W, fpath);
+        }
     }
 
     free(prev_row);
