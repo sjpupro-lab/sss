@@ -31,3 +31,12 @@ build/gpu_models/
 # Generated SSS 1k corpus — regenerate via data/sss_demo_1k/_make_dataset.py
 data/sss_demo_1k/*.ppm
 data/sss_demo_1k/labels.tsv
+
+# 포켓몬 학습 데이터 (대용량)
+data/pokemon_sss/*.ppm
+data/pokemon_demo/
+data/pokemon_ppm/
+build/models/pokemon.sss
+build/sss_pokemon/*.ppm
+convert_ppm_to_png.py
+make_result_grid.py
