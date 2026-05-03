@@ -1,0 +1,1227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>SSS Forge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Noto+Sans+KR:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:        #0C0C0C;
+    --surface:   #161616;
+    --surface-2: #1d1d1d;
+    --border:    #2A2A2A;
+    --border-hi: #3a3a3a;
+    --fg:        #e6e6e6;
+    --fg-dim:    #888;
+    --fg-muted:  #555;
+    --accent:    #FF6B2B;
+    --accent-2:  #00E5FF;
+    --ok:        #4ADE80;
+    --warn:      #FBBF24;
+    --err:       #F87171;
+    --mono:      "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+    --sans:      "Noto Sans KR", system-ui, -apple-system, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font-family: var(--mono); font-size: 14px; line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  body { min-height: 100vh; }
+
+  /* ── header ──────────────────────────────────────────────────────────── */
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 18px; border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, #161616 0%, #0c0c0c 100%);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 {
+    margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 0.02em;
+  }
+  header h1 .accent { color: var(--accent); }
+  header .meta { color: var(--fg-dim); font-size: 11px; }
+  header .meta .dot { display: inline-block; width: 7px; height: 7px;
+    border-radius: 50%; background: var(--ok); margin: 0 6px 0 4px;
+    box-shadow: 0 0 6px var(--ok);
+  }
+  header .meta.bad .dot { background: var(--err); box-shadow: 0 0 6px var(--err); }
+
+  /* ── tab bar ─────────────────────────────────────────────────────────── */
+  nav.tabs {
+    display: flex; overflow-x: auto; border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    -webkit-overflow-scrolling: touch;
+  }
+  nav.tabs button {
+    background: transparent; color: var(--fg-dim); border: none;
+    padding: 12px 18px; font-family: var(--mono); font-size: 13px;
+    cursor: pointer; white-space: nowrap; border-bottom: 2px solid transparent;
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  nav.tabs button.active {
+    color: var(--accent); border-bottom-color: var(--accent);
+    background: rgba(255, 107, 43, 0.06);
+  }
+  nav.tabs button:hover:not(.active) { color: var(--fg); }
+
+  main { padding: 16px; max-width: 1200px; margin: 0 auto; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* ── form atoms ──────────────────────────────────────────────────────── */
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .row > * { flex: 1 1 auto; min-width: 0; }
+  label {
+    display: block; font-size: 11px; color: var(--fg-dim);
+    text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 4px;
+  }
+  input[type=text], input[type=number], select, textarea {
+    width: 100%; background: var(--surface); color: var(--fg);
+    border: 1px solid var(--border); padding: 10px 12px;
+    font-family: var(--mono); font-size: 13px; border-radius: 4px;
+  }
+  input[type=text]:focus, textarea:focus {
+    outline: none; border-color: var(--accent);
+  }
+  textarea { resize: vertical; min-height: 60px; }
+  .slider-wrap {
+    display: flex; align-items: center; gap: 8px;
+  }
+  .slider-wrap input[type=range] {
+    flex: 1; accent-color: var(--accent);
+  }
+  .slider-wrap .val {
+    min-width: 48px; text-align: right; color: var(--accent);
+    font-weight: 700; font-size: 12px;
+  }
+
+  button.primary, button.ghost, button.icon {
+    font-family: var(--mono); cursor: pointer; font-size: 13px;
+    padding: 10px 18px; border-radius: 4px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--fg); letter-spacing: 0.04em;
+  }
+  button.primary {
+    background: var(--accent); color: #111; border-color: var(--accent);
+    font-weight: 700; text-transform: uppercase;
+  }
+  button.primary:hover { filter: brightness(1.1); }
+  button.ghost:hover { border-color: var(--border-hi); color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .toggle {
+    display: inline-flex; align-items: center; gap: 8px; cursor: pointer;
+    user-select: none;
+  }
+  .toggle input { display: none; }
+  .toggle .switch {
+    width: 36px; height: 20px; background: var(--border);
+    border-radius: 12px; position: relative; transition: 0.15s;
+  }
+  .toggle .switch::after {
+    content: ""; position: absolute; top: 2px; left: 2px;
+    width: 16px; height: 16px; border-radius: 50%; background: var(--fg);
+    transition: 0.15s;
+  }
+  .toggle input:checked + .switch { background: var(--accent); }
+  .toggle input:checked + .switch::after { left: 18px; background: #fff; }
+
+  /* ── card ────────────────────────────────────────────────────────────── */
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 6px; padding: 14px; margin-bottom: 14px;
+  }
+  .card h3 {
+    margin: 0 0 10px 0; font-size: 11px; color: var(--fg-dim);
+    text-transform: uppercase; letter-spacing: 0.1em; font-weight: 500;
+  }
+  .card h3 .accent { color: var(--accent); }
+
+  /* ── console ─────────────────────────────────────────────────────────── */
+  .console {
+    background: #050505; border: 1px solid var(--border); border-radius: 4px;
+    font-family: var(--mono); font-size: 12px; color: #b8b8b8;
+    padding: 10px 12px; max-height: 220px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-all; line-height: 1.55;
+  }
+  .console .line { display: block; }
+  .console .line.err  { color: var(--err); }
+  .console .line.ok   { color: var(--ok); }
+  .console .line.sys  { color: var(--accent-2); }
+  .console::-webkit-scrollbar { width: 6px; }
+  .console::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 3px; }
+
+  /* ── image ───────────────────────────────────────────────────────────── */
+  .img-frame {
+    background: #050505; border: 1px solid var(--border); border-radius: 4px;
+    aspect-ratio: 1 / 1; display: flex; align-items: center; justify-content: center;
+    overflow: hidden; position: relative;
+  }
+  .img-frame img, .img-frame canvas {
+    width: 100%; height: 100%; image-rendering: pixelated;
+    image-rendering: -moz-crisp-edges;
+  }
+  .img-frame .placeholder { color: var(--fg-muted); font-size: 11px; }
+
+  /* ── history grid ────────────────────────────────────────────────────── */
+  .history { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .history .img-frame { aspect-ratio: 1 / 1; cursor: pointer; }
+  .history .img-frame:hover { border-color: var(--accent); }
+
+  /* ── pipeline (Signal tab) ───────────────────────────────────────────── */
+  .pipeline {
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .stage {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px; border: 1px solid var(--border); border-radius: 4px;
+    background: var(--surface-2); transition: 0.2s;
+  }
+  .stage .num {
+    width: 24px; height: 24px; border-radius: 50%;
+    background: var(--border); color: var(--fg-dim);
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 12px; flex: 0 0 auto;
+  }
+  .stage .label { flex: 1; font-size: 12px; }
+  .stage .status {
+    font-size: 10px; color: var(--fg-muted); text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .stage.active {
+    border-color: var(--accent);
+    box-shadow: inset 0 0 0 1px var(--accent), 0 0 12px rgba(255, 107, 43, 0.18);
+    background: rgba(255, 107, 43, 0.06);
+  }
+  .stage.active .num { background: var(--accent); color: #111; }
+  .stage.active .status { color: var(--accent); }
+  .stage.active .spinner {
+    width: 12px; height: 12px; border-radius: 50%;
+    border: 2px solid var(--accent); border-top-color: transparent;
+    animation: spin 0.8s linear infinite;
+  }
+  .stage.done {
+    border-color: var(--ok); background: rgba(74, 222, 128, 0.05);
+  }
+  .stage.done .num { background: var(--ok); color: #111; }
+  .stage.done .status { color: var(--ok); }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── morphemes / chips ───────────────────────────────────────────────── */
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font-family: var(--mono); font-size: 11px; padding: 4px 8px;
+    border: 1px solid var(--border); border-radius: 3px;
+    background: var(--surface-2);
+  }
+  .chip.ok    { color: var(--ok);     border-color: rgba(74,222,128,0.4);  background: rgba(74,222,128,0.08); }
+  .chip.cyan  { color: var(--accent-2); border-color: rgba(0,229,255,0.4); background: rgba(0,229,255,0.06); }
+  .chip.amber { color: var(--accent); border-color: rgba(255,107,43,0.4);  background: rgba(255,107,43,0.08); }
+
+  /* ── 3-way viz row ───────────────────────────────────────────────────── */
+  .viz-row {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
+  }
+  @media (max-width: 720px) {
+    .viz-row { grid-template-columns: 1fr; }
+    .history { grid-template-columns: repeat(2, 1fr); }
+  }
+  .viz-row .img-frame { aspect-ratio: 1 / 1; }
+  .viz-row figcaption {
+    font-size: 10px; color: var(--fg-dim); text-align: center;
+    text-transform: uppercase; letter-spacing: 0.08em; margin-top: 4px;
+  }
+
+  /* ── dominance bars ──────────────────────────────────────────────────── */
+  .dom-bars { display: flex; flex-direction: column; gap: 6px; }
+  .dom-row {
+    display: flex; align-items: center; gap: 8px; font-size: 12px;
+  }
+  .dom-row .ch {
+    width: 14px; font-weight: 700; text-align: center;
+  }
+  .dom-row .bar-bg {
+    flex: 1; height: 10px; background: #050505; border-radius: 2px; overflow: hidden;
+  }
+  .dom-row .bar-fill { height: 100%; transition: width 0.3s; }
+  .dom-row .pct { width: 44px; text-align: right; color: var(--fg-dim); font-size: 11px; }
+
+  /* ── chat ────────────────────────────────────────────────────────────── */
+  .chat-log {
+    background: #050505; border: 1px solid var(--border); border-radius: 4px;
+    padding: 12px; min-height: 240px; max-height: 380px; overflow-y: auto;
+    margin-bottom: 10px;
+  }
+  .msg { margin-bottom: 8px; line-height: 1.5; word-break: break-word; }
+  .msg.user { color: var(--accent); }
+  .msg.user::before { content: ">  "; color: var(--accent); font-weight: 700; }
+  .msg.ai {
+    color: #ddd; padding-left: 8px; border-left: 2px solid var(--accent-2);
+    white-space: pre-wrap;
+  }
+  .msg.system { color: var(--fg-muted); font-style: italic; font-size: 11px; }
+
+  /* ── models grid ─────────────────────────────────────────────────────── */
+  .models { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); gap: 10px; }
+  .model-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px; cursor: pointer; transition: 0.15s;
+  }
+  .model-card:hover { border-color: var(--accent); }
+  .model-card .name {
+    font-size: 13px; font-weight: 700; word-break: break-all;
+  }
+  .model-card .meta {
+    margin-top: 6px; font-size: 11px; color: var(--fg-dim);
+    display: flex; justify-content: space-between;
+  }
+  .badge {
+    display: inline-block; font-size: 10px; padding: 2px 6px;
+    border-radius: 3px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .badge.ces  { background: rgba(74,222,128,0.15);  color: var(--ok); }
+  .badge.spai { background: rgba(0,229,255,0.15);   color: var(--accent-2); }
+  .badge.sss  { background: rgba(255,107,43,0.15);  color: var(--accent); }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 720px) { .grid-2 { grid-template-columns: 1fr; } }
+
+  .toast {
+    position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+    background: var(--surface); border: 1px solid var(--accent);
+    color: var(--fg); padding: 10px 16px; border-radius: 4px;
+    font-size: 12px; opacity: 0; transition: opacity 0.2s;
+    z-index: 100; pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+
+  hr.sep { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+  .sub  { font-size: 11px; color: var(--fg-dim); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>SSS<span class="accent">_</span>FORGE</h1>
+  <span class="meta" id="health-meta"><span class="dot"></span>online</span>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button data-tab="generate" class="active">Generate</button>
+  <button data-tab="signal">Signal</button>
+  <button data-tab="train">Train</button>
+  <button data-tab="chat">Chat</button>
+  <button data-tab="models">Models</button>
+</nav>
+
+<main>
+
+<!-- ============ GENERATE ============ -->
+<section class="panel active" id="panel-generate">
+
+  <div class="card">
+    <h3>prompt<span class="accent">/</span>config</h3>
+    <label>Model (.ces)</label>
+    <select id="gen-model"></select>
+
+    <div style="height:10px"></div>
+
+    <label>Prompt</label>
+    <input type="text" id="gen-prompt" placeholder="red apple" value="red apple" />
+
+    <hr class="sep">
+
+    <div class="grid-2">
+      <div>
+        <label>Steps <span class="sub" id="gen-steps-val">50</span></label>
+        <div class="slider-wrap">
+          <input type="range" id="gen-steps" min="4" max="100" value="50">
+          <span class="val" id="gen-steps-vbox">50</span>
+        </div>
+      </div>
+      <div>
+        <label>Wave Iters <span class="sub" id="gen-wave-val">200</span></label>
+        <div class="slider-wrap">
+          <input type="range" id="gen-wave" min="0" max="500" value="200">
+          <span class="val" id="gen-wave-vbox">200</span>
+        </div>
+      </div>
+      <div>
+        <label>Guidance</label>
+        <div class="slider-wrap">
+          <input type="range" id="gen-guidance" min="0.5" max="4.0" step="0.1" value="1.0">
+          <span class="val" id="gen-guidance-vbox">1.0</span>
+        </div>
+      </div>
+      <div>
+        <label>Seed</label>
+        <div class="slider-wrap">
+          <input type="range" id="gen-seed" min="0" max="999" value="0">
+          <span class="val" id="gen-seed-vbox">0</span>
+        </div>
+      </div>
+    </div>
+
+    <div style="height:12px"></div>
+    <div class="row" style="align-items:center">
+      <label class="toggle" style="flex:0 0 auto">
+        <input type="checkbox" id="gen-hybrid">
+        <span class="switch"></span>
+        <span>Hybrid VAE</span>
+      </label>
+      <button class="ghost" id="gen-rand" style="flex:0 0 auto">Rand Seed</button>
+      <button class="primary" id="gen-go" style="flex:0 0 auto">Generate</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>console</h3>
+    <div class="console" id="gen-console"><span class="line sys">[ready]</span></div>
+  </div>
+
+  <div class="card">
+    <h3>output</h3>
+    <div class="img-frame" id="gen-image"><span class="placeholder">no image yet</span></div>
+  </div>
+
+  <div class="card">
+    <h3>history</h3>
+    <div class="history" id="gen-history"></div>
+  </div>
+
+</section>
+
+<!-- ============ SIGNAL ============ -->
+<section class="panel" id="panel-signal">
+
+  <div class="card">
+    <h3>signal<span class="accent">/</span>visualizer</h3>
+    <label>Model (.ces)</label>
+    <select id="sig-model"></select>
+
+    <div style="height:10px"></div>
+
+    <label>Prompt</label>
+    <input type="text" id="sig-prompt" value="red apple" />
+
+    <div style="height:10px"></div>
+    <button class="primary" id="sig-go">Run</button>
+  </div>
+
+  <div class="card">
+    <h3>pipeline<span class="accent">/</span>flow</h3>
+    <div class="pipeline" id="sig-pipeline"></div>
+  </div>
+
+  <div class="card">
+    <h3>morpheme<span class="accent">/</span>routing</h3>
+    <div id="sig-morphemes" class="chips"><span class="sub">awaiting prompt…</span></div>
+    <hr class="sep">
+    <div class="row" style="align-items:center">
+      <span class="sub">canvas_id</span>
+      <span id="sig-canvas" class="chip amber">—</span>
+      <span class="sub">mean rgb</span>
+      <span id="sig-mean" class="chip cyan">—</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>spatial<span class="accent">/</span>maps</h3>
+    <div class="viz-row">
+      <figure>
+        <div class="img-frame"><canvas id="sig-img" width="256" height="256"></canvas></div>
+        <figcaption>generated</figcaption>
+      </figure>
+      <figure>
+        <div class="img-frame"><canvas id="sig-energy" width="256" height="256"></canvas></div>
+        <figcaption>energy map</figcaption>
+      </figure>
+      <figure>
+        <div class="img-frame"><canvas id="sig-edge" width="256" height="256"></canvas></div>
+        <figcaption>edge map</figcaption>
+      </figure>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>color<span class="accent">/</span>distribution</h3>
+    <canvas id="sig-hist" width="320" height="100" style="width:100%;height:100px;background:#050505;border-radius:3px"></canvas>
+  </div>
+
+  <div class="card">
+    <h3>wave<span class="accent">/</span>convergence</h3>
+    <canvas id="sig-wave" width="320" height="80" style="width:100%;height:80px;background:#050505;border-radius:3px"></canvas>
+  </div>
+
+  <div class="card">
+    <h3>dominance</h3>
+    <div class="dom-bars" id="sig-dominance">
+      <div class="dom-row"><span class="ch" style="color:var(--err)">R</span><div class="bar-bg"><div class="bar-fill" style="background:var(--err);width:0%"></div></div><span class="pct">0%</span></div>
+      <div class="dom-row"><span class="ch" style="color:var(--ok)">G</span><div class="bar-bg"><div class="bar-fill" style="background:var(--ok);width:0%"></div></div><span class="pct">0%</span></div>
+      <div class="dom-row"><span class="ch" style="color:var(--accent-2)">B</span><div class="bar-bg"><div class="bar-fill" style="background:var(--accent-2);width:0%"></div></div><span class="pct">0%</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>console</h3>
+    <div class="console" id="sig-console"><span class="line sys">[ready]</span></div>
+  </div>
+</section>
+
+<!-- ============ TRAIN ============ -->
+<section class="panel" id="panel-train">
+
+  <div class="card">
+    <h3>image<span class="accent">/</span>train</h3>
+    <label>Dataset directory</label>
+    <input type="text" id="tr-dataset" value="data/demo">
+    <div style="height:10px"></div>
+    <label>Output base path</label>
+    <input type="text" id="tr-out" value="build/models/demo">
+    <div style="height:10px"></div>
+    <label>Masked epochs <span class="sub" id="tr-mep-val">0</span></label>
+    <div class="slider-wrap">
+      <input type="range" id="tr-mep" min="0" max="20" value="0">
+      <span class="val" id="tr-mep-vbox">0</span>
+    </div>
+    <div style="height:10px"></div>
+    <button class="primary" id="tr-go">Start Training</button>
+  </div>
+
+  <div class="card">
+    <h3>console</h3>
+    <div class="console" id="tr-console"><span class="line sys">[ready]</span></div>
+  </div>
+
+  <hr class="sep">
+
+  <div class="card">
+    <h3>text<span class="accent">/</span>train</h3>
+    <label>Input text file</label>
+    <input type="text" id="tt-input" value="data/sample_en.txt">
+    <div style="height:10px"></div>
+    <label>Output (.spai)</label>
+    <input type="text" id="tt-out" value="build/models/text.spai">
+    <div style="height:10px"></div>
+    <label>Max lines <span class="sub" id="tt-max-val">5000</span></label>
+    <div class="slider-wrap">
+      <input type="range" id="tt-max" min="100" max="50000" value="5000" step="100">
+      <span class="val" id="tt-max-vbox">5000</span>
+    </div>
+    <div style="height:10px"></div>
+    <button class="primary" id="tt-go">Start Text Training</button>
+  </div>
+
+  <div class="card">
+    <h3>console</h3>
+    <div class="console" id="tt-console"><span class="line sys">[ready]</span></div>
+  </div>
+
+</section>
+
+<!-- ============ CHAT ============ -->
+<section class="panel" id="panel-chat">
+
+  <div class="card">
+    <h3>chat<span class="accent">/</span>session</h3>
+    <label>Model (.spai)</label>
+    <select id="chat-model"></select>
+  </div>
+
+  <div class="card">
+    <h3>conversation</h3>
+    <div class="chat-log" id="chat-log">
+      <div class="msg system">load a .spai model to begin</div>
+    </div>
+    <div class="row">
+      <input type="text" id="chat-input" placeholder="type a message…" style="flex:1 1 auto" />
+      <button class="primary" id="chat-send" style="flex:0 0 auto">Send</button>
+    </div>
+  </div>
+
+</section>
+
+<!-- ============ MODELS ============ -->
+<section class="panel" id="panel-models">
+  <div class="card">
+    <h3>build<span class="accent">/</span>models<span class="accent">/</span></h3>
+    <div class="row" style="align-items:center;margin-bottom:10px">
+      <span class="sub" id="models-count">…</span>
+      <button class="ghost" id="models-refresh" style="flex:0 0 auto">Refresh</button>
+    </div>
+    <div class="models" id="models-list"></div>
+  </div>
+</section>
+
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+//
+// ─── core utils ───────────────────────────────────────────────────────────
+//
+const $ = (sel) => document.querySelector(sel);
+const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+function toast(msg, ms = 1800) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toast._h);
+  toast._h = setTimeout(() => t.classList.remove("show"), ms);
+}
+
+function consoleLine(box, text, kind) {
+  const el = document.createElement("span");
+  el.className = "line" + (kind ? " " + kind : "");
+  el.textContent = text;
+  box.appendChild(el);
+  box.scrollTop = box.scrollHeight;
+}
+function consoleClear(box) { box.innerHTML = ""; }
+
+async function api(path, opts) {
+  const r = await fetch(path, opts || {});
+  const ct = r.headers.get("content-type") || "";
+  if (ct.includes("application/json")) return r.json();
+  return r.text();
+}
+
+// SSE helper with polling fallback. onLine gets called per stdout line; onDone
+// receives the final job object (with .result).
+function streamJob(jobId, onLine, onDone) {
+  let closed = false;
+  let es;
+  try {
+    es = new EventSource("/api/stream/" + jobId);
+  } catch (e) { fallback(); return; }
+
+  es.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      if (data.done) {
+        closed = true; es.close();
+        onDone && onDone(data);
+      } else if (data.line !== undefined) {
+        onLine && onLine(data.line);
+      }
+    } catch (err) { /* ignore parse errors */ }
+  };
+  es.onerror = () => {
+    if (closed) return;
+    closed = true;
+    es.close();
+    fallback();
+  };
+
+  function fallback() {
+    const tick = async () => {
+      let prev = 0;
+      while (true) {
+        let job;
+        try { job = await api("/api/job/" + jobId); }
+        catch (e) { await new Promise(r => setTimeout(r, 500)); continue; }
+        if (job.error) { onDone && onDone({done: true, exit_code: -1, result: {error: job.error}}); return; }
+        if (Array.isArray(job.log)) {
+          for (let i = prev; i < job.log.length; i++) onLine && onLine(job.log[i]);
+          prev = job.log.length;
+        }
+        if (job.done) {
+          onDone && onDone({done: true, exit_code: job.exit_code, result: job.result});
+          return;
+        }
+        await new Promise(r => setTimeout(r, 400));
+      }
+    };
+    tick();
+  }
+}
+
+//
+// ─── tab switching ────────────────────────────────────────────────────────
+//
+$$("#tabs button").forEach(b => {
+  b.addEventListener("click", () => {
+    $$("#tabs button").forEach(x => x.classList.remove("active"));
+    b.classList.add("active");
+    $$(".panel").forEach(p => p.classList.remove("active"));
+    $("#panel-" + b.dataset.tab).classList.add("active");
+    if (b.dataset.tab === "models") refreshModels();
+  });
+});
+
+//
+// ─── model lists ──────────────────────────────────────────────────────────
+//
+let MODELS = [];
+
+async function loadModels() {
+  try {
+    const data = await api("/api/models");
+    MODELS = data.models || [];
+  } catch (e) {
+    MODELS = [];
+    $("#health-meta").classList.add("bad");
+  }
+  populateModelSelects();
+  return MODELS;
+}
+
+function populateModelSelects() {
+  const ces  = MODELS.filter(m => m.ext === "ces");
+  const spai = MODELS.filter(m => m.ext === "spai");
+
+  function fill(sel, list, fallback) {
+    const cur = sel.value;
+    sel.innerHTML = "";
+    if (!list.length) {
+      const o = document.createElement("option");
+      o.value = ""; o.textContent = fallback;
+      sel.appendChild(o);
+      return;
+    }
+    list.forEach(m => {
+      const o = document.createElement("option");
+      o.value = m.rel; o.textContent = m.name + " (" + fmtSize(m.size) + ")";
+      sel.appendChild(o);
+    });
+    if (cur && list.find(m => m.rel === cur)) sel.value = cur;
+  }
+  fill($("#gen-model"),  ces,  "no .ces models");
+  fill($("#sig-model"),  ces,  "no .ces models");
+  fill($("#chat-model"), spai, "no .spai models");
+}
+
+function fmtSize(b) {
+  if (b > 1024*1024) return (b/1024/1024).toFixed(1) + "M";
+  if (b > 1024) return (b/1024).toFixed(0) + "K";
+  return b + "B";
+}
+
+//
+// ─── slider mirroring ─────────────────────────────────────────────────────
+//
+function bindSlider(rangeId, boxId, fmt) {
+  const r = $("#" + rangeId), b = $("#" + boxId);
+  const update = () => { b.textContent = fmt ? fmt(r.value) : r.value; };
+  r.addEventListener("input", update); update();
+}
+bindSlider("gen-steps", "gen-steps-vbox");
+bindSlider("gen-wave",  "gen-wave-vbox");
+bindSlider("gen-guidance", "gen-guidance-vbox", v => parseFloat(v).toFixed(1));
+bindSlider("gen-seed",  "gen-seed-vbox");
+bindSlider("tr-mep",    "tr-mep-vbox");
+bindSlider("tt-max",    "tt-max-vbox");
+
+$("#gen-rand").addEventListener("click", () => {
+  const v = Math.floor(Math.random() * 999);
+  $("#gen-seed").value = v; $("#gen-seed-vbox").textContent = v;
+});
+
+//
+// ─── Generate tab ─────────────────────────────────────────────────────────
+//
+const HISTORY = [];
+
+$("#gen-go").addEventListener("click", async () => {
+  const model = $("#gen-model").value;
+  if (!model) { toast("no model selected"); return; }
+  const body = {
+    model,
+    prompt:     $("#gen-prompt").value || "red apple",
+    seed:       parseInt($("#gen-seed").value, 10),
+    steps:      parseInt($("#gen-steps").value, 10),
+    wave_iters: parseInt($("#gen-wave").value, 10),
+    guidance:   parseFloat($("#gen-guidance").value),
+    hybrid:     $("#gen-hybrid").checked,
+  };
+
+  const box = $("#gen-console");
+  consoleClear(box);
+  consoleLine(box, "$ gen_image_ce \"" + body.prompt + "\" seed=" + body.seed
+              + " steps=" + body.steps + " wave=" + body.wave_iters
+              + (body.hybrid ? " --hybrid" : "") + " --guidance " + body.guidance.toFixed(1), "sys");
+
+  const frame = $("#gen-image");
+  frame.innerHTML = '<span class="placeholder">generating…</span>';
+  $("#gen-go").disabled = true;
+
+  let resp;
+  try {
+    resp = await api("/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    consoleLine(box, "[error] " + e, "err");
+    $("#gen-go").disabled = false;
+    return;
+  }
+  if (resp.error) {
+    consoleLine(box, "[error] " + resp.error, "err");
+    $("#gen-go").disabled = false;
+    return;
+  }
+
+  streamJob(resp.job_id,
+    (line) => consoleLine(box, line),
+    (final) => {
+      $("#gen-go").disabled = false;
+      const r = (final && final.result) || {};
+      if (r.error) {
+        consoleLine(box, "[error] " + r.error, "err");
+        frame.innerHTML = '<span class="placeholder">generation failed</span>';
+        return;
+      }
+      if (r.image) {
+        frame.innerHTML = '<img src="' + r.image + '">';
+        HISTORY.unshift(r.image);
+        if (HISTORY.length > 9) HISTORY.length = 9;
+        renderHistory();
+      }
+      consoleLine(box, "[done] exit=" + final.exit_code, "ok");
+    });
+});
+
+function renderHistory() {
+  const h = $("#gen-history");
+  h.innerHTML = "";
+  HISTORY.forEach((src, i) => {
+    const cell = document.createElement("div");
+    cell.className = "img-frame";
+    cell.innerHTML = '<img src="' + src + '">';
+    cell.addEventListener("click", () => {
+      $("#gen-image").innerHTML = '<img src="' + src + '">';
+    });
+    h.appendChild(cell);
+  });
+}
+
+//
+// ─── Signal tab ───────────────────────────────────────────────────────────
+//
+const PIPELINE_STAGES = [
+  { key: "morph",   label: "Morpheme Analysis" },
+  { key: "embed",   label: "CE Embedding" },
+  { key: "vote",    label: "Canvas Vote" },
+  { key: "init",    label: "Latent Init" },
+  { key: "denoise", label: "Denoise" },
+  { key: "decode",  label: "Decode" },
+  { key: "wave",    label: "Wave Refine" },
+  { key: "out",     label: "Output" },
+];
+
+function buildPipeline() {
+  const el = $("#sig-pipeline");
+  el.innerHTML = "";
+  PIPELINE_STAGES.forEach((st, i) => {
+    const s = document.createElement("div");
+    s.className = "stage";
+    s.dataset.key = st.key;
+    s.innerHTML =
+      '<div class="num">' + (i+1) + '</div>' +
+      '<div class="label">' + st.label + '</div>' +
+      '<div class="status">idle</div>';
+    el.appendChild(s);
+  });
+}
+buildPipeline();
+
+function setStage(key, status) {
+  const s = $('#sig-pipeline .stage[data-key="' + key + '"]');
+  if (!s) return;
+  s.classList.remove("active", "done");
+  if (status) s.classList.add(status);
+  // status text + spinner
+  const lbl = s.querySelector(".status");
+  if (status === "active") {
+    lbl.textContent = "running";
+    if (!s.querySelector(".spinner")) {
+      const sp = document.createElement("div"); sp.className = "spinner";
+      s.appendChild(sp);
+    }
+  } else if (status === "done") {
+    lbl.textContent = "done";
+    const sp = s.querySelector(".spinner"); if (sp) sp.remove();
+  } else {
+    lbl.textContent = "idle";
+    const sp = s.querySelector(".spinner"); if (sp) sp.remove();
+  }
+}
+
+function resetPipeline() { PIPELINE_STAGES.forEach(s => setStage(s.key, null)); }
+function markDone(key) { setStage(key, "done"); }
+function activate(key) { setStage(key, "active"); }
+
+// Map a log line to a pipeline transition.
+function pipelineForLine(line) {
+  // morphemes=2 ...  → morph done, embed active
+  if (/morphemes=/.test(line)) {
+    markDone("morph"); activate("embed"); return;
+  }
+  if (/routed canvas_id=/.test(line)) {
+    markDone("embed"); markDone("vote"); activate("init"); return;
+  }
+  if (/steps=\d+/.test(line) && /prompt="/.test(line)) {
+    activate("morph"); return;
+  }
+  if (/seed=/.test(line) && /steps=/.test(line)) {
+    activate("morph"); return;
+  }
+  if (/decode|decoded/i.test(line)) {
+    markDone("init"); markDone("denoise"); activate("decode"); return;
+  }
+  if (/wave|refine/i.test(line)) {
+    markDone("decode"); activate("wave"); return;
+  }
+  if (/mean RGB/.test(line)) {
+    markDone("init"); markDone("denoise"); markDone("decode"); activate("wave"); return;
+  }
+  if (/wrote/i.test(line) || /saved/i.test(line)) {
+    markDone("wave"); markDone("out");
+  }
+}
+
+function renderMorphemes(morphemes, canvasId, meanRgb) {
+  const el = $("#sig-morphemes");
+  el.innerHTML = "";
+  if (!morphemes || !morphemes.length) {
+    el.innerHTML = '<span class="sub">no morphemes</span>';
+  } else {
+    morphemes.forEach(m => {
+      const t = document.createElement("span");
+      t.className = "chip ok"; t.textContent = m.surface;
+      el.appendChild(t);
+      const p = document.createElement("span");
+      p.className = "chip cyan"; p.textContent = m.pos;
+      el.appendChild(p);
+    });
+  }
+  $("#sig-canvas").textContent = canvasId || "—";
+  $("#sig-mean").textContent   = meanRgb
+    ? "(" + meanRgb.map(v => v.toFixed(0)).join(", ") + ")"
+    : "—";
+}
+
+function drawHeatmap(canvas, grid, scheme) {
+  // scheme: 'cyan' | 'amber'
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  const N = grid.length;
+  const cw = W / N, ch = H / N;
+  ctx.fillStyle = "#050505"; ctx.fillRect(0,0,W,H);
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      const v = Math.max(0, Math.min(1, grid[y][x]));
+      let r,g,b;
+      if (scheme === "cyan") {
+        // cyan -> white
+        r = Math.floor(v * 200);
+        g = Math.floor(50 + v * 200);
+        b = Math.floor(120 + v * 135);
+      } else {
+        // amber -> hot
+        r = Math.floor(60 + v * 195);
+        g = Math.floor(20 + v * 130);
+        b = Math.floor(20 + v * 30);
+      }
+      ctx.fillStyle = "rgba(" + r + "," + g + "," + b + "," + (0.25 + 0.75*v) + ")";
+      ctx.fillRect(Math.floor(x*cw), Math.floor(y*ch),
+                   Math.ceil(cw),    Math.ceil(ch));
+    }
+  }
+}
+
+function drawHistogram(canvas, hr, hg, hb) {
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "#050505"; ctx.fillRect(0,0,W,H);
+  const N = hr.length;
+  const bw = W / N;
+  const all = hr.concat(hg, hb);
+  const m = Math.max(0.001, Math.max.apply(null, all));
+  const drawSet = (arr, color) => {
+    ctx.fillStyle = color;
+    arr.forEach((v, i) => {
+      const h = (v / m) * (H - 6);
+      ctx.fillRect(i * bw + 1, H - h, bw - 2, h);
+    });
+  };
+  drawSet(hr, "rgba(248,113,113,0.55)");
+  drawSet(hg, "rgba(74,222,128,0.55)");
+  drawSet(hb, "rgba(0,229,255,0.55)");
+}
+
+function drawWaveConvergence(canvas, iters) {
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "#050505"; ctx.fillRect(0,0,W,H);
+  if (!iters || iters < 1) return;
+  const N = 200;
+  ctx.beginPath();
+  ctx.moveTo(0, H/2);
+  const pts = [];
+  for (let i = 0; i < N; i++) {
+    const t = i / (N - 1);
+    const decay = Math.exp(-3.0 * t);
+    const freq = 6 + (iters / 80);
+    const v = Math.sin(t * freq * Math.PI * 2) * decay;
+    const x = t * W;
+    const y = H/2 - v * (H/2 - 4);
+    pts.push([x,y]);
+  }
+  ctx.beginPath();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  for (const [x,y] of pts) ctx.lineTo(x, y);
+  ctx.strokeStyle = "rgba(0,229,255,0.85)";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  // fill under
+  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
+  ctx.fillStyle = "rgba(0,229,255,0.15)"; ctx.fill();
+}
+
+function drawImageToCanvas(canvas, dataUri) {
+  const img = new Image();
+  img.onload = () => {
+    const ctx = canvas.getContext("2d");
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  };
+  img.src = dataUri;
+}
+
+function setDominance(d) {
+  const rows = $$("#sig-dominance .dom-row");
+  const vals = [d.r || 0, d.g || 0, d.b || 0];
+  rows.forEach((row, i) => {
+    const pct = vals[i] * 100;
+    row.querySelector(".bar-fill").style.width = pct.toFixed(1) + "%";
+    row.querySelector(".pct").textContent = pct.toFixed(1) + "%";
+  });
+}
+
+$("#sig-go").addEventListener("click", async () => {
+  const model = $("#sig-model").value;
+  if (!model) { toast("no model selected"); return; }
+  const body = {
+    model,
+    prompt:     $("#sig-prompt").value || "red apple",
+    seed:       0,
+    steps:      50,
+    wave_iters: 200,
+    guidance:   1.0,
+    hybrid:     false,
+  };
+  resetPipeline();
+  activate("morph");
+  const box = $("#sig-console");
+  consoleClear(box);
+  consoleLine(box, "$ viz-generate \"" + body.prompt + "\"", "sys");
+  $("#sig-go").disabled = true;
+  let resp;
+  try {
+    resp = await api("/api/viz-generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    consoleLine(box, "[error] " + e, "err");
+    $("#sig-go").disabled = false; return;
+  }
+  if (resp.error) {
+    consoleLine(box, "[error] " + resp.error, "err");
+    $("#sig-go").disabled = false; return;
+  }
+  streamJob(resp.job_id,
+    (line) => { consoleLine(box, line); pipelineForLine(line); },
+    (final) => {
+      $("#sig-go").disabled = false;
+      const r = (final && final.result) || {};
+      if (r.error) {
+        consoleLine(box, "[error] " + r.error, "err");
+        return;
+      }
+      // make sure all stages end as done
+      ["morph","embed","vote","init","denoise","decode","wave","out"].forEach(markDone);
+      renderMorphemes(r.morphemes, r.canvas_id, r.mean_rgb);
+      if (r.image) drawImageToCanvas($("#sig-img"), r.image);
+      const a = r.analysis || {};
+      if (a.energy_map) drawHeatmap($("#sig-energy"), a.energy_map, "cyan");
+      if (a.edge_map)   drawHeatmap($("#sig-edge"),   a.edge_map,   "amber");
+      if (a.hist_r)     drawHistogram($("#sig-hist"), a.hist_r, a.hist_g, a.hist_b);
+      drawWaveConvergence($("#sig-wave"), body.wave_iters);
+      if (a.dominance)  setDominance(a.dominance);
+      consoleLine(box, "[done] exit=" + final.exit_code, "ok");
+    });
+});
+
+//
+// ─── Train tab ────────────────────────────────────────────────────────────
+//
+$("#tr-go").addEventListener("click", async () => {
+  const body = {
+    dataset:      $("#tr-dataset").value,
+    out_base:     $("#tr-out").value,
+    masked_epochs: parseInt($("#tr-mep").value, 10),
+  };
+  const box = $("#tr-console");
+  consoleClear(box);
+  consoleLine(box, "$ train_demo " + body.dataset + " " + body.out_base, "sys");
+  $("#tr-go").disabled = true;
+  const resp = await api("/api/train", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (resp.error) {
+    consoleLine(box, "[error] " + resp.error, "err");
+    $("#tr-go").disabled = false; return;
+  }
+  streamJob(resp.job_id,
+    (line) => consoleLine(box, line),
+    (final) => {
+      $("#tr-go").disabled = false;
+      consoleLine(box, "[done] exit=" + final.exit_code,
+                  final.exit_code === 0 ? "ok" : "err");
+      loadModels();
+    });
+});
+
+$("#tt-go").addEventListener("click", async () => {
+  const body = {
+    input: $("#tt-input").value,
+    max:   parseInt($("#tt-max").value, 10),
+    out:   $("#tt-out").value,
+  };
+  const box = $("#tt-console");
+  consoleClear(box);
+  consoleLine(box, "$ stream_train --input " + body.input + " --max " + body.max + " --save " + body.out, "sys");
+  $("#tt-go").disabled = true;
+  const resp = await api("/api/train-text", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (resp.error) {
+    consoleLine(box, "[error] " + resp.error, "err");
+    $("#tt-go").disabled = false; return;
+  }
+  streamJob(resp.job_id,
+    (line) => consoleLine(box, line),
+    (final) => {
+      $("#tt-go").disabled = false;
+      consoleLine(box, "[done] exit=" + final.exit_code,
+                  final.exit_code === 0 ? "ok" : "err");
+      loadModels();
+    });
+});
+
+//
+// ─── Chat tab ─────────────────────────────────────────────────────────────
+//
+function chatPush(kind, text) {
+  const box = $("#chat-log");
+  const m = document.createElement("div");
+  m.className = "msg " + kind;
+  m.textContent = text;
+  box.appendChild(m);
+  box.scrollTop = box.scrollHeight;
+}
+
+async function sendChat() {
+  const model = $("#chat-model").value;
+  if (!model) { toast("no .spai model"); return; }
+  const msg = $("#chat-input").value.trim();
+  if (!msg) return;
+  $("#chat-input").value = "";
+  chatPush("user", msg);
+  chatPush("system", "thinking…");
+  $("#chat-send").disabled = true;
+  const resp = await api("/api/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model, message: msg }),
+  });
+  // remove "thinking" placeholder
+  const log = $("#chat-log");
+  if (log.lastChild) log.removeChild(log.lastChild);
+  if (resp.error) {
+    chatPush("system", "[error] " + resp.error);
+    $("#chat-send").disabled = false; return;
+  }
+  streamJob(resp.job_id, () => {}, (final) => {
+    $("#chat-send").disabled = false;
+    const r = (final && final.result) || {};
+    chatPush("ai", r.reply || "(no reply)");
+  });
+}
+$("#chat-send").addEventListener("click", sendChat);
+$("#chat-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); sendChat(); }
+});
+
+//
+// ─── Models tab ───────────────────────────────────────────────────────────
+//
+async function refreshModels() {
+  await loadModels();
+  const list = $("#models-list");
+  list.innerHTML = "";
+  $("#models-count").textContent = MODELS.length + " files";
+  MODELS.forEach(m => {
+    const c = document.createElement("div");
+    c.className = "model-card";
+    c.innerHTML =
+      '<div class="name">' + m.name + '</div>' +
+      '<div class="meta">' +
+        '<span class="badge ' + m.ext + '">' + m.ext.toUpperCase() + '</span>' +
+        '<span>' + fmtSize(m.size) + '</span>' +
+      '</div>';
+    c.addEventListener("click", () => {
+      if (m.ext === "ces") {
+        $("#gen-model").value = m.rel;
+        $("#sig-model").value = m.rel;
+        toast("set generate/signal model: " + m.name);
+        $$("#tabs button").forEach(x => x.classList.remove("active"));
+        $$("#tabs button[data-tab=generate]")[0].classList.add("active");
+        $$(".panel").forEach(p => p.classList.remove("active"));
+        $("#panel-generate").classList.add("active");
+      } else if (m.ext === "spai") {
+        $("#chat-model").value = m.rel;
+        toast("set chat model: " + m.name);
+        $$("#tabs button").forEach(x => x.classList.remove("active"));
+        $$("#tabs button[data-tab=chat]")[0].classList.add("active");
+        $$(".panel").forEach(p => p.classList.remove("active"));
+        $("#panel-chat").classList.add("active");
+      } else {
+        toast("selected " + m.name);
+      }
+    });
+    list.appendChild(c);
+  });
+  if (!MODELS.length) {
+    list.innerHTML = '<span class="sub">no models. run training first.</span>';
+  }
+}
+$("#models-refresh").addEventListener("click", refreshModels);
+
+//
+// ─── boot ─────────────────────────────────────────────────────────────────
+//
+loadModels();
+</script>
+
+</body>
+</html>
