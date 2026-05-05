@@ -1,0 +1,878 @@
+#!/usr/bin/env python3
+"""SSS Unified Pipeline v2 — No Noise.
+
+Bundles the scattered SSS logic (parse → memory search → sculpt →
+motion → evaluate → store) into one entry point: `run_sss_pipeline()`.
+
+Generation is fully deterministic: blank canvas → CE cell sculpt /
+recombine. No random noise. Variations come from fixed hue/saturation/
+brightness curves selected by index.
+
+Memory is backed by the C bridge (ce_storage_add_typed) so every
+`memory.add(...)` lands in real CEStorage — same store the engine's
+search/decode operates on. Build the bridge once with::
+
+    make pybridge
+
+then::
+
+    python3 tools/sss_unified.py            # quick demo run
+    python3 tools/test_sss_unified.py       # smoke test
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+from collections import defaultdict
+from typing import Optional
+
+import cv2
+import numpy as np
+
+# Bridge-backed CEMemory (ce_storage_add_typed under the hood).
+from tools.sss_memory import CEMemory as _BridgedCEMemory
+
+
+W, H = 256, 256
+ROW_BLOCKS = {
+    "hair":  (0.00, 0.15),
+    "face":  (0.15, 0.40),
+    "upper": (0.40, 0.65),
+    "lower": (0.65, 0.88),
+    "bg":    (0.88, 1.00),
+}
+
+BASE_DIR = os.environ.get("SSS_UNIFIED_DIR",
+                          os.path.join(os.path.expanduser("~"), "sss_unified"))
+
+
+def write_ppm(path, img):
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    h, w = rgb.shape[:2]
+    with open(path, "wb") as f:
+        f.write(f"P6\n{w} {h}\n255\n".encode())
+        f.write(rgb.tobytes())
+
+
+# ────────────────────────────────────────────────────────────
+# 1. CEMemory  (bridge-backed; layered with tags / pending / index)
+# ────────────────────────────────────────────────────────────
+class CEMemory(_BridgedCEMemory):
+    """CEMemory with tag search, pending queue, and prompt index.
+
+    Inherits the bridge-backed `add_cell` so every `add()` routes
+    through ce_storage_add_typed. The Python-side cell dict carries
+    the extra fields (`tags`, `uses`) that the pipeline needs but
+    that don't belong inside CEStorage entries.
+    """
+
+    def __init__(self, db_path: Optional[str] = None):
+        if db_path is None:
+            db_path = os.path.join(BASE_DIR, "memory")
+        super().__init__(db_path)
+        self.pending = []
+        self.prompt_index = defaultdict(list)
+        # ROW_BLOCKS adds two slots beyond the four the bridge knows
+        # about (hair/face/upper/lower/bg vs. top/mid_top/mid_bot/bot).
+        # Re-map to keep CEStorage slots stable across versions.
+        self._slot_for_block = {
+            "hair":  "top",
+            "face":  "mid_top",
+            "upper": "mid_bot",
+            "lower": "bot",
+            "bg":    "bot",  # bg shares bot bucket; block_idx still unique
+        }
+
+    # ── primary API used by the pipeline ────────────────────────
+
+    def add(self, block, canny, color_avg, quality, tags, source=""):
+        """Append a cell. Routes through bridge -> ce_storage_add_typed."""
+        bridge_block = self._slot_for_block.get(block, "bot")
+        cid = super().add_cell(bridge_block, canny, None, color_avg,
+                               quality=float(quality), source=source)
+        # super().add_cell also appends to self.cells[bridge_block] (its
+        # own sidecar). We layer our own per-pipeline-block sidecar on
+        # top, so drop the parent's row to avoid double-counting in
+        # total_cells / avg_quality.
+        parent_list = self.cells.get(bridge_block)
+        if parent_list:
+            parent_list.pop()
+            if not parent_list:
+                # Keep keys disjoint between the two views.
+                self.cells.pop(bridge_block, None)
+
+        cells_for_block = self.cells.setdefault(block, [])
+        local_id = len(cells_for_block)
+        cell = {
+            "id": local_id,
+            "ce_id": cid,
+            "ce_block": bridge_block,
+            "canny": canny,
+            "color": (color_avg.tolist()
+                      if isinstance(color_avg, np.ndarray) else list(color_avg)),
+            "quality": float(quality),
+            "tags": list(tags),
+            "source": source,
+            "gen": self.generation,
+            "uses": 0,
+        }
+        cells_for_block.append(cell)
+        for t in tags:
+            self.prompt_index[t].append((block, local_id))
+        return local_id
+
+    def search(self, tags, block=None):
+        hits = []
+        blocks = [block] if block else list(ROW_BLOCKS.keys())
+        for b in blocks:
+            for cell in self.cells.get(b, []):
+                match = sum(1 for t in tags if t in cell.get("tags", []))
+                if match > 0:
+                    hits.append((match, cell, b))
+        hits.sort(key=lambda x: (x[0], x[1]["quality"]), reverse=True)
+        return hits
+
+    def add_pending(self, data, reason):
+        self.pending.append({"data": data, "reason": reason,
+                             "gen": self.generation})
+
+    def get_best(self, block, n=3):
+        return sorted(self.cells.get(block, []),
+                      key=lambda c: c["quality"], reverse=True)[:n]
+
+    def get_by_tags(self, block, tags, n=5):
+        cands = []
+        for cell in self.cells.get(block, []):
+            match = sum(1 for t in tags if t in cell.get("tags", []))
+            if match > 0:
+                cands.append((match * cell["quality"], cell))
+        cands.sort(key=lambda x: x[0], reverse=True)
+        return [c[1] for c in cands[:n]]
+
+    def update_quality(self, block, cid, new_q):
+        cell = self.cells[block][cid]
+        cell["quality"] = cell["quality"] * 0.7 + new_q * 0.3
+        cell["uses"] += 1
+
+    def total_cells(self):
+        return sum(len(v) for v in self.cells.values())
+
+    def avg_quality(self):
+        all_q = [c["quality"]
+                 for cells in self.cells.values() for c in cells]
+        return float(np.mean(all_q)) if all_q else 0.0
+
+
+# ────────────────────────────────────────────────────────────
+# 2. Planner
+# ────────────────────────────────────────────────────────────
+class Planner:
+    COLOR_MAP = {
+        "빨간": "red", "파란": "blue", "초록": "green", "노란": "yellow",
+        "하얀": "white", "검은": "black", "분홍": "pink", "주황": "orange",
+        "red": "red", "blue": "blue", "green": "green",
+    }
+    EXPR_MAP = {
+        "웃는": "smile", "슬픈": "sad", "놀란": "surprise",
+        "눈감은": "blink", "말하는": "talk", "화난": "angry",
+    }
+    MOTION_MAP = {
+        "걷는": "walk", "뛰는": "run", "흔드는": "wave",
+        "떨어지는": "fall", "날리는": "blow",
+        "꽃잎": "petal", "바람": "wind",
+    }
+
+    def parse(self, prompt):
+        intent = {
+            "needs_chat": True, "needs_image": False,
+            "needs_video": False, "needs_learn": False,
+            "tags": [], "colors": [], "expressions": [], "motions": [],
+            "raw": prompt,
+        }
+        p = prompt.lower()
+        for kw in ["그려", "만들어", "생성", "이미지", "캐릭터", "그림"]:
+            if kw in p:
+                intent["needs_image"] = True
+        for kw in ["영상", "동영상", "움직", "모션", "애니"]:
+            if kw in p:
+                intent["needs_video"] = True
+                intent["needs_image"] = True
+        for kw in ["학습", "업그레이드", "개선"]:
+            if kw in p:
+                intent["needs_learn"] = True
+        for kw, tag in self.COLOR_MAP.items():
+            if kw in p:
+                intent["colors"].append(tag)
+                intent["tags"].append(tag)
+        for kw, tag in self.EXPR_MAP.items():
+            if kw in p:
+                intent["expressions"].append(tag)
+                intent["tags"].append(tag)
+        for kw, tag in self.MOTION_MAP.items():
+            if kw in p:
+                intent["motions"].append(tag)
+                intent["tags"].append(tag)
+        if not intent["tags"]:
+            intent["tags"] = ["default"]
+        return intent
+
+    def search_memory(self, memory, intent):
+        hits = memory.search(intent["tags"])
+        if hits:
+            best_match = hits[0][0]
+            total_tags = len(intent["tags"])
+            ratio = best_match / total_tags if total_tags > 0 else 0
+            return {
+                "hit": ratio > 0.3,
+                "ratio": ratio,
+                "cells": hits[:8],
+                "strategy": "recombine" if ratio > 0.5 else "sculpt_hybrid",
+            }
+        return {"hit": False, "ratio": 0, "cells": [], "strategy": "sculpt_new"}
+
+
+# ────────────────────────────────────────────────────────────
+# 3. SculptGenerator  (deterministic, no random noise)
+# ────────────────────────────────────────────────────────────
+class SculptGenerator:
+    COLOR_BGR = {
+        "red":   (50, 50, 210),  "blue":   (210, 70, 50),
+        "green": (50, 170, 50),  "yellow": (40, 210, 210),
+        "white": (235, 235, 235), "black":  (25, 25, 25),
+        "pink":  (175, 145, 215), "orange": (40, 130, 220),
+        "skin":  (190, 210, 230), "hair_dark": (45, 50, 65),
+        "hair_blonde": (120, 195, 220),
+    }
+
+    def __init__(self, memory):
+        self.memory = memory
+        self.params = {name: {
+            "edge_strength": 0.35,
+            "blend_sharpness": 0.8,
+            "boundary_fade": 8,
+        } for name in ROW_BLOCKS}
+
+    def generate(self, intent, search_result):
+        canvas = np.zeros((H, W, 3), np.uint8)
+        strategy = search_result["strategy"]
+
+        for name, (start, end) in ROW_BLOCKS.items():
+            y0, y1 = int(H * start), int(H * end)
+            bh = y1 - y0
+
+            if strategy == "recombine":
+                block = self._recombine(name, bh, intent, search_result["cells"])
+            elif strategy == "sculpt_hybrid":
+                block = self._sculpt_hybrid(name, bh, intent, search_result["cells"])
+            else:
+                block = self._sculpt_new(name, bh, intent)
+
+            block = self._sculpt_color(block, intent, name)
+            if name == "face" and intent["expressions"]:
+                block = self._sculpt_expression(block, intent["expressions"][0])
+
+            canvas[y0:y1] = np.clip(block, 0, 255).astype(np.uint8)
+
+        return self._fade_boundaries(canvas)
+
+    def generate_variation(self, base_image, intent, variation_idx=0):
+        varied = base_image.copy()
+        hsv = cv2.cvtColor(varied, cv2.COLOR_BGR2HSV).astype(np.float32)
+
+        hue_shifts = [3, -3, 5, -5, 8, -2]
+        sat_factors = [1.05, 0.95, 1.10, 0.90, 1.03, 0.97]
+        bright_factors = [1.02, 0.98, 1.04, 0.96, 1.01, 0.99]
+
+        hsv[:, :, 0] = np.clip(hsv[:, :, 0] + hue_shifts[variation_idx % len(hue_shifts)], 0, 179)
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat_factors[variation_idx % len(sat_factors)], 0, 255)
+        hsv[:, :, 2] = np.clip(hsv[:, :, 2] * bright_factors[variation_idx % len(bright_factors)], 0, 255)
+
+        varied = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        if variation_idx % 3 == 0:
+            kernel = np.array([[0, -0.5, 0], [-0.5, 3, -0.5], [0, -0.5, 0]])
+            varied = cv2.filter2D(varied, -1, kernel)
+            varied = np.clip(varied, 0, 255).astype(np.uint8)
+        return varied
+
+    def _recombine(self, block_name, bh, intent, hits):
+        block = np.zeros((bh, W, 3), np.float32)
+        block_cells = [(s, c) for s, c, b in hits if b == block_name]
+
+        if len(block_cells) >= 2:
+            _, struct_cell = max(block_cells, key=lambda x: x[1]["quality"])
+            _, color_cell = max(block_cells, key=lambda x: x[0])
+            color = np.array(color_cell["color"], np.float32)
+            block[:] = color
+            if struct_cell["canny"] is not None:
+                edge = struct_cell["canny"]
+                if edge.shape[0] != bh:
+                    edge = cv2.resize(edge, (W, bh))
+                edge3 = cv2.cvtColor(edge, cv2.COLOR_GRAY2BGR).astype(np.float32)
+                es = self.params[block_name]["edge_strength"]
+                block = block * (1 - es) + (block + edge3 * 0.8) * es
+        elif block_cells:
+            _, cell = block_cells[0]
+            color = np.array(cell["color"], np.float32)
+            block[:] = color
+            if cell["canny"] is not None:
+                edge = cell["canny"]
+                if edge.shape[0] != bh:
+                    edge = cv2.resize(edge, (W, bh))
+                edge3 = cv2.cvtColor(edge, cv2.COLOR_GRAY2BGR).astype(np.float32)
+                block += edge3 * self.params[block_name]["edge_strength"]
+        else:
+            block = self._sculpt_new(block_name, bh, intent)
+        return np.clip(block, 0, 255)
+
+    def _sculpt_hybrid(self, block_name, bh, intent, hits):
+        cell_block = self._recombine(block_name, bh, intent, hits)
+        new_block = self._sculpt_new(block_name, bh, intent)
+        block_cells = [(s, c) for s, c, b in hits if b == block_name]
+        if block_cells:
+            best_q = max(c["quality"] for _, c in block_cells)
+            cell_weight = min(0.85, 0.4 + best_q)
+        else:
+            cell_weight = 0.3
+        return np.clip(cell_block * cell_weight + new_block * (1 - cell_weight), 0, 255)
+
+    def _sculpt_new(self, block_name, bh, intent):
+        block = np.zeros((bh, W, 3), np.float32)
+        base_colors = {
+            "hair":  self.COLOR_BGR.get("hair_dark", (50, 55, 70)),
+            "face":  self.COLOR_BGR.get("skin", (190, 210, 230)),
+            "upper": (180, 190, 200),
+            "lower": (160, 170, 180),
+            "bg":    (200, 210, 190),
+        }
+        base = np.array(base_colors.get(block_name, (150, 150, 150)), np.float32)
+        block[:] = base
+
+        best = self.memory.get_best(block_name, 3)
+        if best:
+            weighted_color = np.zeros(3, np.float32)
+            total_w = 0.0
+            for cell in best:
+                c = np.array(cell["color"], np.float32)
+                q = cell["quality"]
+                weighted_color += c * q
+                total_w += q
+            if total_w > 0:
+                weighted_color /= total_w
+                block[:] = base * 0.6 + weighted_color * 0.4
+            top_cell = best[0]
+            if top_cell["canny"] is not None:
+                edge = top_cell["canny"]
+                if edge.shape[0] != bh:
+                    edge = cv2.resize(edge, (W, bh))
+                edge3 = cv2.cvtColor(edge, cv2.COLOR_GRAY2BGR).astype(np.float32)
+                es = self.params[block_name]["edge_strength"]
+                block = block + edge3 * es
+        return np.clip(block, 0, 255)
+
+    def _sculpt_color(self, block, intent, block_name):
+        if not intent["colors"]:
+            return block
+        block = block.astype(np.float32)
+        for c in intent["colors"]:
+            if c in self.COLOR_BGR:
+                tint = np.array(self.COLOR_BGR[c], np.float32)
+                weights = {"hair": 0.5, "face": 0.3, "upper": 0.45,
+                           "lower": 0.35, "bg": 0.2}
+                w = weights.get(block_name, 0.3)
+                block = block * (1 - w) + tint * w
+        return np.clip(block, 0, 255)
+
+    def _sculpt_expression(self, block, expr):
+        bh, bw = block.shape[:2]
+        block = np.clip(block, 0, 255).astype(np.uint8)
+        cy, cx = bh // 2, bw // 2
+
+        eye_params = {
+            "smile":    {"w": 8, "h": 5,  "pupil": 3, "highlight": True,  "squint": True},
+            "sad":      {"w": 8, "h": 7,  "pupil": 3, "highlight": False, "squint": False},
+            "surprise": {"w": 9, "h": 11, "pupil": 4, "highlight": True,  "squint": False},
+            "blink":    {"w": 8, "h": 1,  "pupil": 0, "highlight": False, "squint": True},
+            "talk":     {"w": 8, "h": 6,  "pupil": 3, "highlight": True,  "squint": False},
+            "neutral":  {"w": 8, "h": 6,  "pupil": 3, "highlight": False, "squint": False},
+        }
+        ep = eye_params.get(expr, eye_params["neutral"])
+        for ex in [cx - 25, cx + 25]:
+            ey = cy - 15
+            if ep["h"] <= 1:
+                cv2.line(block, (ex - 8, ey), (ex + 8, ey), (40, 40, 50), 2)
+            else:
+                cv2.ellipse(block, (ex, ey), (ep["w"], ep["h"]), 0, 0, 360, (255, 255, 255), -1)
+                if ep["pupil"] > 0:
+                    cv2.circle(block, (ex, ey), ep["pupil"], (35, 35, 45), -1)
+                if ep["highlight"]:
+                    cv2.circle(block, (ex - 1, ey - 2), 1, (255, 255, 255), -1)
+                if ep["squint"]:
+                    cv2.ellipse(block, (ex, ey - ep["h"] + 1),
+                                (ep["w"], 2), 0, 0, 360,
+                                block[max(0, ey - 20), ex].tolist(), -1)
+
+        brow_params = {"smile": 2, "sad": -3, "surprise": 5,
+                       "talk": 1, "neutral": 0, "blink": 0}
+        brow_lift = brow_params.get(expr, 0)
+        for bx in [cx - 25, cx + 25]:
+            by = cy - 28 - brow_lift
+            cv2.line(block,
+                     (bx - 10, by + brow_lift // 2),
+                     (bx + 10, by - brow_lift // 2),
+                     (60, 50, 45), 2)
+
+        my = cy + 22
+        if expr == "smile":
+            cv2.ellipse(block, (cx, my), (16, 9), 0, 10, 170, (90, 70, 120), 2)
+            cv2.ellipse(block, (cx, my + 2), (12, 5), 0, 0, 180, (130, 100, 140), -1)
+        elif expr == "sad":
+            cv2.ellipse(block, (cx, my + 6), (14, 7), 0, 190, 350, (90, 70, 120), 2)
+        elif expr == "surprise":
+            cv2.ellipse(block, (cx, my), (10, 12), 0, 0, 360, (80, 60, 110), -1)
+        elif expr == "talk":
+            cv2.ellipse(block, (cx, my), (11, 7), 0, 0, 360, (90, 70, 120), -1)
+        else:
+            cv2.line(block, (cx - 12, my), (cx + 12, my), (90, 70, 120), 2)
+
+        if expr in ("smile", "talk"):
+            for bx in [cx - 30, cx + 30]:
+                overlay = block.copy()
+                cv2.circle(overlay, (bx, cy + 8), 10, (200, 180, 220), -1)
+                cv2.addWeighted(overlay, 0.15, block, 0.85, 0, block)
+
+        for i in range(0, bw, 3):
+            length = 8 + (i % 7) * 2
+            cv2.line(block, (i, 0),
+                     (i + (i % 5) - 2, min(length, bh - 1)),
+                     (50, 55, 70), 1)
+
+        return block.astype(np.float32)
+
+    def _fade_boundaries(self, canvas):
+        result = canvas.astype(np.float32)
+        block_list = list(ROW_BLOCKS.items())
+        for i in range(len(block_list) - 1):
+            _, (_, end1) = block_list[i]
+            y_boundary = int(H * end1)
+            fade = self.params[block_list[i][0]]["boundary_fade"]
+            for dy in range(1, fade + 1):
+                t = dy / fade
+                y_above = max(0, y_boundary - dy)
+                y_below = min(H - 1, y_boundary + dy)
+                if y_above < H and y_below < H:
+                    result[y_boundary] = (result[y_above] * (1 - t * 0.3)
+                                          + result[y_below] * (t * 0.3))
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+    def update_params(self, block_name, score_data):
+        bp = self.params[block_name]
+        block_score = score_data.get(block_name, 0)
+        if block_score < 0.3:
+            bp["edge_strength"] = min(0.7, bp["edge_strength"] + 0.03)
+        elif block_score > 0.6:
+            bp["blend_sharpness"] = min(1.0, bp["blend_sharpness"] + 0.02)
+
+
+# ────────────────────────────────────────────────────────────
+# 4. MotionEngine
+# ────────────────────────────────────────────────────────────
+class MotionEngine:
+    def generate_frames(self, base_image, intent, n_frames=24):
+        frames = []
+        has_petal = any(m in intent.get("motions", [])
+                        for m in ["petal", "fall", "blow"])
+        has_wind = any(m in intent.get("motions", [])
+                       for m in ["wind", "blow", "wave"])
+
+        petals = []
+        if has_petal:
+            for i in range(12):
+                petals.append({
+                    "x": 20 + (i * 37) % (W - 40),
+                    "y": -(i * 13) % 30,
+                    "vy": 1.5 + (i % 4) * 0.8,
+                    "vx_base": ((i % 5) - 2) * 0.4,
+                    "size": 4 + (i % 5),
+                    "hue": 165 + (i % 6) * 3,
+                    "phase": i * 0.7,
+                })
+
+        for fi in range(n_frames):
+            frame = base_image.copy()
+
+            if has_wind:
+                hair_end = int(H * 0.15)
+                for row in range(hair_end):
+                    shift = int(np.sin(row * 0.06 + fi * 0.18) * 3)
+                    frame[row] = np.roll(frame[row], shift, axis=0)
+
+            if intent.get("expressions"):
+                fy0, fy1 = int(H * 0.15), int(H * 0.40)
+                brightness = 1.0 + np.sin(fi * 0.25) * 0.02
+                frame[fy0:fy1] = np.clip(
+                    frame[fy0:fy1].astype(np.float32) * brightness,
+                    0, 255).astype(np.uint8)
+
+            if has_petal:
+                for p in petals:
+                    p["y"] += p["vy"]
+                    p["x"] += p["vx_base"] + np.sin(p["phase"] + fi * 0.12) * 0.6
+                    if p["y"] >= H:
+                        p["y"] -= (H + 20)
+                    cy = int(np.clip(p["y"], 0, H - 1))
+                    cx = int(np.clip(p["x"], 0, W - 1))
+                    s = p["size"]
+                    y0m, y1m = max(0, cy - s), min(H, cy + s)
+                    x0m, x1m = max(0, cx - s), min(W, cx + s)
+                    if y1m > y0m and x1m > x0m:
+                        roi = frame[y0m:y1m, x0m:x1m].astype(np.float32)
+                        petal_color = np.array(cv2.cvtColor(
+                            np.uint8([[[p["hue"], 120, 230]]]),
+                            cv2.COLOR_HSV2BGR)[0, 0], np.float32)
+                        tint = np.full_like(roi, petal_color)
+                        frame[y0m:y1m, x0m:x1m] = np.clip(
+                            roi * 0.55 + tint * 0.45, 0, 255).astype(np.uint8)
+
+            frames.append(frame)
+        return frames
+
+
+# ────────────────────────────────────────────────────────────
+# 5. Evaluator
+# ────────────────────────────────────────────────────────────
+class Evaluator:
+    COLOR_RANGES = {
+        "red":    ((0,   50, 50), (10,  255, 255)),
+        "blue":   ((100, 50, 50), (130, 255, 255)),
+        "green":  ((35,  50, 50), (85,  255, 255)),
+        "yellow": ((20,  50, 50), (35,  255, 255)),
+        "pink":   ((140, 30, 50), (175, 255, 255)),
+        "orange": ((10,  50, 50), (25,  255, 255)),
+    }
+
+    def evaluate(self, image, intent, frames=None):
+        scores = {}
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        scores["edge"] = round(float(np.mean(edges > 0)), 4)
+
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        scores["color_var"] = round(
+            float(np.std(hsv[:, :, 0]) / 180 + np.mean(hsv[:, :, 1]) / 255 * 0.5), 4)
+        scores["non_trivial"] = round(
+            min(1.0, float(np.std(image.astype(float))) / 50), 4)
+
+        means = [np.mean(image[int(H * s):int(H * e)])
+                 for _, (s, e) in ROW_BLOCKS.items()]
+        diffs = [abs(means[i] - means[i + 1]) for i in range(len(means) - 1)]
+        scores["coherence"] = round(max(0, 1.0 - np.mean(diffs) / 100), 4)
+
+        quality = (scores["edge"] * 0.25
+                   + scores["color_var"] * 0.15
+                   + scores["non_trivial"] * 0.25
+                   + scores["coherence"] * 0.2)
+
+        prompt_score = 0.0
+        checks = 0
+        if intent["colors"]:
+            for c in intent["colors"]:
+                checks += 1
+                if c in self.COLOR_RANGES:
+                    lo, hi = self.COLOR_RANGES[c]
+                    mask = cv2.inRange(hsv, np.array(lo), np.array(hi))
+                    prompt_score += min(1.0, np.mean(mask > 0) * 8)
+                elif c == "white":
+                    prompt_score += float(np.mean(hsv[:, :, 2]) / 255)
+                elif c == "black":
+                    prompt_score += float(1 - np.mean(hsv[:, :, 2]) / 255)
+        if intent["expressions"]:
+            checks += 1
+            fy0, fy1 = int(H * 0.15), int(H * 0.40)
+            face_edge = np.mean(cv2.Canny(
+                cv2.cvtColor(image[fy0:fy1], cv2.COLOR_BGR2GRAY),
+                50, 150) > 0)
+            prompt_score += min(1.0, face_edge * 4)
+        if frames and len(frames) > 1 and intent["motions"]:
+            checks += 1
+            ds = [np.mean(np.abs(frames[i].astype(float)
+                                 - frames[i - 1].astype(float)))
+                  for i in range(1, min(5, len(frames)))]
+            prompt_score += min(1.0, np.mean(ds) / 12)
+
+        prompt_match = prompt_score / checks if checks > 0 else 0.5
+        scores["prompt_match"] = round(prompt_match, 4)
+        scores["quality"] = round(quality, 4)
+        scores["final"] = round(quality * 0.4 + prompt_match * 0.6, 4)
+
+        scores["blocks"] = {}
+        for name, (s, e) in ROW_BLOCKS.items():
+            block = image[int(H * s):int(H * e)]
+            be = np.mean(cv2.Canny(cv2.cvtColor(block, cv2.COLOR_BGR2GRAY),
+                                   50, 150) > 0)
+            bv = np.std(block.astype(float)) / 80
+            scores["blocks"][name] = round(min(1.0, be * 0.4 + bv * 0.6), 4)
+
+        scores["weak_points"] = []
+        if scores["edge"] < 0.03:
+            scores["weak_points"].append("edge_low")
+        if scores["coherence"] < 0.5:
+            scores["weak_points"].append("discontinuity")
+        if prompt_match < 0.3:
+            scores["weak_points"].append("prompt_mismatch")
+        return scores
+
+
+# ────────────────────────────────────────────────────────────
+# 6. Pipeline orchestrator
+# ────────────────────────────────────────────────────────────
+class SSSPipeline:
+    """Stateful orchestrator. Holds memory + planner + generator + evaluator
+    so the same instance can be re-used across many prompts."""
+
+    def __init__(self, db_path: Optional[str] = None):
+        os.makedirs(BASE_DIR, exist_ok=True)
+        self.memory = CEMemory(db_path)
+        self.planner = Planner()
+        self.generator = SculptGenerator(self.memory)
+        self.motion = MotionEngine()
+        self.evaluator = Evaluator()
+        self.run_count = 0
+
+    # ── seeding ─────────────────────────────────────────────
+    def seed_foundation(self):
+        shapes = [
+            ("circle", lambda img, r: cv2.circle(img, (128, 128), r, (220, 220, 230), -1)),
+            ("rect",   lambda img, r: cv2.rectangle(img,
+                                                    (128 - r, 128 - r // 2),
+                                                    (128 + r, 128 + r // 2),
+                                                    (220, 220, 230), -1)),
+            ("tri",    lambda img, r: cv2.fillPoly(
+                img,
+                [np.array([[128, 128 - r], [128 - r, 128 + r], [128 + r, 128 + r]])],
+                (220, 220, 230))),
+        ]
+        for sname, fn in shapes:
+            for size, r in [("s", 25), ("m", 50), ("l", 80)]:
+                img = np.zeros((H, W, 3), np.uint8)
+                fn(img, r)
+                for bname, (s, e) in ROW_BLOCKS.items():
+                    y0, y1 = int(H * s), int(H * e)
+                    block = img[y0:y1]
+                    canny = cv2.Canny(cv2.cvtColor(block, cv2.COLOR_BGR2GRAY), 50, 150)
+                    color = np.mean(block, axis=(0, 1))
+                    self.memory.add(bname, canny, color, 0.40,
+                                    [sname, size], f"found_{sname}_{size}")
+
+        for cname, bgr in [("red", (50, 50, 210)), ("blue", (210, 70, 50)),
+                           ("green", (50, 170, 50)), ("pink", (175, 145, 215)),
+                           ("skin", (190, 210, 230)), ("yellow", (40, 210, 210))]:
+            for bname in ROW_BLOCKS:
+                self.memory.add(bname, None, np.array(bgr, float), 0.42,
+                                [cname], f"found_{cname}")
+
+        for expr in ["smile", "sad", "neutral", "surprise", "blink", "talk"]:
+            self.memory.add("face", None, np.array([190, 210, 230], float),
+                            0.45, [expr, "face_expr"], f"found_{expr}")
+            for bname in ROW_BLOCKS:
+                if bname != "face":
+                    self.memory.add(bname, None, np.array([180, 190, 200], float),
+                                    0.38, [expr], f"found_{expr}")
+
+    # ── single run ─────────────────────────────────────────
+    def run(self, prompt):
+        self.run_count += 1
+        result = {"run": self.run_count, "prompt": prompt}
+
+        intent = self.planner.parse(prompt)
+        search = self.planner.search_memory(self.memory, intent)
+        result["search"] = {
+            "hit": search["hit"],
+            "ratio": round(search["ratio"], 3),
+            "strategy": search["strategy"],
+            "n_hits": len(search["cells"]),
+        }
+
+        image = frames = None
+        if intent["needs_image"] or intent["needs_video"]:
+            image = self.generator.generate(intent, search)
+            candidates = [image]
+            for vi in range(3):
+                candidates.append(self.generator.generate_variation(image, intent, vi))
+            best_score = -1.0
+            for cand in candidates:
+                sc = self.evaluator.evaluate(cand, intent)
+                if sc["final"] > best_score:
+                    best_score = sc["final"]
+                    image = cand
+
+        if intent["needs_video"] and image is not None:
+            frames = self.motion.generate_frames(image, intent, n_frames=24)
+            result["frames"] = len(frames)
+
+        score = {"final": 0, "quality": 0, "prompt_match": 0}
+        if image is not None:
+            score = self.evaluator.evaluate(image, intent, frames)
+            result["score"] = score
+
+            threshold = 0.20 + self.memory.generation * 0.008
+            if score["final"] >= threshold:
+                tags = list(intent["tags"])
+                for bname, (s, e) in ROW_BLOCKS.items():
+                    y0, y1 = int(H * s), int(H * e)
+                    block = image[y0:y1]
+                    canny = cv2.Canny(cv2.cvtColor(block, cv2.COLOR_BGR2GRAY),
+                                      50, 150)
+                    color = np.mean(block, axis=(0, 1))
+                    bq = score["blocks"].get(bname, score["final"])
+                    self.memory.add(bname, canny, color, bq, tags,
+                                    f"run{self.run_count}")
+                    self.generator.update_params(bname, score["blocks"])
+                self.memory.generation += 1
+                result["stored"] = "accepted"
+            else:
+                self.memory.add_pending(
+                    {"prompt": prompt, "score": score["final"]},
+                    score.get("weak_points", []))
+                result["stored"] = "pending"
+
+        parts = []
+        if intent["needs_image"]:
+            parts.append("이미지 생성 완료")
+        if intent["needs_video"]:
+            parts.append("영상 생성 완료")
+        parts.append(
+            f"품질={score['quality']:.3f} prompt={score['prompt_match']:.3f} "
+            f"최종={score['final']:.3f}")
+        parts.append(f"메모리 {self.memory.total_cells()}셀")
+        result["chat"] = " | ".join(parts)
+        result["memory"] = {
+            "cells": self.memory.total_cells(),
+            "avg_q": round(self.memory.avg_quality(), 4),
+            "ce_storage": self.memory.ce_storage_count(),
+        }
+        return result, image, frames
+
+
+# ────────────────────────────────────────────────────────────
+# 7. Module-level convenience (for quick scripting)
+# ────────────────────────────────────────────────────────────
+_pipeline: Optional[SSSPipeline] = None
+
+
+def _get_pipeline():
+    global _pipeline
+    if _pipeline is None:
+        _pipeline = SSSPipeline()
+        _pipeline.seed_foundation()
+    return _pipeline
+
+
+def run_sss_pipeline(prompt):
+    """One-call entry point. Lazily seeds foundation on first use."""
+    return _get_pipeline().run(prompt)
+
+
+# ────────────────────────────────────────────────────────────
+# 8. Demo runner
+# ────────────────────────────────────────────────────────────
+def run_demo():
+    print("=" * 60)
+    print("  SSS Unified Pipeline v2 — No Noise")
+    print("=" * 60)
+
+    pipeline = SSSPipeline()
+    pipeline.seed_foundation()
+    print(f"\n  Foundation: {pipeline.memory.total_cells()} cells "
+          f"(CEStorage: {pipeline.memory.ce_storage_count()})")
+
+    rounds = [
+        ("Round 1 (첫 생성)", [
+            "빨간 캐릭터가 웃는 이미지 그려줘",
+            "파란 캐릭터가 슬픈 이미지 만들어줘",
+            "분홍 캐릭터가 꽃잎 속에서 웃는 영상 만들어줘",
+        ]),
+        ("Round 2 (기억 재사용)", [
+            "빨간 캐릭터가 웃는 이미지 그려줘",
+            "파란 캐릭터가 슬픈 이미지 만들어줘",
+            "분홍 캐릭터가 꽃잎 속에서 웃는 영상 만들어줘",
+        ]),
+        ("Round 3 (개선 확인)", [
+            "빨간 캐릭터가 웃는 이미지 그려줘",
+            "파란 캐릭터가 슬픈 이미지 만들어줘",
+            "분홍 캐릭터가 꽃잎 속에서 웃는 영상 만들어줘",
+            "초록 캐릭터가 놀란 이미지 생성해줘",
+        ]),
+    ]
+
+    output_dir = os.path.join(BASE_DIR, "output")
+    os.makedirs(output_dir, exist_ok=True)
+    tracking = defaultdict(list)
+
+    for rname, prompts in rounds:
+        print(f"\n{'━' * 60}")
+        print(f"  {rname}")
+        print(f"{'━' * 60}")
+        for prompt in prompts:
+            result, image, frames = pipeline.run(prompt)
+            sc = result.get("score", {})
+            ms = result.get("search", {})
+            print(f"\n  \"{prompt}\"")
+            print(f"  strategy={ms.get('strategy', '?')} "
+                  f"hit={ms.get('hit', False)}({ms.get('ratio', 0):.2f}) "
+                  f"n_hits={ms.get('n_hits', 0)}")
+            print(f"  quality={sc.get('quality', 0):.3f} "
+                  f"prompt={sc.get('prompt_match', 0):.3f} "
+                  f"final={sc.get('final', 0):.3f}")
+            print(f"  stored={result.get('stored', '?')} "
+                  f"memory={result['memory']['cells']}셀 "
+                  f"ce={result['memory']['ce_storage']} "
+                  f"avg_q={result['memory']['avg_q']:.3f}")
+            if sc.get("weak_points"):
+                print(f"  weak: {sc['weak_points']}")
+
+            tracking[prompt].append(sc.get("final", 0))
+
+            if image is not None:
+                cv2.imwrite(os.path.join(output_dir, f"run{result['run']:02d}.png"), image)
+            if frames and len(frames) > 1:
+                fd = os.path.join(output_dir, f"fr_{result['run']:02d}")
+                os.makedirs(fd, exist_ok=True)
+                for fi, fr in enumerate(frames):
+                    cv2.imwrite(os.path.join(fd, f"f_{fi:03d}.png"), fr)
+                vp = os.path.join(output_dir, f"vid_{result['run']:02d}.mp4")
+                subprocess.run(
+                    ["ffmpeg", "-y", "-framerate", "24",
+                     "-i", os.path.join(fd, "f_%03d.png"),
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                     "-crf", "22", "-preset", "fast", vp],
+                    capture_output=True)
+                for f in os.listdir(fd):
+                    os.remove(os.path.join(fd, f))
+                os.rmdir(fd)
+
+    print(f"\n{'━' * 60}")
+    print("  개선 추적")
+    print(f"{'━' * 60}")
+    for prompt, scores in tracking.items():
+        if len(scores) >= 2:
+            delta = scores[-1] - scores[0]
+            d = "↑" if delta > 0.003 else ("↓" if delta < -0.003 else "→")
+            print(f"\n  \"{prompt[:35]}\"")
+            vals = " → ".join(f"{s:.3f}" for s in scores)
+            bar_first = "█" * int(scores[0] * 50) + "░" * (50 - int(scores[0] * 50))
+            bar_last = "█" * int(scores[-1] * 50) + "░" * (50 - int(scores[-1] * 50))
+            print(f"    {vals}  {d} ({delta:+.3f})")
+            print(f"    R1: {bar_first}")
+            print(f"    R3: {bar_last}")
+
+    print(f"\n{'━' * 60}")
+    print(f"  최종: {pipeline.run_count}회 실행, "
+          f"{pipeline.memory.total_cells()}셀 "
+          f"(CEStorage: {pipeline.memory.ce_storage_count()}), "
+          f"세대 {pipeline.memory.generation}")
+    print(f"  avg_q={pipeline.memory.avg_quality():.4f}, "
+          f"pending={len(pipeline.memory.pending)}건")
+
+
+if __name__ == "__main__":
+    run_demo()
