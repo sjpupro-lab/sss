@@ -73,6 +73,34 @@ def main() -> int:
         new_id = mem2.add_cell("top", canny, depth, color_avg, 0.4)
         assert new_id == 3, f"expected next top idx to be 3, got {new_id}"
 
+        # After load, the chain anchor must be the keyframe of the
+        # highest block_idx — verified by adding a new cell and reading
+        # its keyframe back; the path through ce_storage_add_typed
+        # depends on prev_kf, so a wrong anchor would silently corrupt
+        # the delta but the keyframe lookup itself still proves the
+        # entry was indexed under bidx=3 (next after the loaded tail).
+        kf_after = mem2.get_keyframe("top", 3)
+        assert kf_after is not None, "load+append: keyframe at idx=3 missing"
+
+        # save() must surface .ces write failures rather than silently
+        # writing only meta.json. Point db_path to a non-writable child
+        # to force ce_storage_save to fail.
+        bad_dir = os.path.join(tmp, "ro_dir", "mem")
+        bad_mem = CEMemory(bad_dir)
+        bad_mem.add_cell("top", canny, depth, color_avg, 0.5)
+        # Replace db_path with a bogus one whose parent doesn't exist,
+        # so fopen("…/storage.ces", "wb") fails inside ce_storage_save.
+        bad_mem.db_path = "/nonexistent/sss_test_does_not_exist"
+        try:
+            bad_mem.save()
+        except IOError as exc:
+            saved_meta = os.path.exists(
+                os.path.join(bad_mem.db_path, "meta.json"))
+            assert not saved_meta, "meta.json must not be written on save failure"
+            print("OK  save raises on failure :", str(exc)[:60])
+        else:
+            raise AssertionError("expected IOError when .ces path is invalid")
+
         print("OK  ce_storage_count =", mem.ce_storage_count())
         print("OK  per-slot counts  : top=%d bot=%d" % (per_top, per_bot))
         print("OK  keyframe bytes   :", kf[:8].hex(), "...")

@@ -229,14 +229,17 @@ class CEMemory:
         }
 
     def save(self):
+        """Persist .ces and meta.json. Raises IOError if .ces write fails;
+        meta.json is only written after a successful .ces save."""
         ces_path = os.path.join(self.db_path, "storage.ces")
         ok = _lib().sss_memory_save(self._handle, ces_path.encode("utf-8"))
+        if not ok:
+            raise IOError(f"sss_memory_save failed for {ces_path!r}")
         meta = {
             "generation": self.generation,
             "stats": self.stats,
             "block_counts": {k: len(v) for k, v in self.cells.items()},
             "ces_path": ces_path,
-            "ces_saved": bool(ok),
         }
         with open(os.path.join(self.db_path, "meta.json"), "w") as f:
             json.dump(meta, f, indent=2)

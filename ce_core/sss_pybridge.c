@@ -15,7 +15,9 @@
 typedef struct {
     uint32_t canvas_id;
     uint16_t slot;
-    uint16_t next_block_idx;
+    uint16_t _pad;
+    /* uint32 so we can detect overflow before truncating to uint16 */
+    uint32_t next_block_idx;
     int      has_prev;
     CEUnit   prev_kf;
 } sss_tail;
@@ -74,6 +76,8 @@ uint32_t sss_memory_add_typed(sss_memory   *m,
 
     sss_tail *t = tail_lookup_or_insert(m, canvas_id, slot);
     if (!t) return UINT32_MAX;
+    /* CEStorageEntry.block_idx is uint16; refuse to wrap. */
+    if (t->next_block_idx > 0xFFFFu) return UINT32_MAX;
 
     CEUnit fresh; ce_init(&fresh);
     if (len > 0) ce_feed(&fresh, bytes, len);
@@ -85,7 +89,7 @@ uint32_t sss_memory_add_typed(sss_memory   *m,
     CEUnit delta;
     ce_delta(&delta, &anchor, &fresh);
 
-    uint16_t bidx = t->next_block_idx;
+    uint16_t bidx = (uint16_t)t->next_block_idx;
     uint32_t before = m->storage.count;
     ce_storage_add_typed(&m->storage, canvas_id, slot, bidx,
                          (CEType)type, &fresh, &delta);
@@ -93,7 +97,7 @@ uint32_t sss_memory_add_typed(sss_memory   *m,
 
     t->prev_kf = fresh;
     t->has_prev = 1;
-    t->next_block_idx = (uint16_t)(bidx + 1u);
+    t->next_block_idx = (uint32_t)bidx + 1u;  /* may reach 0x10000 -> next add errors */
     return (uint32_t)bidx;
 }
 
@@ -126,7 +130,10 @@ int sss_memory_load(sss_memory *m, const char *path) {
         ce_storage_init(&m->storage, 16);
         return 0;
     }
-    /* Rebuild tail map so subsequent adds chain correctly. */
+    /* Rebuild tail map so subsequent adds chain correctly. .ces files
+     * carry no per-(canvas,slot) ordering guarantee, so we pick the
+     * entry with the highest block_idx as the chain anchor — that's
+     * the cell the next append must compute its delta against. */
     free(m->tails);
     m->tails = NULL;
     m->tail_count = m->tail_capacity = 0;
@@ -134,10 +141,12 @@ int sss_memory_load(sss_memory *m, const char *path) {
         const CEStorageEntry *e = &m->storage.entries[i];
         sss_tail *t = tail_lookup_or_insert(m, e->canvas_id, e->slot);
         if (!t) continue;
-        if ((uint32_t)e->block_idx + 1u > t->next_block_idx)
-            t->next_block_idx = (uint16_t)(e->block_idx + 1u);
-        t->prev_kf = e->keyframe;
-        t->has_prev = 1;
+        uint32_t entry_idx_p1 = (uint32_t)e->block_idx + 1u;
+        if (!t->has_prev || entry_idx_p1 > t->next_block_idx) {
+            t->next_block_idx = entry_idx_p1;
+            t->prev_kf = e->keyframe;
+            t->has_prev = 1;
+        }
     }
     return 1;
 }
