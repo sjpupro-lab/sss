@@ -46,7 +46,8 @@ CE_CORE_SRCS = $(CE_CORE_DIR)/ce_core.c \
                $(CE_CORE_DIR)/ce_masked_train.c \
                $(CE_CORE_DIR)/ce_residual_codebook.c \
                $(CE_CORE_DIR)/sss_rowvae.c \
-               $(CE_CORE_DIR)/sss_io.c
+               $(CE_CORE_DIR)/sss_io.c \
+               $(CE_CORE_DIR)/sss_pybridge.c
 
 CE_CORE_OBJS = $(patsubst $(CE_CORE_DIR)/%.c,$(BUILD_DIR)/ce_core_%.o,$(CE_CORE_SRCS))
 
@@ -54,7 +55,7 @@ OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS)) $(CE_CORE_OBJS)
 
 TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_recluster test_refine test_image_roundtrip test_image_gen test_tick_math test_material test_gen_routed
 
-.PHONY: all clean test bench_context bench_refine image_tools
+.PHONY: all clean test bench_context bench_refine image_tools pybridge
 
 all: $(BUILD_DIR) $(OBJS)
 	@echo "Build complete."
@@ -307,6 +308,18 @@ bench: $(BUILD_DIR)/bench_stsb $(BUILD_DIR)/bench_perplexity \
 	else \
 		echo "(skip bench_qa: data/qa.tsv not found — run data/make_qa.ps1)"; \
 	fi
+
+# ─── Python ctypes bridge (libsss_pybridge.so) ───────────────────
+# Routes Python's CEMemory.add_cell into ce_storage_add_typed so every
+# add lands in real CEStorage. Used by tools/sss_memory.py.
+PYBRIDGE_LIB = $(BUILD_DIR)/libsss_pybridge.so
+
+$(PYBRIDGE_LIB): $(CE_CORE_SRCS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -fPIC -shared $(CE_CORE_SRCS) -o $@ $(LDFLAGS)
+
+pybridge: $(PYBRIDGE_LIB)
+	@echo "Built $(PYBRIDGE_LIB)."
+	@echo "  python3 -c 'from tools.sss_memory import CEMemory; m=CEMemory(\"/tmp/m\"); print(m)'"
 
 clean:
 	rm -rf $(BUILD_DIR)
