@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SSS Unified</title>
+<style>
+  body { background:#0f1117; color:#e6edf3; font-family:monospace; margin:0; }
+  .wrap { max-width:1100px; margin:0 auto; padding:16px; }
+  h1 { font-size:16px; margin-bottom:12px; }
+  input { width:100%; padding:10px; background:#161b22; border:1px solid #30363d; color:#e6edf3; border-radius:6px; }
+  button { margin-top:10px; padding:10px 14px; background:#238636; border:none; color:#fff; border-radius:6px; cursor:pointer; }
+  .row { display:flex; gap:16px; margin-top:16px; }
+  .col { flex:1; }
+  .panel { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px; }
+  img { width:100%; image-rendering:pixelated; border-radius:6px; }
+  .frames img { width:64px; height:64px; }
+  pre { font-size:11px; overflow:auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>SSS Unified Pipeline</h1>
+  <input id="prompt" value="red character smile petals" />
+  <button onclick="run()">Generate</button>
+
+  <div class="row">
+    <div class="col panel">
+      <div>Image</div>
+      <img id="img" />
+    </div>
+
+    <div class="col panel">
+      <div>Frames</div>
+      <div class="frames" id="frames"></div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="col panel"><div>Scores</div><pre id="scores"></pre></div>
+    <div class="col panel"><div>Memory</div><pre id="memory"></pre></div>
+  </div>
+
+  <div class="panel" style="margin-top:16px">
+    <div>Raw</div>
+    <pre id="raw"></pre>
+  </div>
+</div>
+
+<script>
+async function run() {
+  const prompt = document.getElementById('prompt').value;
+  const res = await fetch('/api/unified', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({prompt})
+  });
+  const data = await res.json();
+
+  document.getElementById('img').src = data.image || '';
+
+  const frames = document.getElementById('frames');
+  frames.innerHTML = '';
+  (data.frames || []).forEach(f => {
+    const im = document.createElement('img');
+    im.src = f;
+    frames.appendChild(im);
+  });
+
+  document.getElementById('scores').textContent = JSON.stringify(data.scores, null, 2);
+  document.getElementById('memory').textContent = JSON.stringify(data.memory, null, 2);
+  document.getElementById('raw').textContent = JSON.stringify(data.raw, null, 2);
+}
+</script>
+</body>
+</html>
