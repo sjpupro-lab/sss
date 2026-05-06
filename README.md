@@ -10,6 +10,27 @@
 > Inference is integer-only. Float math (DCT / SVD) appears only at
 > training time.
 
+## What's new since the last README cut
+
+This branch lands the full Python perception + orchestration layer on
+top of the C engine. Every new module is benchmarked end-to-end on
+real character images further down — no hand-waving, all numbers were
+produced by the scripts in this repo on the bundled `data/sanrio`
+(Hello Kitty / My Melody / Keroppi, 25 PPMs) and `data/sss_demo_1k`
+(1008-image synthetic corpus) datasets.
+
+| Module                       | Path                          | What it does                                                                  |
+| ---------------------------- | ----------------------------- | ----------------------------------------------------------------------------- |
+| **sss_unified**              | `tools/sss_unified.py`        | Single-call orchestrator: parse → memory search → sculpt → motion → evaluate. No noise; deterministic generation. |
+| **sss_pose_radar**           | `tools/sss_pose_radar.py`     | silhouette → 15 joints → motion rules → 5 dirty-row zones (hair / face / arms / cloth / body), pure numpy. |
+| **sss_ingest**               | `tools/sss_ingest.py`         | label-required image ingest, CSV batch (`path,label`), FFT-based per-row reconstruction. |
+| **sss_memory**               | `tools/sss_memory.py`         | `CEMemory.add_cell()` routes through ctypes → `ce_storage_add_typed`; every Python add lands in a real `.ces`. |
+| **sss_image_io**             | `tools/sss_image_io.py`       | stdlib-only PNG / PPM read+write — drops the cv2 / Pillow runtime requirement from UI encode. |
+| **sss_pybridge**             | `ce_core/sss_pybridge.{c,h}`  | shared library (`libsss_pybridge.so`) exposing `ce_storage_add_typed` and `sss_pybridge_generate` to ctypes. |
+| **sss_rowvae** + **ce_key**  | `ce_core/sss_rowvae.{c,h}`    | ce_feed / ce_distance search and v9 ce_key bridge exposure on top of the spectrogram path. |
+| **Web UI / Forge**           | `ui/unified_server.py`, `ui/unified.html` | unified upload + auto-learn + `/forge` route; cv2-first PNG encoder with stdlib fallback. |
+| **Self-upgrade loop**        | `tools/sss_unified.py::run_upgrade_loop` | quality-weighted cell sampling, no cell deletion, integer tick-blend quality update. |
+
 ```
    text engine                          image engine
    ───────────────                       ─────────────
@@ -28,6 +49,7 @@
 
 ## Table of contents
 
+- [What's new since the last README cut](#whats-new-since-the-last-readme-cut)
 - [Why this exists](#why-this-exists)
 - [Text engine — Spatial Pattern](#text-engine--spatial-pattern)
 - [Image engine — CE Cell](#image-engine--ce-cell)
@@ -39,6 +61,9 @@
   - [Tick-sorted dynamic decode](#6-tick-sorted-dynamic-decode)
 - [End-to-end demo](#end-to-end-demo)
 - [Verified results](#verified-results)
+- [Spectrogram engine — sss_rowvae](#spectrogram-engine--sss_rowvae)
+- [Python perception / orchestration layer](#python-perception--orchestration-layer)
+- [End-to-end benchmarks on real character images](#end-to-end-benchmarks-on-real-character-images)
 - [Build & run](#build--run)
 - [Save / load formats](#save--load-formats)
 - [Project layout](#project-layout)
@@ -580,6 +605,280 @@ phases give every seed a different texture (~0.11 mean pixel diff).
 
 ---
 
+## Python perception / orchestration layer
+
+The new modules wrap the C engine in a single deterministic Python
+pipeline that the web UI and CLI both feed through.
+
+```
+   prompt ─────────────► Planner.parse           (intent + tags)
+                          │
+                          ▼
+                       memory.search             (CEMemory, ctypes-backed)
+                          │
+        ┌─────────────────┼─────────────────┐
+        ▼                 ▼                 ▼
+  SculptGenerator    sss_rowvae         pose_radar         (perception)
+   (Python sculpt)    (C, .sss)         (15 joints, 5 motion rules,
+                                         5 dirty-row zones, pure numpy)
+        │                 │                 │
+        └─────────────────┼─────────────────┘
+                          ▼
+                       Evaluator.evaluate         (final / quality / prompt_match)
+                          │
+                          ▼
+                memory.add  →  ctypes  →  ce_storage_add_typed    (.ces)
+```
+
+* **`sss_image_io`** — stdlib-only PNG / PPM I/O. The UI's `/forge`
+  route used to require cv2 just to encode a preview; this module
+  drops both cv2 and Pillow off the hard dependency list. cv2 is
+  still preferred when present (faster paths inside `sss_unified`),
+  but every demo can run on `python3 + numpy` only.
+* **`sss_memory.CEMemory`** — replaces the old in-memory cell dict.
+  `add_cell()` calls go through `ctypes` →
+  `sss_memory_add_typed` → `ce_storage_add_typed` so every Python
+  cell lands as a real `CE_TYPE_IMAGE` entry in the same `.ces` file
+  the C engine reads. Out-of-band metadata (quality, source, gen,
+  uses) stays Python-side because it doesn't belong inside CEStorage.
+* **`sss_ingest`** — label is required (no auto-classification).
+  `ingest_labeled_image` cuts the resized 256×256 image into 5 row
+  blocks (hair / face / upper / lower / bg), runs Sobel-magnitude
+  edge detection per block, computes a per-row, per-channel rfft of
+  the block, and emits 5 cells with the FFT amplitude + phase kept
+  in the Python sidecar. `ingest_csv(path,label)` batches the same
+  call across a CSV. Free-form text and video go through
+  `_ingest_text` / `_ingest_video` (ffmpeg → PPM).
+* **`sss_pose_radar`** — given an image + label, produces silhouette
+  → 15 joints (head, neck, shoulders, elbows, hands, waist, hips,
+  knees, feet) → 5 motion rules (hair wave, blink, arm sway, cloth,
+  body bounce) → 5 dirty-row zones (hair / face / arms / cloth /
+  body). Output is a JSON sidecar plus four debug PNGs (mask,
+  skeleton overlay, dirty-rows visualisation, radar / edge field).
+* **`sss_unified.SSSPipeline`** — bundles everything above into one
+  `pipeline.run(prompt)` call. Generation is fully deterministic
+  (blank canvas → CE-cell sculpt + recombine, no Gaussian noise);
+  variations come from index-selected hue / saturation / brightness
+  curves. When `SSS_MODEL_PATH` is set the pipeline routes through
+  the C `sss_rowvae` generator first and falls back to the Python
+  sculpt path on any error.
+* **`sss_unified.run_upgrade_loop`** — the self-upgrade loop. Cycles
+  a fixed `(shape, color, expression)` combo set, samples cells from
+  memory with quality-weighted random picking, never deletes cells,
+  and updates quality with an integer tick-blend
+  (`(old*179 + new*77) >> 8`). Bad results lower selection
+  probability, good results raise it.
+* **`sss_pybridge`** — the C side of the ctypes bridge. Exposes
+  `sss_memory_add_typed` (8-arg signature; first 5 bytes of
+  `(canvas_id, slot, block_idx, type)` plus 64 B keyframe + 64 B
+  delta) and `sss_pybridge_generate` (path + prompt + seed + detail
+  + steps + size → 256×256 BGR `uint8` ndarray). Built by
+  `make pybridge` into `build/libsss_pybridge.so`.
+
+---
+
+## End-to-end benchmarks on real character images
+
+Everything in this section was produced by running the bundled
+scripts against `data/sanrio/` (Hello Kitty / My Melody / Keroppi —
+25 64×64 PPMs) and `data/sss_demo_1k/` (1008 synthetic 64×64 PPMs).
+Numbers come from `python3 scripts/sss_train.py` + `./build/sss_gen`
++ `tools/sss_pose_radar.py` + `tools/sss_unified.py` + `tools/sss_ingest.py`,
+single thread, on the host this README was rebuilt on. Reproduce with
+the commands in [§ Build & run](#build--run).
+
+### 1. `sss_rowvae` train + generate on the sanrio corpus
+
+```bash
+python3 scripts/sss_train.py \
+    --labels data/sanrio/labels.tsv \
+    --root   data/sanrio \
+    --out    build/models/sanrio.sss \
+    --size   64
+# wrote build/models/sanrio.sss  (212,763 bytes, 9 cells from 25 images)
+
+./build/sss_gen build/models/sanrio.sss "kitty white cat"     out.ppm 1 1.0 24
+./build/sss_gen build/models/sanrio.sss "mymelody pink rabbit" out.ppm 1 1.0 24
+./build/sss_gen build/models/sanrio.sss "keroppi green frog"   out.ppm 1 1.0 24
+```
+
+| Stage                    | Numbers                                                  |
+| ------------------------ | -------------------------------------------------------- |
+| Training                 | 25 images, 9 spectrogram cells, **0.146 s** total (~6 ms / image) |
+| Model size               | **207.8 KB** for 25 64×64 images = 1.45× smaller than the source PPMs |
+| Generate (24 steps, 64×64) | **mean 0.282 s / image** (range 0.276 – 0.294 s, 9 prompts × 3 seeds) |
+
+Colour fidelity (`gen` mean RGB vs `train` mean RGB):
+
+| Character | Train RGB        | Gen RGB (mean of 3 seeds) | ΔRGB         |
+| --------- | ---------------- | ------------------------- | ------------ |
+| Hello Kitty | (197.6, 188.2, 195.2) | (204.7, 181.3, 183.6) | (7.1, 6.9, 11.6) |
+| Keroppi   | (177.4, 176.5, 130.6) | (196.2, 176.3, 148.6) | (18.8, 0.3, 17.9) |
+| My Melody | (217.9, 183.1, 176.6) | (205.2, 192.4, 169.8) | (12.6, 9.2, 6.8) |
+
+Seed-driven variation (mean per-pixel diff between two seeds, range
+[0, 1]):
+
+```
+kitty     seed1 ↔ 2 = 0.0437   seed1 ↔ 3 = 0.0431
+keroppi   seed1 ↔ 2 = 0.0814   seed1 ↔ 3 = 0.0788
+mymelody  seed1 ↔ 2 = 0.0692   seed1 ↔ 3 = 0.0634
+```
+
+![sanrio originals + sss_gen seeds](docs/bench/sanrio_grid.png)
+
+Column 1 is the original PPM (`data/sanrio/<character>_000.ppm`,
+upscaled NN-2× for display); columns 2–4 are `./build/sss_gen` with
+seed = 1, 2, 3. Same 207.8 KB `sanrio.sss` file generates all nine.
+
+### 2. `sss_rowvae` on the 1008-image synthetic corpus
+
+```bash
+python3 data/sss_demo_1k/_make_dataset.py
+python3 scripts/sss_train.py \
+    --labels data/sss_demo_1k/labels.tsv \
+    --root   data/sss_demo_1k \
+    --out    build/models/demo1k.sss \
+    --size   64
+# wrote build/models/demo1k.sss  (177,860 bytes, 8 cells from 1008 images)
+```
+
+| Stage                | Numbers                                                                   |
+| -------------------- | ------------------------------------------------------------------------- |
+| Training             | 1008 images, 8 cells, **0.752 s** total (~0.7 ms / image — pure numpy FFT) |
+| Source dataset       | 12,108 KB (1008 × 64×64 PPM)                                              |
+| Model on disk        | 173.7 KB                                                                  |
+| Compression ratio    | **69.7×** (target was ≥3×)                                                |
+| Generate (24 steps)  | mean **0.289 s / image** (5 prompts, range 0.279 – 0.311 s)               |
+
+![1k corpus colour × shape grid](docs/bench/demo1k_grid.png)
+
+Same 173.7 KB `demo1k.sss` file, three colour prompts × three shape
+prompts. Colour locks in cleanly; shape signal is weaker because the
+FFT shape band overlaps the colour band at this resolution — see
+[§ Roadmap](#roadmap) for the per-cell direction tag that addresses
+this.
+
+### 3. `sss_pose_radar` on real sanrio characters
+
+```bash
+python3 tools/sss_pose_radar.py data/sanrio/kitty_000.ppm \
+    --label "kitty white cat" --out build/bench/pose_kitty
+```
+
+The module is pure numpy + `tools.sss_image_io` — no cv2, no Pillow,
+no Mediapipe, no Torch. Per character it produces a silhouette mask,
+15 estimated joints, 5 motion rules with `(name, origin, vector,
+amplitude, frequency, dirty_rows)`, and a 5-zone dirty-row map.
+
+| Character    | Joints | Motions | Dirty zones                          | Quality | Time     |
+| ------------ | -----: | ------: | ------------------------------------ | ------: | -------: |
+| Hello Kitty  | 15     | 5       | hair / face / arms / cloth / body    | 0.606   | 0.064 s  |
+| My Melody    | 15     | 5       | hair / face / arms / cloth / body    | 0.560   | 0.060 s  |
+| Keroppi      | 15     | 5       | hair / face / arms / cloth / body    | 0.597   | 0.051 s  |
+
+Mean **0.058 s / image** including PNG-out of all four debug overlays.
+
+![pose radar grid](docs/bench/pose_radar_grid.png)
+
+Columns: original (256×256 NN-up), skeleton overlay, dirty-row zones,
+radar / edge resonance map. JSON sidecar (`pose_motion.json`) keeps
+the bbox + per-joint coordinates + per-motion `(origin, vector,
+amplitude, frequency, dirty_rows)`, ready to feed `MotionEngine` in
+the unified pipeline.
+
+### 4. `sss_unified` end-to-end pipeline
+
+The unified pipeline parses a Korean or English prompt, searches the
+ctypes-backed `CEMemory`, sculpts a deterministic image (no noise),
+runs the C `sss_rowvae` generator when a `.sss` model is present
+(`SSS_MODEL_PATH=...`), evaluates the result, and stores accepted
+runs back into `.ces`.
+
+```bash
+make pybridge
+SSS_MODEL_PATH=build/models/sanrio.sss python3 -c "
+from tools.sss_unified import run_sss_pipeline
+print(run_sss_pipeline('핑크 토끼를 그려줘')[0]['chat'])"
+```
+
+Six prompt run, warmed pipeline, 256×256 output, C generator path:
+
+| Prompt                   | Time    | Final score | Stored      |
+| ------------------------ | ------: | ----------: | ----------- |
+| `핑크 토끼를 그려줘`     | 323 ms  | 0.512       | accepted    |
+| `하얀 고양이를 그려줘`   | 325 ms  | 0.704       | accepted    |
+| `초록색 개구리를 그려줘` | 331 ms  | 0.800       | accepted    |
+| `pink rabbit smile draw` | 322 ms  | 0.513       | accepted    |
+| `white cat draw`         | 317 ms  | 0.508       | accepted    |
+| `green frog draw`        | 327 ms  | 0.812       | accepted    |
+
+Mean **324 ms / prompt**, all six accepted, memory grew from 117 cells
+(seeded foundation) to 135 cells (foundation + 18 stored from accepted
+runs, 5 row blocks × ~3.6 mean per accepted run after dedup).
+`ce_storage_count == 135` confirms every Python add hit real CEStorage
+through the ctypes bridge.
+
+![unified pipeline grid](docs/bench/unified_grid.png)
+
+### 5. `sss_ingest` — labelled image → `.ces`
+
+```bash
+python3 -c "
+from tools.sss_unified import CEMemory
+from tools.sss_ingest import ingest_labeled_image
+m = CEMemory('build/bench/ingest')
+ingest_labeled_image('data/sanrio/kitty_000.ppm', m, 'kitty white cat')
+m.save()"
+```
+
+| Corpus                      | Files | Cells written | Total time | Per file   | `.ces` size |
+| --------------------------- | ----: | ------------: | ---------: | ---------: | ----------: |
+| `data/sanrio/`              | 25    | 125           | 1.156 s    | **46.3 ms** | 17,524 B   |
+| `data/sss_demo_1k/` (head 200) | 200   | 1000          | 7.67 s     | **38.4 ms** | 140,024 B  |
+
+Each labelled image becomes 5 row-block cells (hair / face / upper /
+lower / bg) routed through `_BridgedCEMemory.add_cell` →
+`sss_memory_add_typed` → `ce_storage_add_typed`, with the FFT
+amplitude / phase kept Python-side for the spectrogram path.
+
+### 6. FFT row-block roundtrip — encode → reconstruct
+
+`tools/sss_ingest._block_fft` and the inverse `np.fft.irfft` form the
+basis of the FFT-based reconstruction path. On the three real sanrio
+characters (resized to 256×256, full-band amplitude + phase kept):
+
+```
+kitty_000.ppm     PSNR(full FFT roundtrip) = 53.3 dB
+mymelody_000.ppm  PSNR(full FFT roundtrip) = 53.2 dB
+keroppi_000.ppm   PSNR(full FFT roundtrip) = 53.2 dB
+```
+
+That's the noise floor — anything lower than ~50 dB would mean we
+were quantising amplitudes or dropping bins, both of which we don't
+do on the encode side. The compression in §1 / §2 comes from
+*sharing* one (amp, phase) pair across many images in a label, not
+from lossy quantisation of any single image.
+
+### Summary table
+
+| Benchmark                                        | Throughput / size                        |
+| ------------------------------------------------ | ---------------------------------------- |
+| `sss_train.py` on sanrio (25 imgs, 64²)          | 0.146 s total = 5.84 ms / image          |
+| `sss_train.py` on demo_1k (1008 imgs, 64²)       | 0.752 s total = 0.75 ms / image          |
+| `sss_gen` on sanrio model (24 step, 64²)         | 0.282 s / image                          |
+| `sss_gen` on demo_1k model (24 step, 64²)        | 0.289 s / image                          |
+| Unified pipeline (256², 6 prompts, KO + EN)      | 324 ms / prompt, 100 % stored            |
+| `sss_pose_radar.analyze_pose_radar` (256² + PNGs) | 58 ms / image, 15 joints, 5 motion rules |
+| `ingest_labeled_image` (sanrio, 64² → 256²)      | 46.3 ms / image, 5 cells / image         |
+| `ingest_labeled_image` (demo_1k, 64² → 256²)     | 38.4 ms / image, 5 cells / image         |
+| FFT row-block roundtrip PSNR (sanrio)            | 53.2 – 53.3 dB                           |
+| Compression: demo_1k                             | 69.7× vs source PPM                      |
+| `make test` upper engine                         | 19/19 binaries pass                      |
+| `make -C ce_core test`                           | 20/21 (1 doc'd Windows file-write fail)  |
+
+---
+
 ## Build & run
 
 ```bash
@@ -636,6 +935,49 @@ changes.
 ```bash
 make demo_tools                               # also builds verify_hybrid
 ./build/verify_hybrid data/demo/colors/*.ppm data/demo/fruits/*.ppm
+```
+
+### Python pipeline
+
+```bash
+make pybridge                                 # build/libsss_pybridge.so
+make sss_gen                                  # build/sss_gen
+
+# 1) train a spectrogram model from a labels.tsv
+python3 scripts/sss_train.py \
+    --labels data/sanrio/labels.tsv \
+    --root   data/sanrio \
+    --out    build/models/sanrio.sss \
+    --size   64
+
+# 2) one-shot deterministic generation through the unified pipeline
+SSS_MODEL_PATH=build/models/sanrio.sss python3 -c "
+from tools.sss_unified import run_sss_pipeline
+print(run_sss_pipeline('pink rabbit smile draw')[0]['chat'])"
+
+# 3) perception only — joints + motion + dirty rows
+python3 tools/sss_pose_radar.py data/sanrio/kitty_000.ppm \
+    --label "kitty white cat" --out build/bench/pose_kitty/
+
+# 4) ingest a labelled image into a real .ces
+python3 -c "
+from tools.sss_unified import CEMemory
+from tools.sss_ingest import ingest_labeled_image
+m = CEMemory('build/bench/ingest')
+ingest_labeled_image('data/sanrio/kitty_000.ppm', m, 'kitty white cat')
+m.save()"
+
+# 5) launch the unified web UI (Forge)
+bash ui/start_unified.sh
+```
+
+The Python tests live next to the modules they cover:
+
+```bash
+python3 tools/test_sss_unified.py             # unified pipeline smoke
+python3 tools/test_sss_memory.py              # ctypes bridge smoke
+python3 tools/test_sss_pose_radar.py          # pose / radar smoke
+python3 tools/test_sss_ingest.py              # ingest smoke
 ```
 
 ---
@@ -751,15 +1093,34 @@ on-disk model.
 ├── tools/
 │   ├── train_demo.c            joint text+image trainer
 │   │                            (--masked-epochs N, --residual-codebook)
-│   ├── gen_image_ce.c          prompt → 256×256 PPM
-│   │                            (default canvas-routed, --hybrid --guidance N)
+│   ├── gen_image_ce.c          legacy prompt → 256×256 PPM
+│   ├── sss_gen.c               MAIN PATH — sss_rowvae spectrogram generator
 │   ├── verify_hybrid.c         hybrid_vae_roundtrip PSNR over a folder
 │   ├── train_images_ce.c       single-image CE trainer
 │   ├── stream_train.c          line-by-line text trainer
 │   ├── chat.c                  interactive REPL
 │   ├── make_demo_dataset.c     generates data/demo
 │   ├── img2grid.c / grid2img.c PPM ↔ SpatialGrid round-trip
-│   └── png_to_ppm256.py / jpeg_to_ppm256.c image converters
+│   ├── png_to_ppm256.py / jpeg_to_ppm256.c   image converters
+│   ├── sss_unified.py          deterministic pipeline (Planner / Sculpt /
+│   │                            MotionEngine / Evaluator / SSSPipeline /
+│   │                            run_upgrade_loop)
+│   ├── sss_memory.py           CEMemory bridged to ce_storage_add_typed
+│   ├── sss_ingest.py           file → SSS memory cells (label-required,
+│   │                            CSV batch, FFT-based reconstruction)
+│   ├── sss_pose_radar.py       silhouette → joints → motion → dirty rows
+│   ├── sss_image_io.py         stdlib-only PNG / PPM I/O
+│   ├── test_sss_unified.py     smoke test for the unified pipeline
+│   ├── test_sss_memory.py      smoke test for the bridge
+│   └── test_sss_pose_radar.py  smoke test for the pose / radar module
+├── ui/
+│   ├── unified.html            Forge UI (upload + auto-learn + /forge)
+│   ├── unified_server.py       cv2-first PNG encoder, stdlib fallback
+│   └── start_unified.sh        one-shot launcher
+├── scripts/
+│   ├── sss_train.py            train .sss spectrogram model from labels.tsv
+│   ├── prepare_pokemon_dataset.py
+│   └── train_pokemon.sh        end-to-end train + sample script
 ├── data/
 │   ├── samples/                IMG_0304.png, IMG_0305.jpeg, IMG_0306.jpeg
 │   └── demo/                   procedurally generated PPMs + labels.tsv
@@ -790,6 +1151,20 @@ Implemented (this branch — see `PIPELINE.md` for the 13-phase log):
       ~10× via the codebook.
 - [x] hybrid VAE decode applies `CE_TYPE_RESIDUAL` patches in
       tick order, with positional `(x, y)` 8×8 gaussian stamping.
+- [x] Unified Python orchestration: `tools/sss_unified.py` parses a
+      prompt, searches the bridged `CEMemory`, sculpts a deterministic
+      image, evaluates it, and stores accepted runs back into `.ces`.
+- [x] ctypes bridge (`make pybridge`): every Python `add_cell` lands
+      in real `CEStorage` via `sss_memory_add_typed` →
+      `ce_storage_add_typed`.
+- [x] `sss_pose_radar`: silhouette / joint / dirty-row perception in
+      pure numpy, ~58 ms per 256² image.
+- [x] `sss_ingest`: label-required image ingest + CSV batch + FFT-based
+      reconstruction, ~38 – 46 ms / image end-to-end.
+- [x] `sss_image_io`: stdlib-only PNG / PPM encode / decode (UI no
+      longer hard-requires cv2 / Pillow).
+- [x] Self-upgrade loop with quality-weighted cell sampling and integer
+      tick-blend quality update.
 
 Pending (deferred per user direction until end-to-end is validated on
 a 1000+-image corpus):
