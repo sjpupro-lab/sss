@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import http.server
+import io
 import json
 import os
 import sys
@@ -18,6 +19,11 @@ import threading
 import traceback
 from pathlib import Path
 from urllib.parse import urlparse
+
+try:
+    from PIL import Image as PILImage
+except ImportError:
+    PILImage = None
 
 ROOT = Path(__file__).resolve().parent.parent
 UI_DIR = ROOT / "ui"
@@ -54,12 +60,17 @@ def _read_json(handler):
 
 
 def _png_data_uri(img):
-    """Accept numpy BGR/RGB image or path and return data:image/png URI."""
+    """Accept numpy BGR image or path and return data:image/png URI.
+
+    Encodes via cv2 if available, otherwise via Pillow. Returns an
+    error-message string if neither is installed."""
     try:
         import cv2
-        import numpy as np
     except Exception:
         cv2 = None
+    try:
+        import numpy as np
+    except Exception:
         np = None
 
     if img is None:
@@ -77,18 +88,28 @@ def _png_data_uri(img):
         else:
             return None
         return f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
-    if cv2 is None or np is None:
+
+    if np is None or not hasattr(img, "shape"):
         return None
-    arr = img
-    if not hasattr(arr, "shape"):
-        return None
-    arr = arr.copy()
+    arr = img.copy()
     if arr.dtype != np.uint8:
         arr = np.clip(arr, 0, 255).astype(np.uint8)
-    ok, buf = cv2.imencode(".png", arr)
-    if not ok:
-        return None
-    return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
+
+    if cv2 is not None:
+        ok, buf = cv2.imencode(".png", arr)
+        if not ok:
+            return None
+        return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
+
+    if PILImage is not None:
+        # cv2 arrays are BGR; PIL expects RGB. Mono images pass through.
+        rgb = arr[..., ::-1] if (arr.ndim == 3 and arr.shape[2] >= 3) else arr
+        bio = io.BytesIO()
+        PILImage.fromarray(rgb).save(bio, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(bio.getvalue()).decode("ascii")
+
+    return ("ERROR: PNG encoding requires cv2 or Pillow. "
+            "Install with: pip install Pillow")
 
 
 def _as_plain(x, depth=0):
