@@ -32,7 +32,19 @@ sys.path.insert(0, str(ROOT))
 # numpy is a hard requirement (tools.sss_unified and tools.sss_image_io
 # both import it unconditionally), so don't pretend otherwise here.
 import numpy as np  # noqa: E402
-from tools.sss_image_io import numpy_to_png_data_uri  # noqa: E402
+
+# cv2 is optional. When present we use it for PNG encoding (it's a few
+# times faster than the pure-Python encoder); when missing we fall back
+# to sss_image_io. Both produce identical PNG bytes from the same input.
+try:
+    import cv2  # type: ignore
+except ImportError:
+    cv2 = None
+
+try:
+    from tools.sss_image_io import numpy_to_png_data_uri as _sss_png_uri
+except ImportError:
+    _sss_png_uri = None
 
 PIPELINE = None
 
@@ -63,14 +75,12 @@ def _read_json(handler):
 def _png_data_uri(img):
     """Return a data: URI for a numpy image or a file path.
 
-    - numpy ndarray → encoded as PNG (`data:image/png;base64,...`).
+    - numpy ndarray → encoded as PNG (`data:image/png;base64,...`),
+      via cv2 when available else tools/sss_image_io.
     - existing .png path → passed through as `data:image/png;base64,...`.
     - existing .jpg/.jpeg path → passed through as `data:image/jpeg;base64,...`.
     Anything else (None, missing path, unsupported extension, non-image
-    object) returns None.
-
-    PNG encoding is handled by tools/sss_image_io and uses only stdlib
-    + numpy — no cv2, no Pillow."""
+    object) returns None."""
     if img is None:
         return None
 
@@ -94,7 +104,22 @@ def _png_data_uri(img):
     arr = np.asarray(img)
     if arr.ndim < 2:
         return None
-    return numpy_to_png_data_uri(arr)
+    # Coerce to uint8 — cv2.imencode and sss_image_io both want uint8.
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+    # Prefer cv2 when present (faster encoder).
+    if cv2 is not None:
+        ok, buf = cv2.imencode(".png", arr)
+        if ok:
+            return ("data:image/png;base64,"
+                    + base64.b64encode(buf.tobytes()).decode("ascii"))
+
+    # Fall back to the stdlib + numpy encoder.
+    if _sss_png_uri is not None:
+        return _sss_png_uri(arr)
+
+    return None
 
 
 def _as_plain(x, depth=0):
@@ -306,6 +331,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        # Serve the legacy SSS Forge UI on /forge for users who still
+        # want it. Returns 404 if ui/index.html isn't shipped (it's
+        # part of the older binary-driven flow and may be removed).
+        if path == "/forge":
+            p = UI_DIR / "index.html"
+            if not p.exists():
+                _json(self, {"error": "ui/index.html not found"}, 404)
+                return
+            data = p.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if path in ("/", "/unified.html"):
             p = UI_DIR / "unified.html"
             data = p.read_bytes()
