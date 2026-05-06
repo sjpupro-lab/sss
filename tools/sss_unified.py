@@ -27,11 +27,409 @@ import subprocess
 from collections import defaultdict
 from typing import Optional
 
-import cv2
 import numpy as np
+
+try:
+    import cv2  # native OpenCV
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+    cv2 = None  # populated below by the fallback shim
 
 # Bridge-backed CEMemory (ce_storage_add_typed under the hood).
 from tools.sss_memory import CEMemory as _BridgedCEMemory
+
+
+# ────────────────────────────────────────────────────────────
+# 0a. cv2 fallback — numpy-only implementations of the OpenCV
+#     surface this module uses. Activated only if `import cv2`
+#     fails. Intentionally minimal: not a complete cv2 stand-in,
+#     just enough for sss_unified's deterministic generate / eval
+#     path (cvtColor, Canny, resize, filter2D, simple drawing
+#     primitives, addWeighted, inRange, imwrite-as-PPM).
+# ────────────────────────────────────────────────────────────
+if not HAS_CV2:
+    class _CV2Fallback:
+        # Codes used by this module. Values are arbitrary — only
+        # equality with the constants below matters.
+        COLOR_BGR2RGB  = 4
+        COLOR_BGR2GRAY = 6
+        COLOR_GRAY2BGR = 8
+        COLOR_BGR2HSV  = 40
+        COLOR_HSV2BGR  = 54
+
+        # ---- color conversions --------------------------------
+        @staticmethod
+        def cvtColor(img, code):
+            arr = np.asarray(img)
+            if code == _CV2Fallback.COLOR_BGR2RGB:
+                return arr[..., ::-1].copy()
+            if code == _CV2Fallback.COLOR_BGR2GRAY:
+                # B=29/256, G=150/256, R=77/256  ≈ 0.114/0.587/0.299
+                a = arr.astype(np.uint16)
+                gray = (a[..., 0] * 29 + a[..., 1] * 150
+                        + a[..., 2] * 77) >> 8
+                return gray.astype(np.uint8)
+            if code == _CV2Fallback.COLOR_GRAY2BGR:
+                if arr.ndim == 2:
+                    return np.stack([arr, arr, arr], axis=-1)
+                return arr
+            if code == _CV2Fallback.COLOR_BGR2HSV:
+                return _bgr2hsv(arr)
+            if code == _CV2Fallback.COLOR_HSV2BGR:
+                return _hsv2bgr(arr)
+            raise ValueError(f"cvtColor: unsupported code {code}")
+
+        # ---- gradient / blur ----------------------------------
+        @staticmethod
+        def Canny(gray, t1, t2):
+            # Sobel magnitude + threshold. Not Canny in the strict
+            # sense (no NMS / hysteresis) but produces a binary edge
+            # map that Evaluator and the cell-canny stash can use.
+            g = gray.astype(np.int32)
+            gx = np.zeros_like(g); gy = np.zeros_like(g)
+            gx[:, 1:-1] = (g[:, 2:] - g[:, :-2])
+            gy[1:-1, :] = (g[2:, :] - g[:-2, :])
+            mag = np.abs(gx) + np.abs(gy)
+            return ((mag >= int(t2)).astype(np.uint8)) * 255
+
+        @staticmethod
+        def resize(img, dsize, interpolation=None):
+            # Nearest neighbour. dsize is (W, H) per cv2 convention.
+            nw, nh = int(dsize[0]), int(dsize[1])
+            h, w = img.shape[:2]
+            yi = (np.arange(nh) * h // max(1, nh)).astype(np.int64)
+            xi = (np.arange(nw) * w // max(1, nw)).astype(np.int64)
+            yi = np.clip(yi, 0, h - 1)
+            xi = np.clip(xi, 0, w - 1)
+            if img.ndim == 2:
+                return img[yi[:, None], xi[None, :]]
+            return img[yi[:, None], xi[None, :], :]
+
+        @staticmethod
+        def GaussianBlur(img, ksize, sigmaX, sigmaY=0):
+            # Simple separable box blur of width ksize[0] — close
+            # enough for the deterministic-blur use case here.
+            kw = max(1, int(ksize[0]) | 1)
+            pad = kw // 2
+            kernel = np.ones(kw, np.float32) / kw
+            f = img.astype(np.float32)
+            if f.ndim == 2:
+                f = np.pad(f, ((pad, pad), (pad, pad)), mode="edge")
+                tmp = np.zeros_like(f)
+                for i in range(kw):
+                    tmp += np.roll(f, i - pad, axis=0) * kernel[i]
+                tmp2 = np.zeros_like(tmp)
+                for i in range(kw):
+                    tmp2 += np.roll(tmp, i - pad, axis=1) * kernel[i]
+                return np.clip(
+                    tmp2[pad:-pad, pad:-pad], 0, 255).astype(np.uint8)
+            f = np.pad(f, ((pad, pad), (pad, pad), (0, 0)), mode="edge")
+            tmp = np.zeros_like(f)
+            for i in range(kw):
+                tmp += np.roll(f, i - pad, axis=0) * kernel[i]
+            tmp2 = np.zeros_like(tmp)
+            for i in range(kw):
+                tmp2 += np.roll(tmp, i - pad, axis=1) * kernel[i]
+            return np.clip(
+                tmp2[pad:-pad, pad:-pad, :], 0, 255).astype(np.uint8)
+
+        @staticmethod
+        def filter2D(img, ddepth, kernel):
+            kh, kw = kernel.shape
+            ph, pw = kh // 2, kw // 2
+            f = img.astype(np.float32)
+            if f.ndim == 2:
+                padded = np.pad(f, ((ph, ph), (pw, pw)), mode="edge")
+                out = np.zeros_like(f)
+                for y in range(kh):
+                    for x in range(kw):
+                        out += (padded[y:y + f.shape[0],
+                                       x:x + f.shape[1]]
+                                * float(kernel[y, x]))
+            else:
+                padded = np.pad(f, ((ph, ph), (pw, pw), (0, 0)),
+                                mode="edge")
+                out = np.zeros_like(f)
+                for y in range(kh):
+                    for x in range(kw):
+                        out += (padded[y:y + f.shape[0],
+                                       x:x + f.shape[1], :]
+                                * float(kernel[y, x]))
+            return np.clip(out, 0, 255).astype(img.dtype if img.dtype
+                                               != np.bool_ else np.uint8)
+
+        # ---- pixel arithmetic ---------------------------------
+        @staticmethod
+        def addWeighted(a, wa, b, wb, gamma, dst=None):
+            out = np.clip(
+                a.astype(np.float32) * float(wa)
+                + b.astype(np.float32) * float(wb)
+                + float(gamma), 0, 255).astype(np.uint8)
+            if dst is not None:
+                dst[...] = out
+            return out
+
+        @staticmethod
+        def inRange(img, lo, hi):
+            lo = np.asarray(lo); hi = np.asarray(hi)
+            mask = np.all((img >= lo) & (img <= hi), axis=-1)
+            return mask.astype(np.uint8) * 255
+
+        # ---- drawing primitives -------------------------------
+        @staticmethod
+        def circle(img, center, r, color, thickness=1):
+            _draw_circle(img, center, int(r), color, int(thickness))
+
+        @staticmethod
+        def rectangle(img, p1, p2, color, thickness=1):
+            _draw_rect(img, p1, p2, color, int(thickness))
+
+        @staticmethod
+        def line(img, p1, p2, color, thickness=1):
+            _draw_line(img, p1, p2, color, int(thickness))
+
+        @staticmethod
+        def ellipse(img, center, axes, angle, start, end,
+                    color, thickness=1):
+            _draw_ellipse(img, center, axes, float(angle),
+                          float(start), float(end), color,
+                          int(thickness))
+
+        @staticmethod
+        def fillPoly(img, pts_list, color):
+            for pts in pts_list:
+                _fill_poly(img, np.asarray(pts).reshape(-1, 2), color)
+
+        # ---- IO ----------------------------------------------
+        @staticmethod
+        def imwrite(path, img):
+            # Write a PPM next to whatever path was requested. We do
+            # not try to encode PNG/JPEG by hand. The demo's ffmpeg
+            # step won't work without cv2 either; that's expected.
+            base, _ext = os.path.splitext(path)
+            rgb = np.ascontiguousarray(img[..., ::-1].astype(np.uint8))
+            h, w = rgb.shape[:2]
+            with open(base + ".ppm", "wb") as f:
+                f.write(f"P6\n{w} {h}\n255\n".encode())
+                f.write(rgb.tobytes())
+            return True
+
+    # ---- numpy helpers used by the shim above -----------------
+    def _bgr2hsv(arr):
+        a = arr.astype(np.float32)
+        b, g, r = a[..., 0], a[..., 1], a[..., 2]
+        cmax = np.maximum(np.maximum(b, g), r)
+        cmin = np.minimum(np.minimum(b, g), r)
+        delta = cmax - cmin
+        safe = np.where(delta == 0, 1.0, delta)
+        h = np.zeros_like(cmax)
+        rmax = (cmax == r) & (delta > 0)
+        gmax = (cmax == g) & (delta > 0) & ~rmax
+        bmax = (cmax == b) & (delta > 0) & ~rmax & ~gmax
+        # OpenCV scales H to [0, 180); each 60° segment becomes 30 units.
+        h = np.where(rmax, ((g - b) / safe) * 30.0, h)
+        h = np.where(gmax, ((b - r) / safe) * 30.0 + 60.0, h)
+        h = np.where(bmax, ((r - g) / safe) * 30.0 + 120.0, h)
+        h = np.mod(h, 180.0)
+        s = np.where(cmax > 0, (delta / np.where(cmax == 0, 1.0, cmax))
+                     * 255.0, 0.0)
+        v = cmax
+        return np.stack([h, s, v], axis=-1).clip(0, 255).astype(np.uint8)
+
+    def _hsv2bgr(arr):
+        a = arr.astype(np.float32)
+        h = a[..., 0] * 2.0   # → 0..360
+        s = a[..., 1] / 255.0
+        v = a[..., 2]
+        c = v * s
+        h60 = h / 60.0
+        x = c * (1.0 - np.abs(np.mod(h60, 2.0) - 1.0))
+        m = v - c
+        seg = np.mod(h60.astype(np.int32), 6)
+        zero = np.zeros_like(v)
+        r = np.select(
+            [seg == 0, seg == 1, seg == 2, seg == 3, seg == 4, seg == 5],
+            [c, x, zero, zero, x, c], default=zero)
+        g = np.select(
+            [seg == 0, seg == 1, seg == 2, seg == 3, seg == 4, seg == 5],
+            [x, c, c, x, zero, zero], default=zero)
+        b = np.select(
+            [seg == 0, seg == 1, seg == 2, seg == 3, seg == 4, seg == 5],
+            [zero, zero, x, c, c, x], default=zero)
+        out = np.stack([b + m, g + m, r + m], axis=-1)
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    def _coerce_color(img, color):
+        n = img.shape[-1] if img.ndim == 3 else 1
+        if np.isscalar(color):
+            return np.full(n, int(color), dtype=img.dtype)
+        c = np.asarray(color).flatten()
+        if c.size < n:
+            c = np.concatenate([c, np.zeros(n - c.size)])
+        return c[:n].astype(img.dtype)
+
+    def _draw_circle(img, center, r, color, thickness):
+        cx, cy = int(center[0]), int(center[1])
+        h, w = img.shape[:2]
+        yy, xx = np.ogrid[:h, :w]
+        d2 = (xx - cx) ** 2 + (yy - cy) ** 2
+        col = _coerce_color(img, color)
+        if thickness < 0:
+            mask = d2 <= r * r
+        else:
+            outer = (r + max(thickness, 1) / 2.0) ** 2
+            inner = max(0.0, r - max(thickness, 1) / 2.0) ** 2
+            mask = (d2 <= outer) & (d2 >= inner)
+        if img.ndim == 2:
+            img[mask] = col
+        else:
+            img[mask] = col
+
+    def _draw_rect(img, p1, p2, color, thickness):
+        x0, y0 = int(p1[0]), int(p1[1])
+        x1, y1 = int(p2[0]), int(p2[1])
+        if x0 > x1: x0, x1 = x1, x0
+        if y0 > y1: y0, y1 = y1, y0
+        h, w = img.shape[:2]
+        x0 = max(0, x0); y0 = max(0, y0)
+        x1 = min(w - 1, x1); y1 = min(h - 1, y1)
+        col = _coerce_color(img, color)
+        if thickness < 0:
+            img[y0:y1 + 1, x0:x1 + 1] = col
+            return
+        t = max(1, thickness)
+        img[y0:min(y0 + t, h), x0:x1 + 1] = col
+        img[max(0, y1 - t + 1):y1 + 1, x0:x1 + 1] = col
+        img[y0:y1 + 1, x0:min(x0 + t, w)] = col
+        img[y0:y1 + 1, max(0, x1 - t + 1):x1 + 1] = col
+
+    def _draw_line(img, p1, p2, color, thickness):
+        x0, y0 = int(p1[0]), int(p1[1])
+        x1, y1 = int(p2[0]), int(p2[1])
+        n = max(abs(x1 - x0), abs(y1 - y0)) + 1
+        xs = np.linspace(x0, x1, n).round().astype(np.int64)
+        ys = np.linspace(y0, y1, n).round().astype(np.int64)
+        h, w = img.shape[:2]
+        col = _coerce_color(img, color)
+        t = max(1, thickness)
+        for dy in range(-(t // 2), (t // 2) + 1):
+            for dx in range(-(t // 2), (t // 2) + 1):
+                yy = np.clip(ys + dy, 0, h - 1)
+                xx = np.clip(xs + dx, 0, w - 1)
+                img[yy, xx] = col
+
+    def _draw_ellipse(img, center, axes, angle, start, end,
+                      color, thickness):
+        cx, cy = int(center[0]), int(center[1])
+        a, b = max(1, int(axes[0])), max(1, int(axes[1]))
+        h, w = img.shape[:2]
+        yy, xx = np.ogrid[:h, :w]
+        rad = np.deg2rad(angle)
+        ca, sa = np.cos(rad), np.sin(rad)
+        dx = xx - cx; dy = yy - cy
+        rx = dx * ca + dy * sa
+        ry = -dx * sa + dy * ca
+        norm = (rx * rx) / (a * a) + (ry * ry) / (b * b)
+        if thickness < 0:
+            shape = norm <= 1.0
+        else:
+            band = max(thickness, 1) / float(max(a, b))
+            outer = (1.0 + band) ** 2
+            inner = max(0.0, 1.0 - band) ** 2
+            shape = (norm <= outer) & (norm >= inner)
+        # Sweep gate. atan2(ry, rx) in degrees, normalised to 0..360.
+        sweep = (end - start) % 360
+        if sweep == 0 and start != end:
+            arc = np.ones_like(shape)
+        else:
+            theta = np.mod(np.degrees(np.arctan2(ry, rx)) - start, 360.0)
+            arc = theta <= max(sweep, 1.0)
+        col = _coerce_color(img, color)
+        img[shape & arc] = col
+
+    def _fill_poly(img, pts, color):
+        # Even-odd ray casting via numpy. Slow per-edge but fine for
+        # the seed-foundation triangle (3 vertices).
+        h, w = img.shape[:2]
+        yy, xx = np.mgrid[:h, :w]
+        inside = np.zeros((h, w), dtype=bool)
+        n = len(pts)
+        j = n - 1
+        for i in range(n):
+            xi, yi = float(pts[i][0]), float(pts[i][1])
+            xj, yj = float(pts[j][0]), float(pts[j][1])
+            denom = (yj - yi) if (yj - yi) != 0 else 1e-9
+            cond = ((yi > yy) != (yj > yy)) & (
+                xx < (xj - xi) * (yy - yi) / denom + xi)
+            inside ^= cond
+            j = i
+        col = _coerce_color(img, color)
+        img[inside] = col
+
+    cv2 = _CV2Fallback()
+
+
+# ────────────────────────────────────────────────────────────
+# 0b. Tick integer math — mirrors ce_core/slig_tick_math.h
+#     Replaces the float blends and trig used in the generation
+#     and motion paths so behaviour matches the C engine. The
+#     score / evaluator code stays in float (per spec).
+# ────────────────────────────────────────────────────────────
+TICK_SIN_TABLE = np.array([
+    128, 131, 134, 137, 140, 144, 147, 150, 153, 156, 159, 162, 165, 168, 171, 174,
+    177, 179, 182, 185, 188, 191, 193, 196, 199, 201, 204, 206, 209, 211, 213, 216,
+    218, 220, 222, 224, 226, 228, 230, 232, 234, 235, 237, 239, 240, 241, 243, 244,
+    245, 246, 248, 249, 250, 250, 251, 252, 253, 253, 254, 254, 254, 255, 255, 255,
+    255, 255, 255, 255, 254, 254, 254, 253, 253, 252, 251, 250, 250, 249, 248, 246,
+    245, 244, 243, 241, 240, 239, 237, 235, 234, 232, 230, 228, 226, 224, 222, 220,
+    218, 216, 213, 211, 209, 206, 204, 201, 199, 196, 193, 191, 188, 185, 182, 179,
+    177, 174, 171, 168, 165, 162, 159, 156, 153, 150, 147, 144, 140, 137, 134, 131,
+    128, 125, 122, 119, 116, 112, 109, 106, 103, 100,  97,  94,  91,  88,  85,  82,
+     79,  77,  74,  71,  68,  65,  63,  60,  57,  55,  52,  50,  47,  45,  43,  40,
+     38,  36,  34,  32,  30,  28,  26,  24,  22,  21,  19,  17,  16,  15,  13,  12,
+     11,  10,   8,   7,   6,   6,   5,   4,   3,   3,   2,   2,   2,   1,   1,   1,
+      1,   1,   1,   1,   2,   2,   2,   3,   3,   4,   5,   6,   6,   7,   8,  10,
+     11,  12,  13,  15,  16,  17,  19,  21,  22,  24,  26,  28,  30,  32,  34,  36,
+     38,  40,  43,  45,  47,  50,  52,  55,  57,  60,  63,  65,  68,  71,  74,  77,
+     79,  82,  85,  88,  91,  94,  97, 100, 103, 106, 109, 112, 116, 119, 122, 125,
+], dtype=np.uint8)
+
+TICK_COS_TABLE = np.array([
+    255, 255, 255, 255, 254, 254, 254, 253, 253, 252, 251, 250, 250, 249, 248, 246,
+    245, 244, 243, 241, 240, 239, 237, 235, 234, 232, 230, 228, 226, 224, 222, 220,
+    218, 216, 213, 211, 209, 206, 204, 201, 199, 196, 193, 191, 188, 185, 182, 179,
+    177, 174, 171, 168, 165, 162, 159, 156, 153, 150, 147, 144, 140, 137, 134, 131,
+    128, 125, 122, 119, 116, 112, 109, 106, 103, 100,  97,  94,  91,  88,  85,  82,
+     79,  77,  74,  71,  68,  65,  63,  60,  57,  55,  52,  50,  47,  45,  43,  40,
+     38,  36,  34,  32,  30,  28,  26,  24,  22,  21,  19,  17,  16,  15,  13,  12,
+     11,  10,   8,   7,   6,   6,   5,   4,   3,   3,   2,   2,   2,   1,   1,   1,
+      1,   1,   1,   1,   2,   2,   2,   3,   3,   4,   5,   6,   6,   7,   8,  10,
+     11,  12,  13,  15,  16,  17,  19,  21,  22,  24,  26,  28,  30,  32,  34,  36,
+     38,  40,  43,  45,  47,  50,  52,  55,  57,  60,  63,  65,  68,  71,  74,  77,
+     79,  82,  85,  88,  91,  94,  97, 100, 103, 106, 109, 112, 116, 119, 122, 125,
+    128, 131, 134, 137, 140, 144, 147, 150, 153, 156, 159, 162, 165, 168, 171, 174,
+    177, 179, 182, 185, 188, 191, 193, 196, 199, 201, 204, 206, 209, 211, 213, 216,
+    218, 220, 222, 224, 226, 228, 230, 232, 234, 235, 237, 239, 240, 241, 243, 244,
+    245, 246, 248, 249, 250, 250, 251, 252, 253, 253, 254, 254, 254, 255, 255, 255,
+], dtype=np.uint8)
+
+# Convert radians → tick-256 phase index. 256 entries == 2π.
+TICK_PHASE_SCALE = 256.0 / (2.0 * np.pi)
+
+
+def tick_sin_signed(idx):
+    """Lookup signed sin in [-128, 127] from TICK_SIN_TABLE."""
+    return int(TICK_SIN_TABLE[idx & 0xFF]) - 128
+
+
+def tick_cos_signed(idx):
+    return int(TICK_COS_TABLE[idx & 0xFF]) - 128
+
+
+def tick_phase_idx(rad):
+    """Float radians → tick-table index (0..255)."""
+    return int(rad * TICK_PHASE_SCALE) & 0xFF
 
 
 W, H = 256, 256
@@ -152,7 +550,12 @@ class CEMemory(_BridgedCEMemory):
 
     def update_quality(self, block, cid, new_q):
         cell = self.cells[block][cid]
-        cell["quality"] = cell["quality"] * 0.7 + new_q * 0.3
+        # Tick blend: q*0.7 + new*0.3 → (q*179 + new*77) >> 8.
+        # 179 + 77 = 256 so the divide is a clean right shift.
+        old256 = int(max(0.0, min(1.0, cell["quality"])) * 256)
+        new256 = int(max(0.0, min(1.0, float(new_q))) * 256)
+        blended = (old256 * 179 + new256 * 77) >> 8
+        cell["quality"] = max(0.0, min(1.0, blended / 256.0))
         cell["uses"] += 1
 
     def total_cells(self):
@@ -282,11 +685,21 @@ class SculptGenerator:
         varied = base_image.copy()
         hsv = cv2.cvtColor(varied, cv2.COLOR_BGR2HSV).astype(np.float32)
 
-        hue_shifts = [3, -3, 5, -5, 8, -2]
+        # Hue shifts expressed as tick-256 indices (256/360 ≈ 0.711
+        # ticks/deg). Original spec: ±5° → ±3 ticks, ±3° → ±2 ticks,
+        # +8° → +6 ticks, -2° → -1 tick.
+        hue_tick_shifts = [2, -2, 3, -3, 6, -1]
         sat_factors = [1.05, 0.95, 1.10, 0.90, 1.03, 0.97]
         bright_factors = [1.02, 0.98, 1.04, 0.96, 1.01, 0.99]
 
-        hsv[:, :, 0] = np.clip(hsv[:, :, 0] + hue_shifts[variation_idx % len(hue_shifts)], 0, 179)
+        # Convert hue from cv2's 0..179 (180-step) space into
+        # tick-256 (256-step), apply the shift in tick space, convert
+        # back. Mirrors how the C engine tracks angles.
+        hue_180 = hsv[:, :, 0].astype(np.int32)
+        hue_tick = ((hue_180 * 256) // 180) & 0xFF
+        hue_tick = (hue_tick + hue_tick_shifts[variation_idx
+                                               % len(hue_tick_shifts)]) & 0xFF
+        hsv[:, :, 0] = ((hue_tick * 180) // 256).astype(np.float32)
         hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat_factors[variation_idx % len(sat_factors)], 0, 255)
         hsv[:, :, 2] = np.clip(hsv[:, :, 2] * bright_factors[variation_idx % len(bright_factors)], 0, 255)
 
@@ -312,7 +725,9 @@ class SculptGenerator:
                     edge = cv2.resize(edge, (W, bh))
                 edge3 = cv2.cvtColor(edge, cv2.COLOR_GRAY2BGR).astype(np.float32)
                 es = self.params[block_name]["edge_strength"]
-                block = block * (1 - es) + (block + edge3 * 0.8) * es
+                # Tick scale: edge3 * 0.8 → (edge3 * 204) >> 8.
+                edge_204 = ((edge3.astype(np.uint16) * 204) >> 8).astype(np.float32)
+                block = block * (1 - es) + (block + edge_204) * es
         elif block_cells:
             _, cell = block_cells[0]
             color = np.array(cell["color"], np.float32)
@@ -361,7 +776,12 @@ class SculptGenerator:
                 total_w += q
             if total_w > 0:
                 weighted_color /= total_w
-                block[:] = base * 0.6 + weighted_color * 0.4
+                # Tick blend: base*0.6 + weighted*0.4
+                #          → (base*153 + weighted*102) >> 8.
+                base_u  = np.clip(base, 0, 255).astype(np.uint16)
+                wcol_u  = np.clip(weighted_color, 0, 255).astype(np.uint16)
+                block[:] = ((base_u * 153 + wcol_u * 102) >> 8
+                            ).astype(np.float32)
             top_cell = best[0]
             if top_cell["canny"] is not None:
                 edge = top_cell["canny"]
@@ -506,12 +926,17 @@ class MotionEngine:
             if has_wind:
                 hair_end = int(H * 0.15)
                 for row in range(hair_end):
-                    shift = int(np.sin(row * 0.06 + fi * 0.18) * 3)
+                    # tick sin → signed [-128,127]; scale to ±3 px shift.
+                    sin_s = tick_sin_signed(
+                        tick_phase_idx(row * 0.06 + fi * 0.18))
+                    shift = (sin_s * 3) // 128
                     frame[row] = np.roll(frame[row], shift, axis=0)
 
             if intent.get("expressions"):
                 fy0, fy1 = int(H * 0.15), int(H * 0.40)
-                brightness = 1.0 + np.sin(fi * 0.25) * 0.02
+                # tick sin scaled to ±0.02 brightness factor.
+                sin_s = tick_sin_signed(tick_phase_idx(fi * 0.25))
+                brightness = 1.0 + (sin_s * 0.02) / 128.0
                 frame[fy0:fy1] = np.clip(
                     frame[fy0:fy1].astype(np.float32) * brightness,
                     0, 255).astype(np.uint8)
@@ -519,7 +944,9 @@ class MotionEngine:
             if has_petal:
                 for p in petals:
                     p["y"] += p["vy"]
-                    p["x"] += p["vx_base"] + np.sin(p["phase"] + fi * 0.12) * 0.6
+                    sin_s = tick_sin_signed(
+                        tick_phase_idx(p["phase"] + fi * 0.12))
+                    p["x"] += p["vx_base"] + (sin_s * 0.6) / 128.0
                     if p["y"] >= H:
                         p["y"] -= (H + 20)
                     cy = int(np.clip(p["y"], 0, H - 1))
