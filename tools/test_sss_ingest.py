@@ -72,11 +72,14 @@ def main() -> int:
         assert s["tags"] == ["red", "green", "stripe"]
         assert set(s["blocks"]) == {"hair", "face", "upper", "lower", "bg"}
         assert pipe.memory.total_cells() == before + 5
-        # Spot-check a cell carries amp + phase.
+        # Spot-check a cell carries amp + phase as a contiguous ndarray.
         sample = pipe.memory.cells["face"][-1]
         assert sample["amp"] is not None and sample["phase"] is not None
-        assert len(sample["amp"]) == len(sample["phase"]) > 0
-        print(f"OK  png+label : +{s['cells_added']} cells with amp/phase")
+        assert sample["amp"].shape == sample["phase"].shape
+        assert sample["amp"].ndim == 3 and sample["amp"].shape[1] == 3
+        assert sample["amp"].dtype == np.float32
+        print(f"OK  png+label : +{s['cells_added']} cells, "
+              f"amp shape={sample['amp'].shape} ({sample['amp'].dtype})")
 
         # ── PPM image with label ─────────────────────────
         ppm_path = os.path.join(tmp, "img.ppm"); write_ppm(ppm_path, img)
@@ -112,6 +115,30 @@ def main() -> int:
         assert s["type"] == "csv" and s["files_ok"] == 2
         assert pipe.memory.total_cells() == before + 10
         print(f"OK  csv route : ingest_file dispatches to ingest_csv")
+
+        # ── path traversal: rows that escape base_dir are refused ─
+        evil_csv = os.path.join(csv_dir, "evil.csv")
+        outside = os.path.join(tmp, "outside.png"); write_png(outside, img)
+        with open(evil_csv, "w", encoding="utf-8") as f:
+            # All four entries should be refused as per-row errors,
+            # without reading any of those files.
+            f.write("../outside.png,escape via parent\n")
+            f.write("../../etc/passwd,absolute escape\n")
+            f.write(f"{outside},absolute path\n")
+            f.write("a.png,legit relative\n")        # this one IS allowed
+        before = pipe.memory.total_cells()
+        s = ingest_csv(evil_csv, pipe.memory, base_dir=csv_dir)
+        # Only the legit relative row should add cells.
+        assert s["files_ok"] == 1, s
+        assert s["cells_added"] == 5
+        assert len(s["files_err"]) == 3, s
+        # The errors should mention the sandbox refusal.
+        joined_errs = " ".join(e["error"] for e in s["files_err"])
+        assert "absolute path not allowed" in joined_errs
+        assert "escapes base_dir" in joined_errs
+        assert pipe.memory.total_cells() == before + 5
+        print(f"OK  csv sandbox: blocked {len(s['files_err'])}/4, "
+              f"allowed {s['files_ok']}/4")
 
         # ── UTF-8 text ───────────────────────────────────
         txt = os.path.join(tmp, "note.txt")

@@ -196,16 +196,20 @@ def _ingest_image_array(img: np.ndarray, memory, *, tags, source) -> dict:
 
 def _block_fft(block: np.ndarray) -> tuple:
     """Per-row, per-channel rfft of a (bh, W, 3) uint8 block normalised
-    into [0, 1]. Returns flat lists of length bh*3 for amp and phase."""
+    into [0, 1]. Returns two contiguous float32 ndarrays of shape
+    `(bh, 3, NF)` for amp and phase. NF = W // 2 + 1.
+
+    The compact ndarray representation avoids the Python list +
+    per-row ndarray-object overhead the earlier list-of-arrays form
+    paid (≈ bh * 3 small allocations per cell × 5 cells per image)."""
     block_f = block.astype(np.float32) / 255.0
-    bh = block_f.shape[0]
-    amps, phases = [], []
-    for r in range(bh):
-        for c in range(3):
-            spec = np.fft.rfft(block_f[r, :, c])
-            amps.append(np.abs(spec).astype(np.float32))
-            phases.append(np.angle(spec).astype(np.float32))
-    return amps, phases
+    # rfft along axis=1 (the W axis): result is (bh, NF, 3) complex.
+    spec = np.fft.rfft(block_f, axis=1)
+    # Reorder to (bh, 3, NF) so reconstruction can index `[row, ch]`.
+    spec = np.transpose(spec, (0, 2, 1))
+    amp = np.ascontiguousarray(np.abs(spec).astype(np.float32))
+    phase = np.ascontiguousarray(np.angle(spec).astype(np.float32))
+    return amp, phase
 
 
 def ingest_labeled_image(filepath, memory, label_text: str,
@@ -260,13 +264,43 @@ def ingest_labeled_image(filepath, memory, label_text: str,
     }
 
 
+def _resolve_csv_path(fname: str, base_dir: str) -> str:
+    """Resolve a CSV path against base_dir, refusing anything that
+    escapes the sandbox.
+
+    Rules:
+        - When `base_dir` is non-empty, absolute paths are refused
+          and relative paths must resolve (after symlink follow) to
+          a location inside `realpath(base_dir)`. Any escape via
+          `..`, symlinks, or `/etc/...` raises `ValueError`.
+        - When `base_dir` is empty (the caller has opted out of the
+          sandbox — e.g. running ingest_csv directly from a script),
+          the path is returned as-is via abspath. The /api/ingest
+          endpoint always passes a non-empty base_dir, so the
+          server is sandboxed by default.
+    """
+    if not base_dir:
+        return os.path.abspath(fname)
+    if os.path.isabs(fname):
+        raise ValueError(f"absolute path not allowed: {fname!r}")
+    abs_base = os.path.realpath(base_dir)
+    abs_target = os.path.realpath(os.path.join(base_dir, fname))
+    sep = os.path.sep
+    if abs_target != abs_base and not abs_target.startswith(abs_base + sep):
+        raise ValueError(
+            f"path escapes base_dir: {fname!r} → {abs_target!r}")
+    return abs_target
+
+
 def ingest_csv(csv_path, memory, base_dir: str = "") -> dict:
     """Batch-ingest from a 2-column CSV: `path,label`.
 
     Lines starting with `#` are skipped. A header row whose first
     column is `filepath` / `file` / `filename` (case-insensitive) is
     also skipped. Relative paths resolve under `base_dir` (or the cwd
-    if base_dir is falsy)."""
+    if base_dir is falsy). When base_dir is set, absolute paths and
+    `..`/symlink escapes are refused per row — see
+    `_resolve_csv_path`."""
     rows = []
     errors = []
     with open(csv_path, encoding="utf-8") as f:
@@ -294,12 +328,12 @@ def ingest_csv(csv_path, memory, base_dir: str = "") -> dict:
     files_ok = 0
     files_err = []
     for lineno, fname, label in rows:
-        path = fname
-        if not os.path.isabs(path):
-            if base_dir:
-                path = os.path.join(base_dir, fname)
-            else:
-                path = os.path.abspath(fname)
+        try:
+            path = _resolve_csv_path(fname, base_dir)
+        except ValueError as e:
+            files_err.append({"line": lineno, "file": fname,
+                              "error": str(e)})
+            continue
         if not os.path.exists(path):
             files_err.append({"line": lineno, "file": fname,
                               "error": "file not found"})

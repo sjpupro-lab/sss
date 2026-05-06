@@ -727,14 +727,14 @@ class SculptGenerator:
         return varied
 
     def _block_from_amp_phase(self, cells, bh):
-        """Row-partition multiple cells' (per-row, per-channel) rfft
+        """Row-partition multiple cells' (row × channel × NF) rfft
         spectrograms back into a (bh, W, 3) float32 block.
 
-        `cells` is a list of cell dicts that all carry non-None `amp`
-        and `phase`. Each row of the output is reconstructed from
-        whichever cell owns that region (region = r * n_cells / bh).
-        Cells trained at a different block height map their rows by
-        nearest-neighbour. Returns None if no cell has spectrograms."""
+        Each cell's `amp` / `phase` are contiguous float32 ndarrays of
+        shape `(cell_bh, 3, NF)` (see tools/sss_ingest._block_fft).
+        Each output row picks the cell that owns its region; rows of a
+        cell trained at a different block height map by nearest-
+        neighbour. Returns None if no cell carries spectrograms."""
         with_spec = [c for c in cells
                      if c.get("amp") is not None and c.get("phase") is not None]
         if not with_spec:
@@ -746,13 +746,14 @@ class SculptGenerator:
             if region >= n_cells:
                 region = n_cells - 1
             cell = with_spec[region]
-            amps = cell["amp"]; phases = cell["phase"]
-            cell_bh = max(1, len(amps) // 3)
+            amps = np.asarray(cell["amp"])
+            phases = np.asarray(cell["phase"])
+            if amps.ndim != 3 or phases.shape != amps.shape:
+                continue
+            cell_bh = amps.shape[0]
             sr = min(int(r * cell_bh / max(1, bh)), cell_bh - 1)
             for c in range(3):
-                a = np.asarray(amps[sr * 3 + c], dtype=np.float32)
-                p = np.asarray(phases[sr * 3 + c], dtype=np.float32)
-                spec = a * np.exp(1j * p)
+                spec = amps[sr, c] * np.exp(1j * phases[sr, c])
                 row_recon = np.fft.irfft(spec, n=W)
                 block[r, :, c] = np.clip(row_recon * 255.0, 0, 255)
         return block
