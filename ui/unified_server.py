@@ -28,12 +28,10 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(ROOT))
 
 # Stdlib-only PNG encoder lives in tools/. No cv2 / Pillow dependency.
+# numpy is a hard requirement (tools.sss_unified and tools.sss_image_io
+# both import it unconditionally), so don't pretend otherwise here.
+import numpy as np  # noqa: E402
 from tools.sss_image_io import numpy_to_png_data_uri  # noqa: E402
-
-try:
-    import numpy as np  # only used to coerce inputs into ndarrays
-except ImportError:
-    np = None
 
 PIPELINE = None
 
@@ -92,10 +90,8 @@ def _png_data_uri(img):
         return f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
 
     # ndarray branch.
-    if np is None:
-        return None
     arr = np.asarray(img)
-    if not hasattr(arr, "shape") or arr.ndim < 2:
+    if arr.ndim < 2:
         return None
     return numpy_to_png_data_uri(arr)
 

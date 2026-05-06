@@ -189,6 +189,11 @@ def _decode_png(data: bytes) -> np.ndarray:
 
     raw = zlib.decompress(bytes(idat))
     stride = width * bpp
+    expected = height * (stride + 1)   # one filter byte + scanline per row
+    if len(raw) != expected:
+        raise ValueError(
+            f"PNG: decompressed IDAT length {len(raw)} != expected "
+            f"{expected} ({width}x{height}, bpp={bpp})")
     out = np.zeros((height, stride), dtype=np.uint8)
     prev = np.zeros(stride, dtype=np.uint8)
     src = 0
@@ -266,7 +271,16 @@ def read_ppm(path) -> np.ndarray:
         maxval = int(_ppm_token(f))
         if maxval != 255:
             raise ValueError(f"PPM maxval {maxval} not supported (need 255)")
-        body = f.read(h * w * 3)
+        expected = h * w * 3
+        body = f.read(expected + 1)         # +1 to detect trailing data
+    if len(body) < expected:
+        raise ValueError(
+            f"PPM: truncated body (got {len(body)} bytes, "
+            f"expected {expected} for {w}x{h})")
+    if len(body) > expected:
+        raise ValueError(
+            f"PPM: trailing data after pixel block "
+            f"(got {len(body)} bytes, expected {expected})")
     rgb = np.frombuffer(body, dtype=np.uint8).reshape(h, w, 3)
     return np.ascontiguousarray(rgb[..., ::-1])               # RGB → BGR
 
