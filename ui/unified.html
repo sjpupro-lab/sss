@@ -33,6 +33,24 @@
   }
   .ingest-row .item.err  { border-color:#7d1f1f; color:#f85149; }
   .ingest-row .item.ok   { border-color:#244c2c; }
+  /* Status line for the file ingest panel — bigger than the surrounding
+     12px fineprint so the "학습 중 / 학습 완료" feedback is visible at
+     a glance on phones. */
+  #ingest-status         { font-size:14px; color:#8b949e; line-height:1.4; }
+  #ingest-status.busy    { color:#d97706; }
+  #ingest-status.done    { color:#3fb950; font-weight:bold; }
+  #ingest-status.partial { color:#d29922; font-weight:bold; }
+  #ingest-status.err     { color:#f85149; font-weight:bold; }
+  #ingest-hint        { font-size:11px; color:#6e7681; margin-top:2px; }
+  /* Top-bar links. */
+  .top-links { display:flex; gap:12px; align-items:center;
+               margin-bottom:12px; font-size:12px; }
+  .top-links a {
+    color:#8b949e; text-decoration:none;
+    border:1px solid #30363d; border-radius:6px;
+    padding:6px 10px; background:#161b22;
+  }
+  .top-links a:hover { color:#e6edf3; border-color:#1f6feb; }
   .row { display:flex; gap:16px; margin-top:16px; }
   .col { flex:1; }
   .panel { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px; }
@@ -50,6 +68,12 @@
 <body>
 <div class="wrap">
   <h1>SSS Unified Pipeline</h1>
+  <div class="top-links">
+    <a href="/forge" target="_blank" rel="noopener"
+       title="Forge UI는 별도 서버(ui/server.py)가 필요합니다. /forge 페이지에 실행 방법이 있습니다.">
+      SSS Forge UI 안내 →
+    </a>
+  </div>
   <input id="prompt" value="red character smile petals" />
   <div>
     <button class="gen" id="btn-gen" onclick="run()">Generate</button>
@@ -88,10 +112,8 @@
     <div class="ingest-row" style="margin-top:10px">
       <input type="file" id="ingest-files" class="ingest-pick" multiple
              accept="image/*,video/*,.txt,.md,.csv,.ppm,.bmp" />
-      <div id="ingest-status" style="color:#8b949e; font-size:12px;">
-        이미지 / 영상 / 텍스트 파일을 선택하면 자동으로 학습합니다.
-        (최대 50MB)
-      </div>
+      <div id="ingest-status">파일을 선택하면 자동으로 학습합니다.</div>
+      <div id="ingest-hint">이미지 / 영상 / 텍스트 (최대 50MB)</div>
       <div id="ingest-results"></div>
     </div>
   </div>
@@ -187,16 +209,27 @@ async function upgrade() {
   }
 }
 
+function setIngestStatus(text, kind) {
+  // kind is one of '', 'busy', 'done', 'partial', 'err'.
+  const el = document.getElementById('ingest-status');
+  el.classList.remove('busy', 'done', 'partial', 'err');
+  if (kind) el.classList.add(kind);
+  el.textContent = text;
+}
+
 async function ingestFiles(files) {
-  const status  = document.getElementById('ingest-status');
   const results = document.getElementById('ingest-results');
   if (!files.length) return;
 
   lockButtons(true);
   results.innerHTML = '';
   let done = 0;
+  let okCount = 0;
+  let errCount = 0;
+  let cellsTotal = 0;
   for (const file of files) {
-    status.textContent = `학습 중... (${done + 1}/${files.length}) ${file.name}`;
+    setIngestStatus(
+      `학습 중... (${done + 1}/${files.length}) ${file.name}`, 'busy');
     const fd = new FormData();
     fd.append('file', file);
     let data;
@@ -206,10 +239,27 @@ async function ingestFiles(files) {
     } catch (e) {
       data = { ok: false, error: String(e) };
     }
+    if (data && data.ok) {
+      okCount++;
+      cellsTotal += (data.result && data.result.cells_added) || 0;
+    } else {
+      errCount++;
+    }
     results.appendChild(renderIngestRow(file.name, data));
     done++;
   }
-  status.textContent = `완료 (${files.length} files)`;
+
+  if (errCount === 0) {
+    setIngestStatus(
+      `✓ ${okCount}개 파일 학습 완료 (+${cellsTotal} 셀)`, 'done');
+  } else if (okCount === 0) {
+    setIngestStatus(`✗ 학습 실패 (${errCount}/${files.length})`, 'err');
+  } else {
+    setIngestStatus(
+      `⚠ 일부 학습 완료: 성공 ${okCount} · 실패 ${errCount}`
+      + ` (+${cellsTotal} 셀)`,
+      'partial');
+  }
   lockButtons(false);
 }
 

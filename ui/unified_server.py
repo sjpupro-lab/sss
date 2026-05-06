@@ -32,7 +32,21 @@ sys.path.insert(0, str(ROOT))
 # numpy is a hard requirement (tools.sss_unified and tools.sss_image_io
 # both import it unconditionally), so don't pretend otherwise here.
 import numpy as np  # noqa: E402
-from tools.sss_image_io import numpy_to_png_data_uri  # noqa: E402
+
+# tools.sss_image_io is a hard dependency. We always need at least one
+# working PNG encoder, so importing this unconditionally fails fast at
+# server startup (clear ImportError) instead of degrading silently to a
+# blank image at request time.
+from tools.sss_image_io import numpy_to_png_data_uri as _sss_png_uri  # noqa: E402
+
+# cv2 is optional — when present it tends to be a few times faster than
+# the pure-Python encoder. Both produce *equivalent* PNGs (the decoded
+# image matches), but the on-disk bytes differ because each encoder
+# picks its own filter / compression strategy.
+try:
+    import cv2  # type: ignore
+except ImportError:
+    cv2 = None
 
 PIPELINE = None
 
@@ -63,14 +77,12 @@ def _read_json(handler):
 def _png_data_uri(img):
     """Return a data: URI for a numpy image or a file path.
 
-    - numpy ndarray → encoded as PNG (`data:image/png;base64,...`).
+    - numpy ndarray → encoded as PNG (`data:image/png;base64,...`),
+      via cv2 when available else tools/sss_image_io.
     - existing .png path → passed through as `data:image/png;base64,...`.
     - existing .jpg/.jpeg path → passed through as `data:image/jpeg;base64,...`.
     Anything else (None, missing path, unsupported extension, non-image
-    object) returns None.
-
-    PNG encoding is handled by tools/sss_image_io and uses only stdlib
-    + numpy — no cv2, no Pillow."""
+    object) returns None."""
     if img is None:
         return None
 
@@ -94,7 +106,20 @@ def _png_data_uri(img):
     arr = np.asarray(img)
     if arr.ndim < 2:
         return None
-    return numpy_to_png_data_uri(arr)
+    # Coerce to uint8 — cv2.imencode and sss_image_io both want uint8.
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+    # Prefer cv2 when present (faster encoder).
+    if cv2 is not None:
+        ok, buf = cv2.imencode(".png", arr)
+        if ok:
+            return ("data:image/png;base64,"
+                    + base64.b64encode(buf.tobytes()).decode("ascii"))
+
+    # Fall back to the stdlib + numpy encoder. Imported at module load,
+    # so this branch always returns a real data URI.
+    return _sss_png_uri(arr)
 
 
 def _as_plain(x, depth=0):
@@ -306,6 +331,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        # /forge — the legacy SSS Forge UI (`ui/index.html`) calls a
+        # different set of API endpoints (`/api/stream/<jobId>`,
+        # `/api/job/<jobId>`, `/api/generate`, `/api/chat`, …) than the
+        # unified server exposes. Serving the HTML here would load a UI
+        # whose buttons all 404. Instead we return a small explainer
+        # page that tells the user how to launch the legacy server and
+        # links back to the unified UI.
+        if path == "/forge":
+            forge_html = (
+                "<!DOCTYPE html>"
+                "<html lang=\"ko\"><head><meta charset=\"utf-8\">"
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+                "<title>SSS Forge UI</title>"
+                "<style>body{background:#0f1117;color:#e6edf3;"
+                "font-family:monospace;margin:0;padding:24px;line-height:1.6}"
+                ".wrap{max-width:720px;margin:0 auto}"
+                "h1{font-size:18px;margin-bottom:16px}"
+                "code,pre{background:#161b22;border:1px solid #30363d;"
+                "border-radius:6px;padding:2px 6px}"
+                "pre{padding:12px;overflow:auto}"
+                "a{color:#58a6ff;text-decoration:none}"
+                "a:hover{text-decoration:underline}"
+                ".note{color:#8b949e;font-size:13px;margin-top:18px}"
+                "</style></head><body><div class=\"wrap\">"
+                "<h1>SSS Forge UI</h1>"
+                "<p>Forge UI는 별도 서버(<code>ui/server.py</code>)로 동작합니다."
+                " 이 통합 서버(<code>ui/unified_server.py</code>)는 Forge가 호출하는"
+                " <code>/api/stream</code>, <code>/api/job</code>, <code>/api/generate</code> 등을"
+                " 구현하지 않으므로 같은 포트로는 띄울 수 없습니다.</p>"
+                "<p>Forge를 띄우려면 다른 터미널에서:</p>"
+                "<pre>python3 ui/server.py 8080</pre>"
+                "<p>그 다음 <a href=\"http://localhost:8080/\">http://localhost:8080/</a> 를 열면 됩니다.</p>"
+                "<p class=\"note\">"
+                "← <a href=\"/\">SSS Unified Pipeline UI로 돌아가기</a>"
+                "</p></div></body></html>"
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(forge_html)))
+            self.end_headers()
+            self.wfile.write(forge_html)
+            return
         if path in ("/", "/unified.html"):
             p = UI_DIR / "unified.html"
             data = p.read_bytes()
