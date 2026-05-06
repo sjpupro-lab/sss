@@ -57,6 +57,20 @@ int         sss_memory_get_keyframe(const sss_memory *m,
                                     uint16_t          block_idx,
                                     uint8_t           out[64]);
 
+/* sss_rowvae thin wrapper: load .sss model, run sss_generate, write
+ * uint8 RGB into out_rgb (size out_w * out_h * 3). If the model size
+ * differs from out_w/out_h, the result is nearest-neighbour resampled.
+ * Returns 0 on success, -1 on any failure (model load, allocation,
+ * generate). The caller owns out_rgb. */
+int         sss_pybridge_generate(const char *model_path,
+                                  const char *prompt,
+                                  uint32_t    seed,
+                                  float       detail,
+                                  int         steps,
+                                  uint8_t    *out_rgb,
+                                  uint32_t    out_w,
+                                  uint32_t    out_h);
+
 #ifdef __cplusplus
 }
 #endif

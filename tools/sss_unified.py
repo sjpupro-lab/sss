@@ -1070,6 +1070,11 @@ class SSSPipeline:
         self.generator = SculptGenerator(self.memory)
         self.motion = MotionEngine()
         self.evaluator = Evaluator()
+        # SSS_MODEL_PATH points at a .sss file produced by
+        # scripts/sss_train.py. When present, run() routes through the
+        # C sss_rowvae generator first; otherwise it stays on the
+        # Python sculpt path.
+        self._sss_model_path = os.environ.get("SSS_MODEL_PATH", "")
         self.run_count = 0
 
     # ── seeding ─────────────────────────────────────────────
@@ -1112,6 +1117,25 @@ class SSSPipeline:
                     self.memory.add(bname, None, np.array([180, 190, 200], float),
                                     0.38, [expr], f"found_{expr}")
 
+    def _try_c_generate(self, prompt):
+        """Run the C sss_rowvae generator at SSS_W×SSS_W. Returns a BGR
+        uint8 ndarray on success, None on any failure (no model path,
+        missing file, missing C symbol, runtime error). Resampled with
+        nearest-neighbour to (H, W) so the rest of the pipeline can
+        compose with it as if it came from SculptGenerator."""
+        path = self._sss_model_path
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            from tools.sss_memory import sss_generate as _c_generate
+            img = _c_generate(path, prompt, seed=int(self.run_count) or 1,
+                              detail=1.0, steps=24, size=W)
+            if img is None or img.shape != (H, W, 3):
+                return None
+            return img
+        except Exception:
+            return None
+
     # ── single run ─────────────────────────────────────────
     def run(self, prompt):
         self.run_count += 1
@@ -1128,7 +1152,14 @@ class SSSPipeline:
 
         image = frames = None
         if intent["needs_image"] or intent["needs_video"]:
-            image = self.generator.generate(intent, search)
+            # Prefer the C sss_rowvae generator when a trained .sss
+            # model is available (env var or default path). Falls back
+            # to the Python sculpt path for any failure: missing model
+            # file, missing C symbol on an older libsss_pybridge.so, or
+            # any runtime error from sss_pybridge_generate.
+            image = self._try_c_generate(prompt)
+            if image is None:
+                image = self.generator.generate(intent, search)
             candidates = [image]
             for vi in range(3):
                 candidates.append(self.generator.generate_variation(image, intent, vi))

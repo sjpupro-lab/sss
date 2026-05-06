@@ -2,19 +2,32 @@
 """
 sss_train.py — Train the SSS spectrogram engine.
 
-Reads a labels.tsv of the form
-    filename<TAB>color_label<TAB>shape_label<TAB>face_label
-Loads each image (PPM, PNG, JPG — anything PIL handles), computes
-row-FFT (Y) and column-FFT (X) spectrograms, then aggregates per
-label:
+Reads a labels.tsv in either of two formats (auto-detected per row):
 
-    COLOR cell  ← mean of low-band Y amplitudes per RGB channel
-    FACE  cell  ← mean of high-band Y amplitudes per RGB channel
-    SHAPE cell  ← mean of full-band X amplitudes (grayscale)
+    Legacy (4-column, hand-classified):
+        filename<TAB>color_label<TAB>shape_label<TAB>face_label
+        → one COLOR / SHAPE / FACE cell per *label* with amplitudes
+          averaged across all matching images (current behaviour).
 
-Phases are NOT averaged — that destroys structure. Instead, the
-phase from the first image labelled with that token is stored as
-a reference, and the C runtime jitters it during generation.
+    Free-form (2-column, descriptive):
+        filename<TAB>"red circle smile"
+        → splits the description on whitespace; for every (image,
+          word) pair we emit one COLOR / SHAPE / FACE cell carrying
+          *that image's* amplitudes and phase. The fingerprint is
+          computed from the bare word (so multiple images of "red"
+          all share the same fp), but the cell labels are suffixed
+          (`red_0`, `red_1`, …) so they don't collide on disk.
+          The C generator picks among same-fp cells via a seed-
+          based tie-break (see find_cells_per_token).
+
+Both formats can coexist in one labels.tsv. FFT separates COLOR vs
+FACE by frequency band, so describing an image as "red circle" lets
+"red" land in the colour band while "circle" lands in shape.
+
+Phases are stored *as written* — for legacy averaged labels we keep
+the first image's phase (averaging phases across images destroys
+structure); for per-image cells we keep that image's actual phase,
+which is the whole point of dropping the average.
 
 Outputs a v8 .sss binary that the C runtime (sss_io.c) can load.
 The file format and the fingerprint() function below MUST stay in
@@ -107,12 +120,19 @@ def main() -> int:
     NF_LOW = NF // 3
     NF_HIGH = NF - NF_LOW
 
+    # ── Legacy (4-column) accumulators: average amps across images
+    #    per label, keep the first image's phase as the reference.
     color_amp = defaultdict(list)
     color_phase_ref: dict[str, np.ndarray] = {}
     shape_amp = defaultdict(list)
     shape_phase_ref: dict[str, np.ndarray] = {}
     face_amp = defaultdict(list)
     face_phase_ref: dict[str, np.ndarray] = {}
+
+    # ── Free-form (2-column) per-(image, word) cells. One entry per
+    #    cell that will be written as-is, no averaging.
+    individual_cells: list[tuple[int, str, np.ndarray, np.ndarray, np.ndarray]] = []
+    word_counts: dict[str, int] = defaultdict(int)
 
     root = Path(args.root)
     n_images = 0
@@ -122,11 +142,20 @@ def main() -> int:
             if not line or line.startswith("#"):
                 continue
             parts = line.split("\t")
-            if len(parts) < 4:
-                print(f"[{args.labels}:{lineno}] need 4 fields, got {len(parts)}",
-                      file=sys.stderr)
+            # Auto-detect format. Legacy ≥ 4 fields (filename + 3
+            # labels); free-form is exactly 2 fields. Anything else
+            # is a malformed row.
+            if len(parts) >= 4:
+                fname, c_lbl, s_lbl, f_lbl = parts[:4]
+                mode = "legacy"
+            elif len(parts) == 2:
+                fname, desc = parts
+                mode = "freeform"
+            else:
+                print(f"[{args.labels}:{lineno}] expected 2 or ≥4 TAB-separated"
+                      f" fields, got {len(parts)}", file=sys.stderr)
                 continue
-            fname, c_lbl, s_lbl, f_lbl = parts[:4]
+
             ipath = root / fname
             if not ipath.exists():
                 print(f"[{args.labels}:{lineno}] missing image: {ipath}",
@@ -137,14 +166,37 @@ def main() -> int:
             y_amp, y_phase = row_fft(img)        # (H, NF, 3)
             x_amp, x_phase = col_fft(img)        # (W, NF)
 
-            color_amp[c_lbl].append(y_amp[:, :NF_LOW, :])
-            color_phase_ref.setdefault(c_lbl, y_phase[:, :NF_LOW, :].copy())
-
-            face_amp[f_lbl].append(y_amp[:, NF_LOW:, :])
-            face_phase_ref.setdefault(f_lbl, y_phase[:, NF_LOW:, :].copy())
-
-            shape_amp[s_lbl].append(x_amp)
-            shape_phase_ref.setdefault(s_lbl, x_phase.copy())
+            if mode == "legacy":
+                color_amp[c_lbl].append(y_amp[:, :NF_LOW, :])
+                color_phase_ref.setdefault(c_lbl, y_phase[:, :NF_LOW, :].copy())
+                face_amp[f_lbl].append(y_amp[:, NF_LOW:, :])
+                face_phase_ref.setdefault(f_lbl, y_phase[:, NF_LOW:, :].copy())
+                shape_amp[s_lbl].append(x_amp)
+                shape_phase_ref.setdefault(s_lbl, x_phase.copy())
+            else:
+                # Free-form: every word becomes its own per-image cell.
+                # FFT bands separate COLOR (low Y) from FACE (high Y),
+                # so a word that means "red" naturally settles into the
+                # colour band and "circle" into the shape band — even
+                # though we apply all three.
+                words = [w for w in desc.split() if w]
+                for word in words:
+                    idx = word_counts[word]
+                    word_counts[word] += 1
+                    label = f"{word}_{idx}"
+                    fp = fingerprint(word)        # bare word = shared fp
+                    individual_cells.append((
+                        CE_COLOR, label, fp,
+                        y_amp[:, :NF_LOW, :].copy(),
+                        y_phase[:, :NF_LOW, :].copy()))
+                    individual_cells.append((
+                        CE_FACE, label, fp,
+                        y_amp[:, NF_LOW:, :].copy(),
+                        y_phase[:, NF_LOW:, :].copy()))
+                    individual_cells.append((
+                        CE_SHAPE, label, fp,
+                        x_amp.copy(),
+                        x_phase.copy()))
 
             n_images += 1
 
@@ -156,6 +208,7 @@ def main() -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     cells: list[tuple[int, str, np.ndarray, np.ndarray, np.ndarray]] = []
+    # Legacy mode: averaged amps + first-image phase per label.
     for label, stack in color_amp.items():
         amp = np.mean(np.stack(stack, axis=0), axis=0)
         cells.append((CE_COLOR, label, fingerprint(label), amp, color_phase_ref[label]))
@@ -165,6 +218,8 @@ def main() -> int:
     for label, stack in face_amp.items():
         amp = np.mean(np.stack(stack, axis=0), axis=0)
         cells.append((CE_FACE, label, fingerprint(label), amp, face_phase_ref[label]))
+    # Free-form mode: per-(image, word) cells written as-is.
+    cells.extend(individual_cells)
 
     with open(out_path, "wb") as f:
         f.write(struct.pack("<IIIIIII",
