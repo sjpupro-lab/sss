@@ -71,6 +71,19 @@ int         sss_pybridge_generate(const char *model_path,
                                   uint32_t    out_w,
                                   uint32_t    out_h);
 
+/* Run ce_feed over `text[len]` and copy the resulting CEUnit into the
+ * caller's 64-byte buffer. Used by the SSS trainer to derive each
+ * cell's `ce_key` (the 256-grid morpheme link) without re-implementing
+ * ce_feed in Python. */
+void        sss_pybridge_ce_feed(const char *text,
+                                 uint32_t    len,
+                                 uint8_t     out_64[64]);
+
+/* ce_distance over the two 64-byte CEUnits. 0 means identical;
+ * upper-bounded around 16320. */
+uint32_t    sss_pybridge_ce_distance(const uint8_t a_64[64],
+                                     const uint8_t b_64[64]);
+
 #ifdef __cplusplus
 }
 #endif
