@@ -255,13 +255,49 @@ def ingest_labeled_image(filepath, memory, label_text: str,
                    amp=amps, phase=phases, fp=fp)
         per_block[bname] = per_block.get(bname, 0) + 1
         cells_added += 1
-    return {
+
+    # Pose / radar perception: produces a sidecar entry on the same
+    # memory instance (memory.pose_cells via add_pose) when the
+    # underlying CEMemory subclass supports it. Failures are
+    # swallowed — pose perception is additive, never blocking the
+    # primary 5 row-block cells.
+    pose_summary = None
+    pose_cells_added = 0
+    if hasattr(memory, "add_pose"):
+        try:
+            from tools import sss_pose_radar
+            pose_filename = os.path.basename(str(filepath)) or "<image>"
+            pose_result = sss_pose_radar.analyze_pose_radar(
+                img, label_text.strip(), filename=pose_filename)
+            pose_result.pop("_arrays", None)
+            pose_tags = ["pose", "radar", "motion"] + list(tags)
+            memory.add_pose(
+                pose_result, pose_tags,
+                source=f"pose_radar:{pose_filename}",
+                quality=float(pose_result.get("quality", 0.5)))
+            pose_cells_added = 1
+            pose_summary = {
+                "bbox": pose_result.get("bbox"),
+                "joint_count": len(pose_result.get("joints") or {}),
+                "motion_count": len(pose_result.get("motions") or []),
+                "dirty_zone_count": len(pose_result.get("dirty_zones") or {}),
+                "quality": pose_result.get("quality"),
+                "area_frac": pose_result.get("area_frac"),
+            }
+        except Exception as e:
+            pose_summary = {"error": str(e)}
+
+    out = {
         "type": "image",
         "cells_added": cells_added,
         "blocks": per_block,
         "tags": tags,
         "label": label_text.strip(),
+        "pose_cells_added": pose_cells_added,
     }
+    if pose_summary is not None:
+        out["pose_radar"] = pose_summary
+    return out
 
 
 def _resolve_csv_path(fname: str, base_dir: str) -> str:

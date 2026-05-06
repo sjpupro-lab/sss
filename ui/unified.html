@@ -413,6 +413,24 @@ function renderIngestRow(filename, data) {
   if (r.frames_processed != null) parts.push('frames=' + r.frames_processed);
   if (r.lines != null)            parts.push('lines='  + r.lines);
   if (r.blocks)                   parts.push('blocks=' + Object.keys(r.blocks).length);
+
+  // pose / radar perception summary, when ingest_labeled_image ran
+  // tools.sss_pose_radar (regular images). Reports yes/no, joint /
+  // motion / dirty-zone counts so the UI can show the silhouette
+  // layer was learned alongside the pixels.
+  const pr = r.pose_radar;
+  if (pr && !pr.error) {
+    parts.push('pose=yes');
+    if (pr.motion_count != null)     parts.push('motions=' + pr.motion_count);
+    if (pr.dirty_zone_count != null) parts.push('zones='   + pr.dirty_zone_count);
+    if (pr.joint_count != null)      parts.push('joints='  + pr.joint_count);
+    if (pr.quality != null)          parts.push('q=' + Number(pr.quality).toFixed(2));
+  } else if (r.pose_cells_added === 0 && r.type === 'image') {
+    parts.push('pose=no');
+  } else if (pr && pr.error) {
+    parts.push('pose=err');
+  }
+
   row.innerHTML = '<b>' + escapeHtml(filename) + '</b> — ' + parts.join(' · ')
                 + ' <span style="color:#8b949e">(' + (data.bytes || 0) + 'B)</span>';
   return row;
