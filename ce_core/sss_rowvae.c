@@ -238,57 +238,66 @@ static int tokenise(const char *prompt, char **tokens, int *out_count)
 /* Single-best matcher across the whole token set. Kept for backward
  * compatibility — the new path uses find_cells_per_token below, which
  * returns one cell per token so a multi-word prompt like "red blue"
- * can place both colours instead of collapsing to one. */
+ * can place both colours instead of collapsing to one.
+ *
+ * Now uses CEUnit/ce_distance against each cell's ce_key. The legacy
+ * sss_fingerprint / fp_distance helpers are still defined above for
+ * callers that need them. */
 __attribute__((unused))
 static int best_cell_for_type(const SSSModel *m,
                               uint32_t type,
                               char **tokens, int n)
 {
     int best = -1;
-    float best_d = 1e30f;
+    uint32_t best_d = 0xFFFFFFFFu;
     for (int i = 0; i < n; ++i) {
-        float fp[SSS_FP_LEN];
-        sss_fingerprint(tokens[i], fp);
+        CEUnit query;
+        ce_init(&query);
+        ce_feed(&query, (const uint8_t *)tokens[i],
+                (uint32_t)strlen(tokens[i]));
         for (uint32_t j = 0; j < m->num_cells; ++j) {
             if (m->cells[j].type != type) continue;
-            float d = fp_distance(fp, m->cells[j].fp);
+            uint32_t d = ce_distance(&query, &m->cells[j].ce_key);
             if (d < best_d) { best_d = d; best = (int)j; }
         }
     }
-    if (best >= 0 && best_d > 1.2f) return -1;
+    /* ce_distance ranges 0 (identical) up to ~16320 (orthogonal).
+     * 4000 keeps "close enough" matches and rejects clear misses. */
+    if (best >= 0 && best_d > 4000u) return -1;
     return best;
 }
 
-/* For each token, find the closest cell of `type`. Threshold 1.2f is
- * the same cut best_cell_for_type uses. When multiple cells share the
- * minimum distance (the trainer's 2-column format keeps one cell per
- * (image, word) with identical fp), one is picked deterministically
- * from the seed — passing a different seed shuffles the choice across
- * the tied set, which is the spec's "quality-based probabilistic
- * selection" approximated as uniform sampling for now. Duplicates
- * across tokens are dropped. Returns count written into out_indices. */
+/* For each token, find the closest cell of `type`. Threshold 4000 in
+ * ce_distance space (0 = identical, ~16320 = orthogonal). When
+ * multiple cells share the minimum distance (the trainer's 2-column
+ * format keeps one cell per (image, word) with identical ce_key), one
+ * is picked deterministically from the seed — passing a different
+ * seed shuffles the choice across the tied set. Duplicates across
+ * tokens are dropped. Returns count written into out_indices. */
 static int find_cells_per_token(const SSSModel *m, uint32_t type,
                                 char **tokens, int ntok,
                                 int *out_indices, int max_out,
                                 uint32_t seed)
 {
     enum { TIE_BUF = 64 };
-    const float TIE_EPS = 1e-4f;
+    const uint32_t TIE_EPS = 4u;       /* tolerate tiny ce_distance drift */
     int n_out = 0;
     for (int ti = 0; ti < ntok && n_out < max_out; ++ti) {
-        float fp[SSS_FP_LEN];
-        sss_fingerprint(tokens[ti], fp);
-        float best_d = 1e30f;
+        CEUnit query;
+        ce_init(&query);
+        ce_feed(&query, (const uint8_t *)tokens[ti],
+                (uint32_t)strlen(tokens[ti]));
+        uint32_t best_d = 0xFFFFFFFFu;
         for (uint32_t j = 0; j < m->num_cells; ++j) {
             if (m->cells[j].type != type) continue;
-            float d = fp_distance(fp, m->cells[j].fp);
+            uint32_t d = ce_distance(&query, &m->cells[j].ce_key);
             if (d < best_d) best_d = d;
         }
-        if (best_d > 1.2f) continue;
+        if (best_d > 4000u) continue;
         int tied[TIE_BUF]; int n_tied = 0;
         for (uint32_t j = 0; j < m->num_cells && n_tied < TIE_BUF; ++j) {
             if (m->cells[j].type != type) continue;
-            float d = fp_distance(fp, m->cells[j].fp);
+            uint32_t d = ce_distance(&query, &m->cells[j].ce_key);
             if (d <= best_d + TIE_EPS) tied[n_tied++] = (int)j;
         }
         if (n_tied <= 0) continue;

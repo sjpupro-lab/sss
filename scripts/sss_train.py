@@ -36,6 +36,7 @@ lock-step with ce_core/sss_rowvae.{h,c}.
 from __future__ import annotations
 
 import argparse
+import functools
 import math
 import os
 import struct
@@ -46,15 +47,31 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-SSS_MAGIC = 0x53535838
-SSS_VERSION = 8
+# Wire `tools.sss_memory.ce_feed_bytes` (which routes to the C bridge)
+# once at import time. `python3 scripts/sss_train.py` puts `scripts/`
+# on sys.path[0]; we add the repo root so `from tools…` resolves.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+try:
+    from tools.sss_memory import ce_feed_bytes as _ce_feed_bytes_impl
+    _CE_BRIDGE_ERROR: str | None = None
+except Exception as _err:                    # noqa: BLE001 — keep raw msg
+    _ce_feed_bytes_impl = None               # type: ignore[assignment]
+    _CE_BRIDGE_ERROR = str(_err)
+
+SSS_MAGIC = 0x53535839       # "SSX9" — adds per-cell ce_key
+SSS_VERSION = 9
 SSS_FP_LEN = 256
 
 CE_COLOR, CE_SHAPE, CE_FACE = 1, 2, 3
 
 
 def fingerprint(text: str) -> np.ndarray:
-    """Byte-histogram fingerprint. Mirror of sss_fingerprint() in C."""
+    """Byte-histogram fingerprint. Mirror of sss_fingerprint() in C.
+    Kept alongside ce_key for backward compatibility — the C runtime
+    no longer searches with it, but the field still ships in every
+    cell so legacy callers (sss_search, fp_distance) keep working."""
     fp = np.zeros(SSS_FP_LEN, dtype=np.float32)
     data = text.encode("utf-8")
     for i, b in enumerate(data):
@@ -65,6 +82,29 @@ def fingerprint(text: str) -> np.ndarray:
     if s > 1e-9:
         fp /= s
     return fp
+
+
+@functools.lru_cache(maxsize=None)
+def ce_key_bytes(text: str) -> bytes:
+    """Compute the 64-byte CEUnit ce_key for `text` via the C bridge.
+    The trainer prefers the C function so the runtime's ce_distance
+    search keys line up byte-for-byte with what the .sss file ships.
+
+    Memoised: each distinct token crosses the Python↔ctypes boundary
+    exactly once, even when many cells reference the same word.
+
+    Raises RuntimeError if libsss_pybridge.so isn't loadable. We
+    intentionally do NOT silently fall back to a 64-byte zero key —
+    that would write a v9 file whose ce_distance search returns
+    nonsense, producing models that look fine on disk but search
+    incorrectly at generate time. Rebuild with `make pybridge` and
+    retry."""
+    if _ce_feed_bytes_impl is None:
+        raise RuntimeError(
+            "tools.sss_memory.ce_feed_bytes is unreachable: "
+            f"{_CE_BRIDGE_ERROR}. Rebuild with `make pybridge` so the "
+            "trainer can derive each cell's ce_key from C ce_feed.")
+    return _ce_feed_bytes_impl(text)
 
 
 def load_image(path: Path, size: int) -> np.ndarray:
@@ -88,11 +128,15 @@ def col_fft(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def write_cell(f, ctype: int, label: str, fp: np.ndarray,
-               amp: np.ndarray, phase: np.ndarray) -> None:
+               amp: np.ndarray, phase: np.ndarray,
+               ce_key: bytes) -> None:
     label_b = label.encode("utf-8")
+    if len(ce_key) != 64:
+        raise ValueError(f"ce_key must be 64 bytes, got {len(ce_key)}")
     f.write(struct.pack("<I", ctype))
     f.write(struct.pack("<I", len(label_b)))
     f.write(label_b)
+    f.write(ce_key)                      # v9 addition
     f.write(fp.astype(np.float32).tobytes())
     amp_flat = amp.astype(np.float32).ravel()
     f.write(struct.pack("<I", amp_flat.size))
@@ -130,8 +174,10 @@ def main() -> int:
     face_phase_ref: dict[str, np.ndarray] = {}
 
     # ── Free-form (2-column) per-(image, word) cells. One entry per
-    #    cell that will be written as-is, no averaging.
-    individual_cells: list[tuple[int, str, np.ndarray, np.ndarray, np.ndarray]] = []
+    #    cell that will be written as-is, no averaging. Tuple shape:
+    #    (ctype, label, fp, ce_key, amp, phase).
+    individual_cells: list[tuple[
+        int, str, np.ndarray, bytes, np.ndarray, np.ndarray]] = []
     word_counts: dict[str, int] = defaultdict(int)
 
     root = Path(args.root)
@@ -178,23 +224,27 @@ def main() -> int:
                 # FFT bands separate COLOR (low Y) from FACE (high Y),
                 # so a word that means "red" naturally settles into the
                 # colour band and "circle" into the shape band — even
-                # though we apply all three.
+                # though we apply all three. fp + ce_key come from the
+                # bare word so all sibling cells share both keys; the
+                # `_N` suffix only disambiguates the human-readable
+                # label on disk.
                 words = [w for w in desc.split() if w]
                 for word in words:
                     idx = word_counts[word]
                     word_counts[word] += 1
                     label = f"{word}_{idx}"
-                    fp = fingerprint(word)        # bare word = shared fp
+                    fp = fingerprint(word)
+                    key = ce_key_bytes(word)
                     individual_cells.append((
-                        CE_COLOR, label, fp,
+                        CE_COLOR, label, fp, key,
                         y_amp[:, :NF_LOW, :].copy(),
                         y_phase[:, :NF_LOW, :].copy()))
                     individual_cells.append((
-                        CE_FACE, label, fp,
+                        CE_FACE, label, fp, key,
                         y_amp[:, NF_LOW:, :].copy(),
                         y_phase[:, NF_LOW:, :].copy()))
                     individual_cells.append((
-                        CE_SHAPE, label, fp,
+                        CE_SHAPE, label, fp, key,
                         x_amp.copy(),
                         x_phase.copy()))
 
@@ -207,17 +257,21 @@ def main() -> int:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    cells: list[tuple[int, str, np.ndarray, np.ndarray, np.ndarray]] = []
+    cells: list[tuple[
+        int, str, np.ndarray, bytes, np.ndarray, np.ndarray]] = []
     # Legacy mode: averaged amps + first-image phase per label.
     for label, stack in color_amp.items():
         amp = np.mean(np.stack(stack, axis=0), axis=0)
-        cells.append((CE_COLOR, label, fingerprint(label), amp, color_phase_ref[label]))
+        cells.append((CE_COLOR, label, fingerprint(label),
+                      ce_key_bytes(label), amp, color_phase_ref[label]))
     for label, stack in shape_amp.items():
         amp = np.mean(np.stack(stack, axis=0), axis=0)
-        cells.append((CE_SHAPE, label, fingerprint(label), amp, shape_phase_ref[label]))
+        cells.append((CE_SHAPE, label, fingerprint(label),
+                      ce_key_bytes(label), amp, shape_phase_ref[label]))
     for label, stack in face_amp.items():
         amp = np.mean(np.stack(stack, axis=0), axis=0)
-        cells.append((CE_FACE, label, fingerprint(label), amp, face_phase_ref[label]))
+        cells.append((CE_FACE, label, fingerprint(label),
+                      ce_key_bytes(label), amp, face_phase_ref[label]))
     # Free-form mode: per-(image, word) cells written as-is.
     cells.extend(individual_cells)
 
@@ -226,8 +280,8 @@ def main() -> int:
                             SSS_MAGIC, SSS_VERSION,
                             H, W, NF, NF_LOW,
                             len(cells)))
-        for ctype, label, fp_vec, amp, phase in cells:
-            write_cell(f, ctype, label, fp_vec, amp, phase)
+        for ctype, label, fp_vec, ce_key, amp, phase in cells:
+            write_cell(f, ctype, label, fp_vec, amp, phase, ce_key)
 
     bytes_written = out_path.stat().st_size
     print(f"wrote {out_path}  ({bytes_written} bytes, {len(cells)} cells "

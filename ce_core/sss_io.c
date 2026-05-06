@@ -1,9 +1,9 @@
-/* sss_io.c — .sss v8 binary loader.
+/* sss_io.c — .sss v9 binary loader (with v8 backward-compat).
  *
  * Layout (little-endian, host writes/reads must agree):
  *   Header (28 bytes):
- *     uint32 magic      = 'SSX8'
- *     uint32 version    = 8
+ *     uint32 magic      = 'SSX9' (v9) or 'SSX8' (v8 read-only)
+ *     uint32 version    = 9 (or 8 for legacy)
  *     uint32 height
  *     uint32 width
  *     uint32 nf
@@ -13,6 +13,7 @@
  *     uint32 type
  *     uint32 label_len
  *     bytes  label[label_len]
+ *     bytes  ce_key[64]      <-- v9 only; v8 regenerates via ce_feed
  *     float  fp[256]
  *     uint32 amp_len    (in floats)
  *     float  amp[amp_len]
@@ -20,6 +21,7 @@
  *     float  phase[phase_len]
  */
 #include "sss_rowvae.h"
+#include "ce_core.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,11 +45,17 @@ int sss_model_load(const char *path, SSSModel *out)
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
 
+    /* Accept both the current SSX9 layout and the legacy SSX8 layout
+     * (which lacks the per-cell ce_key block). The cell loop below
+     * checks `is_v8` to know whether to read+skip or synthesise it. */
     uint32_t magic, version;
-    if (read_u32(f, &magic) || magic != SSS_MAGIC) {
+    if (read_u32(f, &magic)) { fclose(f); return -2; }
+    if (magic != SSS_MAGIC && magic != 0x53535838u /* SSX8 */) {
         fclose(f); return -2;
     }
-    if (read_u32(f, &version) || version != SSS_VERSION) {
+    if (read_u32(f, &version)) { fclose(f); return -3; }
+    int is_v8 = (magic == 0x53535838u && version == 8u);
+    if (!is_v8 && (magic != SSS_MAGIC || version != SSS_VERSION)) {
         fclose(f); return -3;
     }
     if (read_u32(f, &out->height)
@@ -72,28 +80,46 @@ int sss_model_load(const char *path, SSSModel *out)
         if (read_u32(f, &c->type) || read_u32(f, &label_len)) {
             fclose(f); sss_model_free(out); return -6;
         }
-        if (label_len >= SSS_LABEL_MAX) {
-            /* Truncate label but still consume the bytes. */
-            char drop[256];
-            uint32_t to_keep = SSS_LABEL_MAX - 1;
-            if (fread(c->label, 1, to_keep, f) != to_keep) {
+
+        /* Read the full on-disk label into a heap buffer. We need
+         * every byte for the v8 ce_feed regeneration (truncating
+         * c->label to SSS_LABEL_MAX-1 would change the ce_key for
+         * long labels — feeding only the prefix gives a different
+         * morpheme link than the trainer used). c->label still gets
+         * the truncated NUL-terminated prefix for display. */
+        uint8_t *full_label = NULL;
+        if (label_len > 0) {
+            full_label = (uint8_t *)malloc(label_len);
+            if (!full_label) {
                 fclose(f); sss_model_free(out); return -7;
             }
-            c->label[to_keep] = '\0';
-            uint32_t rest = label_len - to_keep;
-            while (rest > 0) {
-                uint32_t chunk = rest > sizeof(drop) ? (uint32_t)sizeof(drop) : rest;
-                if (fread(drop, 1, chunk, f) != chunk) {
-                    fclose(f); sss_model_free(out); return -7;
-                }
-                rest -= chunk;
+            if (fread(full_label, 1, label_len, f) != label_len) {
+                free(full_label); fclose(f);
+                sss_model_free(out); return -7;
+            }
+        }
+        uint32_t to_keep = (label_len < SSS_LABEL_MAX)
+                           ? label_len : (uint32_t)(SSS_LABEL_MAX - 1);
+        if (to_keep > 0) memcpy(c->label, full_label, to_keep);
+        c->label[to_keep] = '\0';
+
+        /* v9 stores the ce_key explicitly; v8 files don't, so we
+         * regenerate it from the full on-disk label bytes via
+         * ce_feed — same morpheme, same ce_key, search key stays
+         * consistent across versions even when the human-readable
+         * label was longer than SSS_LABEL_MAX. */
+        if (is_v8) {
+            ce_init(&c->ce_key);
+            if (label_len > 0) {
+                ce_feed(&c->ce_key, full_label, label_len);
             }
         } else {
-            if (label_len > 0 && fread(c->label, 1, label_len, f) != label_len) {
-                fclose(f); sss_model_free(out); return -7;
+            if (fread(ce_bytes(&c->ce_key), 1, 64, f) != 64) {
+                free(full_label); fclose(f);
+                sss_model_free(out); return -8;
             }
-            c->label[label_len] = '\0';
         }
+        free(full_label);
 
         if (read_floats(f, c->fp, SSS_FP_LEN)) {
             fclose(f); sss_model_free(out); return -8;

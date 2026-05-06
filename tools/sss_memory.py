@@ -110,6 +110,22 @@ def _load_lib():
         ]
         lib.sss_pybridge_generate.restype = ctypes.c_int
 
+    # ce_feed / ce_distance — used by the SSS trainer to derive each
+    # cell's CEUnit search key without re-implementing ce_feed in
+    # Python. Older .so builds lack these; gate via hasattr().
+    if hasattr(lib, "sss_pybridge_ce_feed"):
+        lib.sss_pybridge_ce_feed.argtypes = [
+            ctypes.c_char_p, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint8),
+        ]
+        lib.sss_pybridge_ce_feed.restype = None
+    if hasattr(lib, "sss_pybridge_ce_distance"):
+        lib.sss_pybridge_ce_distance.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.POINTER(ctypes.c_uint8),
+        ]
+        lib.sss_pybridge_ce_distance.restype = ctypes.c_uint32
+
     return lib
 
 
@@ -273,6 +289,45 @@ class CEMemory:
             self._handle, self.canvas_id, _slot_for(block_name),
             int(block_idx), out)
         return bytes(out) if ok else None
+
+
+def ce_feed_bytes(text: str) -> bytes:
+    """Compute the 64-byte CEUnit ce_key for `text` via the C bridge.
+
+    Used by the SSS trainer to derive each cell's search key. Raises
+    RuntimeError if the loaded libsss_pybridge.so doesn't carry the
+    `sss_pybridge_ce_feed` symbol (rebuild with `make pybridge`).
+    """
+    lib = _lib()
+    if not hasattr(lib, "sss_pybridge_ce_feed"):
+        raise RuntimeError(
+            "libsss_pybridge.so is missing sss_pybridge_ce_feed; "
+            "rebuild with `make pybridge` after pulling the latest C source")
+    out = (ctypes.c_uint8 * 64)()
+    data = text.encode("utf-8")
+    # ctypes.c_char_p(data) pins the bytes object's buffer for the
+    # duration of the FFI call — no separate "keep-alive" copy needed.
+    lib.sss_pybridge_ce_feed(
+        ctypes.c_char_p(data),
+        ctypes.c_uint32(len(data)),
+        out,
+    )
+    return bytes(out)
+
+
+def ce_distance(a: bytes, b: bytes) -> int:
+    """ce_distance over two 64-byte CEUnit blobs. Raises if either
+    blob isn't 64 bytes or if the C symbol is missing."""
+    if len(a) != 64 or len(b) != 64:
+        raise ValueError("ce_distance arguments must be 64 bytes each")
+    lib = _lib()
+    if not hasattr(lib, "sss_pybridge_ce_distance"):
+        raise RuntimeError(
+            "libsss_pybridge.so is missing sss_pybridge_ce_distance; "
+            "rebuild with `make pybridge`")
+    a_buf = (ctypes.c_uint8 * 64).from_buffer_copy(a)
+    b_buf = (ctypes.c_uint8 * 64).from_buffer_copy(b)
+    return int(lib.sss_pybridge_ce_distance(a_buf, b_buf))
 
 
 def sss_generate(model_path: str, prompt: str, *,

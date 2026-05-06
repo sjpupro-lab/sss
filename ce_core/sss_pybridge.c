@@ -231,3 +231,23 @@ int sss_pybridge_generate(const char *model_path,
     sss_model_free(&model);
     return 0;
 }
+
+void sss_pybridge_ce_feed(const char *text, uint32_t len, uint8_t out_64[64])
+{
+    if (!out_64) return;
+    CEUnit u;
+    ce_init(&u);
+    if (text && len > 0) {
+        ce_feed(&u, (const uint8_t *)text, len);
+    }
+    memcpy(out_64, ce_cbytes(&u), 64);
+}
+
+uint32_t sss_pybridge_ce_distance(const uint8_t a_64[64], const uint8_t b_64[64])
+{
+    if (!a_64 || !b_64) return 0xFFFFFFFFu;
+    CEUnit a, b;
+    memcpy(ce_bytes(&a), a_64, 64);
+    memcpy(ce_bytes(&b), b_64, 64);
+    return ce_distance(&a, &b);
+}

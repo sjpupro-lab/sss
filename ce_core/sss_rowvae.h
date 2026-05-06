@@ -18,12 +18,18 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* CEUnit is the 256-grid morpheme cell. Pulled in here so SSSCell
+ * can carry a `ce_key` — the label's ce_feed-fingerprint, which is
+ * what find_cells_per_token compares against at generate time.
+ * ce_core must NOT include this header back (would cycle). */
+#include "ce_core.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define SSS_MAGIC      0x53535838u   /* "SSX8" little-endian */
-#define SSS_VERSION    8u
+#define SSS_MAGIC      0x53535839u   /* "SSX9" little-endian (v9 ce_key) */
+#define SSS_VERSION    9u
 #define SSS_FP_LEN     256
 #define SSS_LABEL_MAX  64
 
@@ -36,7 +42,11 @@ typedef enum {
 typedef struct {
     uint32_t type;                 /* SSSCellType */
     char     label[SSS_LABEL_MAX];
-    float    fp[SSS_FP_LEN];       /* fingerprint = search key */
+    CEUnit   ce_key;               /* 256-grid morpheme link — search key */
+    float    fp[SSS_FP_LEN];       /* legacy byte-histogram fp; kept for
+                                    * backward-compat callers (sss_search,
+                                    * fp_distance). New search path uses
+                                    * ce_key + ce_distance. */
     uint32_t amp_len;
     float   *amp;
     uint32_t phase_len;
