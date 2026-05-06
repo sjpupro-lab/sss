@@ -37,7 +37,10 @@ ROW_BLOCKS = {
 }
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".ppm", ".bmp"}
-TEXT_EXTS  = {".txt", ".md", ".csv"}
+# .csv used to flow through the text path; it now drives ingest_csv()
+# (batch image ingest via `path,label` rows). Plain prose still goes
+# through .txt / .md.
+TEXT_EXTS  = {".txt", ".md"}
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
 
@@ -140,11 +143,36 @@ def _read_image_any(filepath: str) -> np.ndarray:
 
 
 # ────────────────────────────────────────────────────────────
+# Fingerprint — Python port of sss_fingerprint() in
+# ce_core/sss_rowvae.c. Byte-histogram with a position-mixed
+# neighbour bump, then L2-normalised. Must stay byte-identical to
+# the C version so future fp-keyed search lines up.
+# ────────────────────────────────────────────────────────────
+SSS_FP_LEN = 256
+
+
+def fingerprint(text: str) -> np.ndarray:
+    fp = np.zeros(SSS_FP_LEN, dtype=np.float32)
+    if not text:
+        return fp
+    data = text.encode("utf-8")
+    for i, b in enumerate(data):
+        fp[b] += 1.0
+        n = (b + 1 + i) & 0xFF
+        fp[n] += 0.3
+    s = float(np.sqrt(np.sum(fp * fp)))
+    if s > 1e-9:
+        fp /= s
+    return fp
+
+
+# ────────────────────────────────────────────────────────────
 # Image ingest
 # ────────────────────────────────────────────────────────────
 def _ingest_image_array(img: np.ndarray, memory, *, tags, source) -> dict:
     """Split a 256×256 BGR image into row blocks, write one cell per
-    block, return a per-block summary."""
+    block, return a per-block summary. Used by the legacy unlabeled
+    path; the labeled path goes through ingest_labeled_image()."""
     img = _resize_nn(img, H, W)
     if img.ndim == 2:
         img = np.stack([img, img, img], axis=-1)
@@ -166,14 +194,172 @@ def _ingest_image_array(img: np.ndarray, memory, *, tags, source) -> dict:
     return {"cells_added": cells_added, "blocks": per_block}
 
 
-def _ingest_image(filepath: str, memory, filename: str) -> dict:
-    img = _read_image_any(filepath)
-    summary = _ingest_image_array(
-        img, memory,
-        tags=["ingest", "image", filename],
-        source=f"ingest:{filename}")
-    summary["type"] = "image"
-    return summary
+def _block_fft(block: np.ndarray) -> tuple:
+    """Per-row, per-channel rfft of a (bh, W, 3) uint8 block normalised
+    into [0, 1]. Returns two contiguous float32 ndarrays of shape
+    `(bh, 3, NF)` for amp and phase. NF = W // 2 + 1.
+
+    The compact ndarray representation avoids the Python list +
+    per-row ndarray-object overhead the earlier list-of-arrays form
+    paid (≈ bh * 3 small allocations per cell × 5 cells per image)."""
+    block_f = block.astype(np.float32) / 255.0
+    # rfft along axis=1 (the W axis): result is (bh, NF, 3) complex.
+    spec = np.fft.rfft(block_f, axis=1)
+    # Reorder to (bh, 3, NF) so reconstruction can index `[row, ch]`.
+    spec = np.transpose(spec, (0, 2, 1))
+    amp = np.ascontiguousarray(np.abs(spec).astype(np.float32))
+    phase = np.ascontiguousarray(np.angle(spec).astype(np.float32))
+    return amp, phase
+
+
+def ingest_labeled_image(filepath, memory, label_text: str,
+                         *, source: Optional[str] = None) -> dict:
+    """Ingest one image with a required text label.
+
+    The label drives the cell's tags AND its fingerprint (Python port
+    of sss_fingerprint). For each row block the cell stores:
+        canny  — Sobel edge map
+        color  — mean BGR
+        amp    — per-row, per-channel rfft amplitudes
+        phase  — per-row, per-channel rfft phases
+        tags   — every word in the label (lowercased, len > 1)
+        fp     — 256-bin fingerprint of the bare label text
+    """
+    if not label_text or not label_text.strip():
+        return {"error": "라벨이 필요합니다"}
+
+    tags = [w.lower() for w in label_text.split() if len(w) > 1]
+    if not tags:
+        return {"error": "라벨이 필요합니다"}
+    fp = fingerprint(label_text.strip())
+
+    img = _read_image_any(str(filepath))
+    img = _resize_nn(img, H, W)
+    if img.ndim == 2:
+        img = np.stack([img, img, img], axis=-1)
+    elif img.shape[2] == 4:
+        img = img[..., :3]
+    img = np.ascontiguousarray(img, dtype=np.uint8)
+
+    src = source if source is not None else str(filepath)
+    per_block = {}
+    cells_added = 0
+    for bname, (s, e) in ROW_BLOCKS.items():
+        y0, y1 = int(H * s), int(H * e)
+        block = img[y0:y1]
+        gray = _to_gray(block)
+        canny = _sobel_edges(gray, 80)
+        color = np.mean(block, axis=(0, 1))
+        amps, phases = _block_fft(block)
+        memory.add(bname, canny, color, 0.5, list(tags), src,
+                   amp=amps, phase=phases, fp=fp)
+        per_block[bname] = per_block.get(bname, 0) + 1
+        cells_added += 1
+    return {
+        "type": "image",
+        "cells_added": cells_added,
+        "blocks": per_block,
+        "tags": tags,
+        "label": label_text.strip(),
+    }
+
+
+def _resolve_csv_path(fname: str, base_dir: str) -> str:
+    """Resolve a CSV path against base_dir, refusing anything that
+    escapes the sandbox.
+
+    Rules:
+        - When `base_dir` is non-empty, absolute paths are refused
+          and relative paths must resolve (after symlink follow) to
+          a location inside `realpath(base_dir)`. Any escape via
+          `..`, symlinks, or `/etc/...` raises `ValueError`.
+        - When `base_dir` is empty (the caller has opted out of the
+          sandbox — e.g. running ingest_csv directly from a script),
+          the path is returned as-is via abspath. The /api/ingest
+          endpoint always passes a non-empty base_dir, so the
+          server is sandboxed by default.
+    """
+    if not base_dir:
+        return os.path.abspath(fname)
+    if os.path.isabs(fname):
+        raise ValueError(f"absolute path not allowed: {fname!r}")
+    abs_base = os.path.realpath(base_dir)
+    abs_target = os.path.realpath(os.path.join(base_dir, fname))
+    sep = os.path.sep
+    if abs_target != abs_base and not abs_target.startswith(abs_base + sep):
+        raise ValueError(
+            f"path escapes base_dir: {fname!r} → {abs_target!r}")
+    return abs_target
+
+
+def ingest_csv(csv_path, memory, base_dir: str = "") -> dict:
+    """Batch-ingest from a 2-column CSV: `path,label`.
+
+    Lines starting with `#` are skipped. A header row whose first
+    column is `filepath` / `file` / `filename` (case-insensitive) is
+    also skipped. Relative paths resolve under `base_dir` (or the cwd
+    if base_dir is falsy). When base_dir is set, absolute paths and
+    `..`/symlink escapes are refused per row — see
+    `_resolve_csv_path`."""
+    rows = []
+    errors = []
+    with open(csv_path, encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",", 1)
+            if len(parts) < 2:
+                errors.append({"line": lineno, "error": "missing label"})
+                continue
+            fname = parts[0].strip()
+            label = parts[1].strip()
+            # Skip an obvious header row.
+            if (lineno == 1
+                    and fname.lower() in ("filepath", "file", "filename", "path")):
+                continue
+            if not fname or not label:
+                errors.append({"line": lineno,
+                               "error": "empty filepath or label"})
+                continue
+            rows.append((lineno, fname, label))
+
+    cells_total = 0
+    files_ok = 0
+    files_err = []
+    for lineno, fname, label in rows:
+        try:
+            path = _resolve_csv_path(fname, base_dir)
+        except ValueError as e:
+            files_err.append({"line": lineno, "file": fname,
+                              "error": str(e)})
+            continue
+        if not os.path.exists(path):
+            files_err.append({"line": lineno, "file": fname,
+                              "error": "file not found"})
+            continue
+        try:
+            r = ingest_labeled_image(path, memory, label,
+                                     source=f"csv:{os.path.basename(csv_path)}#{lineno}")
+        except Exception as e:
+            files_err.append({"line": lineno, "file": fname,
+                              "error": str(e)})
+            continue
+        if "error" in r:
+            files_err.append({"line": lineno, "file": fname,
+                              "error": r["error"]})
+            continue
+        cells_total += r["cells_added"]
+        files_ok += 1
+
+    return {
+        "type": "csv",
+        "rows": len(rows),
+        "files_ok": files_ok,
+        "files_err": files_err,
+        "errors": errors,
+        "cells_added": cells_total,
+    }
 
 
 # ────────────────────────────────────────────────────────────
@@ -280,12 +466,18 @@ def _ingest_video(filepath: str, memory, filename: str,
 # ────────────────────────────────────────────────────────────
 # Public entry
 # ────────────────────────────────────────────────────────────
-def ingest_file(filepath, memory, *, filename: Optional[str] = None) -> dict:
+def ingest_file(filepath, memory, *,
+                filename: Optional[str] = None,
+                label: Optional[str] = None,
+                base_dir: str = "") -> dict:
     """Ingest one file into `memory`. Returns a per-type summary dict.
 
     Routes by extension:
-      .png / .jpg / .jpeg / .ppm / .bmp  → image ingest
-      .txt / .md / .csv                  → text ingest
+      .png / .jpg / .jpeg / .ppm / .bmp  → labeled image ingest (label
+                                            is required — unlabeled
+                                            images are refused)
+      .csv                               → batch via ingest_csv
+      .txt / .md                         → text ingest
       .mp4 / .avi / .mov / .mkv / .webm  → video ingest
     Unknown extensions raise ValueError.
     """
@@ -294,7 +486,12 @@ def ingest_file(filepath, memory, *, filename: Optional[str] = None) -> dict:
     ext = os.path.splitext(name)[1].lower()
 
     if ext in IMAGE_EXTS:
-        return _ingest_image(p, memory, name)
+        if not label or not label.strip():
+            return {"type": "image", "error": "라벨이 필요합니다",
+                    "filename": name}
+        return ingest_labeled_image(p, memory, label, source=name)
+    if ext == ".csv":
+        return ingest_csv(p, memory, base_dir=base_dir)
     if ext in TEXT_EXTS:
         return _ingest_text(p, memory, name)
     if ext in VIDEO_EXTS:
