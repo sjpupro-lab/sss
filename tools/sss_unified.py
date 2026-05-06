@@ -475,6 +475,13 @@ class CEMemory(_BridgedCEMemory):
         super().__init__(db_path)
         self.pending = []
         self.prompt_index = defaultdict(list)
+        # Pose / radar sidecar — populated by tools.sss_ingest when
+        # tools.sss_pose_radar produces motion + dirty-zone hints. Lives
+        # on the same memory instance so it's saved/searched alongside
+        # the row-block cells, but doesn't enter CEStorage (the bridge
+        # is keyed on row blocks). MotionEngine reads this when a
+        # prompt's tags match an entry.
+        self.pose_cells = []
         # ROW_BLOCKS adds two slots beyond the four the bridge knows
         # about (hair/face/upper/lower/bg vs. top/mid_top/mid_bot/bot).
         # Re-map to keep CEStorage slots stable across versions.
@@ -573,6 +580,48 @@ class CEMemory(_BridgedCEMemory):
         blended = (old256 * 179 + new256 * 77) >> 8
         cell["quality"] = max(0.0, min(1.0, blended / 256.0))
         cell["uses"] += 1
+
+    # ── pose / radar sidecar ────────────────────────────────
+    def add_pose(self, pose_data, tags, *, source: str = "",
+                 quality: Optional[float] = None) -> int:
+        """Append one pose / radar entry to the sidecar.
+
+        Stays out of CEStorage and out of `self.cells` so callers that
+        count row-block cells (test_sss_ingest, total_cells) are
+        unaffected. Returned index is the slot in `self.pose_cells`.
+        """
+        q = float(quality) if quality is not None else float(
+            pose_data.get("quality", 0.5) if isinstance(pose_data, dict) else 0.5)
+        entry = {
+            "id": len(self.pose_cells),
+            "tags": list(tags),
+            "data": pose_data,
+            "source": source,
+            "quality": q,
+            "gen": self.generation,
+            "uses": 0,
+        }
+        self.pose_cells.append(entry)
+        for t in tags:
+            self.prompt_index[t].append(("pose", entry["id"]))
+        return entry["id"]
+
+    def find_pose(self, tags, n: int = 4):
+        """Pose entries ranked by tag-match × quality. Returns at most
+        `n` entries; empty list when nothing matches or the sidecar is
+        empty."""
+        if not self.pose_cells or not tags:
+            return []
+        scored = []
+        for e in self.pose_cells:
+            match = sum(1 for t in tags if t in e.get("tags", []))
+            if match > 0:
+                scored.append((match * max(0.05, e.get("quality", 0.0)), e))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [e for _, e in scored[:n]]
+
+    def total_pose_cells(self) -> int:
+        return len(self.pose_cells)
 
     def total_cells(self):
         return sum(len(v) for v in self.cells.values())
@@ -968,12 +1017,60 @@ class SculptGenerator:
 # 4. MotionEngine
 # ────────────────────────────────────────────────────────────
 class MotionEngine:
+    def __init__(self, memory=None):
+        # Optional. When set, generate_frames() prefers pose-cell
+        # dirty_zones / motion rules over the deterministic fallback.
+        self.memory = memory
+
+    def _find_pose_for_intent(self, intent):
+        if self.memory is None or not hasattr(self.memory, "find_pose"):
+            return None
+        tags = list(intent.get("tags") or [])
+        if not tags:
+            return None
+        try:
+            entries = self.memory.find_pose(tags, n=1)
+        except Exception:
+            return None
+        if not entries:
+            return None
+        data = entries[0].get("data") or {}
+        if not isinstance(data, dict):
+            return None
+        return data
+
+    @staticmethod
+    def _zone_rows(dirty, name, fallback):
+        """Clip a dirty-zone span into a [r0, r1) tuple usable for
+        slicing. `fallback` is `(r0, r1)`; used when the zone is
+        missing or degenerate."""
+        if not isinstance(dirty, dict):
+            return fallback
+        span = dirty.get(name)
+        if not span or len(span) < 2:
+            return fallback
+        a, b = int(span[0]), int(span[1])
+        if b < a:
+            a, b = b, a
+        a = max(0, min(H - 1, a))
+        b = max(0, min(H, b + 1))
+        if b <= a:
+            return fallback
+        return (a, b)
+
     def generate_frames(self, base_image, intent, n_frames=24):
+        # Pose-cell hints take priority for row band placement when a
+        # matching entry exists; falls back to ROW_BLOCKS percentages.
+        pose_data = self._find_pose_for_intent(intent)
+        dirty = pose_data.get("dirty_zones") if pose_data else None
+        pose_motions = pose_data.get("motions") if pose_data else []
+
         frames = []
         has_petal = any(m in intent.get("motions", [])
                         for m in ["petal", "fall", "blow"])
         has_wind = any(m in intent.get("motions", [])
                        for m in ["wind", "blow", "wave"])
+        has_pose_motions = isinstance(pose_motions, list) and bool(pose_motions)
 
         petals = []
         if has_petal:
@@ -988,12 +1085,20 @@ class MotionEngine:
                     "phase": i * 0.7,
                 })
 
+        # Resolve row bands. When a matching pose cell exists we use
+        # its detected dirty zones so wind/face/arm motions follow the
+        # actual silhouette instead of the fixed 15%/40% percentages.
+        hair_band  = self._zone_rows(dirty, "hair",  (0,            int(H * 0.15)))
+        face_band  = self._zone_rows(dirty, "face",  (int(H * 0.15), int(H * 0.40)))
+        arm_band   = self._zone_rows(dirty, "arms",  (int(H * 0.40), int(H * 0.65)))
+        cloth_band = self._zone_rows(dirty, "cloth", (int(H * 0.65), int(H * 0.88)))
+
         for fi in range(n_frames):
             frame = base_image.copy()
 
             if has_wind:
-                hair_end = int(H * 0.15)
-                for row in range(hair_end):
+                hair_lo, hair_hi = hair_band
+                for row in range(hair_lo, hair_hi):
                     # tick sin → signed [-128,127]; scale to ±3 px shift.
                     sin_s = tick_sin_signed(
                         tick_phase_idx(row * 0.06 + fi * 0.18))
@@ -1001,13 +1106,40 @@ class MotionEngine:
                     frame[row] = np.roll(frame[row], shift, axis=0)
 
             if intent.get("expressions"):
-                fy0, fy1 = int(H * 0.15), int(H * 0.40)
+                fy0, fy1 = face_band
                 # tick sin scaled to ±0.02 brightness factor.
                 sin_s = tick_sin_signed(tick_phase_idx(fi * 0.25))
                 brightness = 1.0 + (sin_s * 0.02) / 128.0
                 frame[fy0:fy1] = np.clip(
                     frame[fy0:fy1].astype(np.float32) * brightness,
                     0, 255).astype(np.uint8)
+
+            # Pose-cell motion rules: arm sway and cloth sway both run
+            # as bounded horizontal row rolls scaled by the cell's
+            # `amplitude`. They only fire when a pose cell matched the
+            # prompt — the deterministic fallback is just no extra
+            # motion (keeps every existing test deterministic).
+            if has_pose_motions:
+                for m in pose_motions:
+                    name = m.get("name", "")
+                    amp = float(m.get("amplitude", 0.0))
+                    freq = float(m.get("frequency", 0.12))
+                    if amp <= 0.0:
+                        continue
+                    if name == "arm_sway":
+                        rlo, rhi = arm_band
+                    elif name == "cloth_sway":
+                        rlo, rhi = cloth_band
+                    else:
+                        continue
+                    if rhi <= rlo:
+                        continue
+                    sin_s = tick_sin_signed(tick_phase_idx(fi * freq))
+                    shift = int(round(amp * sin_s / 128.0))
+                    if shift == 0:
+                        continue
+                    frame[rlo:rhi] = np.roll(
+                        frame[rlo:rhi], shift, axis=1)
 
             if has_petal:
                 for p in petals:
@@ -1132,7 +1264,9 @@ class SSSPipeline:
         self.memory = CEMemory(db_path)
         self.planner = Planner()
         self.generator = SculptGenerator(self.memory)
-        self.motion = MotionEngine()
+        # MotionEngine reads memory.pose_cells for prompt-matching
+        # dirty-row / motion hints when present.
+        self.motion = MotionEngine(memory=self.memory)
         self.evaluator = Evaluator()
         # SSS_MODEL_PATH points at a .sss file produced by
         # scripts/sss_train.py. When present, run() routes through the
