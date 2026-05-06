@@ -80,43 +80,46 @@ int sss_model_load(const char *path, SSSModel *out)
         if (read_u32(f, &c->type) || read_u32(f, &label_len)) {
             fclose(f); sss_model_free(out); return -6;
         }
-        if (label_len >= SSS_LABEL_MAX) {
-            /* Truncate label but still consume the bytes. */
-            char drop[256];
-            uint32_t to_keep = SSS_LABEL_MAX - 1;
-            if (fread(c->label, 1, to_keep, f) != to_keep) {
+
+        /* Read the full on-disk label into a heap buffer. We need
+         * every byte for the v8 ce_feed regeneration (truncating
+         * c->label to SSS_LABEL_MAX-1 would change the ce_key for
+         * long labels — feeding only the prefix gives a different
+         * morpheme link than the trainer used). c->label still gets
+         * the truncated NUL-terminated prefix for display. */
+        uint8_t *full_label = NULL;
+        if (label_len > 0) {
+            full_label = (uint8_t *)malloc(label_len);
+            if (!full_label) {
                 fclose(f); sss_model_free(out); return -7;
             }
-            c->label[to_keep] = '\0';
-            uint32_t rest = label_len - to_keep;
-            while (rest > 0) {
-                uint32_t chunk = rest > sizeof(drop) ? (uint32_t)sizeof(drop) : rest;
-                if (fread(drop, 1, chunk, f) != chunk) {
-                    fclose(f); sss_model_free(out); return -7;
-                }
-                rest -= chunk;
+            if (fread(full_label, 1, label_len, f) != label_len) {
+                free(full_label); fclose(f);
+                sss_model_free(out); return -7;
             }
-        } else {
-            if (label_len > 0 && fread(c->label, 1, label_len, f) != label_len) {
-                fclose(f); sss_model_free(out); return -7;
-            }
-            c->label[label_len] = '\0';
         }
+        uint32_t to_keep = (label_len < SSS_LABEL_MAX)
+                           ? label_len : (uint32_t)(SSS_LABEL_MAX - 1);
+        if (to_keep > 0) memcpy(c->label, full_label, to_keep);
+        c->label[to_keep] = '\0';
 
         /* v9 stores the ce_key explicitly; v8 files don't, so we
-         * regenerate it from the label via ce_feed — same morpheme,
-         * same ce_key, search key stays consistent across versions. */
+         * regenerate it from the full on-disk label bytes via
+         * ce_feed — same morpheme, same ce_key, search key stays
+         * consistent across versions even when the human-readable
+         * label was longer than SSS_LABEL_MAX. */
         if (is_v8) {
             ce_init(&c->ce_key);
-            uint32_t lbl_n = (uint32_t)strlen(c->label);
-            if (lbl_n > 0) {
-                ce_feed(&c->ce_key, (const uint8_t *)c->label, lbl_n);
+            if (label_len > 0) {
+                ce_feed(&c->ce_key, full_label, label_len);
             }
         } else {
             if (fread(ce_bytes(&c->ce_key), 1, 64, f) != 64) {
-                fclose(f); sss_model_free(out); return -8;
+                free(full_label); fclose(f);
+                sss_model_free(out); return -8;
             }
         }
+        free(full_label);
 
         if (read_floats(f, c->fp, SSS_FP_LEN)) {
             fclose(f); sss_model_free(out); return -8;

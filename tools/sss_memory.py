@@ -305,14 +305,13 @@ def ce_feed_bytes(text: str) -> bytes:
             "rebuild with `make pybridge` after pulling the latest C source")
     out = (ctypes.c_uint8 * 64)()
     data = text.encode("utf-8")
-    buf = (ctypes.c_uint8 * len(data)).from_buffer_copy(data) if data else None
+    # ctypes.c_char_p(data) pins the bytes object's buffer for the
+    # duration of the FFI call — no separate "keep-alive" copy needed.
     lib.sss_pybridge_ce_feed(
         ctypes.c_char_p(data),
         ctypes.c_uint32(len(data)),
         out,
     )
-    # Keep `buf` alive through the call.
-    del buf
     return bytes(out)
 
 

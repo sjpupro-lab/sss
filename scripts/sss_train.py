@@ -36,6 +36,7 @@ lock-step with ce_core/sss_rowvae.{h,c}.
 from __future__ import annotations
 
 import argparse
+import functools
 import math
 import os
 import struct
@@ -45,6 +46,19 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+
+# Wire `tools.sss_memory.ce_feed_bytes` (which routes to the C bridge)
+# once at import time. `python3 scripts/sss_train.py` puts `scripts/`
+# on sys.path[0]; we add the repo root so `from tools…` resolves.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+try:
+    from tools.sss_memory import ce_feed_bytes as _ce_feed_bytes_impl
+    _CE_BRIDGE_ERROR: str | None = None
+except Exception as _err:                    # noqa: BLE001 — keep raw msg
+    _ce_feed_bytes_impl = None               # type: ignore[assignment]
+    _CE_BRIDGE_ERROR = str(_err)
 
 SSS_MAGIC = 0x53535839       # "SSX9" — adds per-cell ce_key
 SSS_VERSION = 9
@@ -70,29 +84,27 @@ def fingerprint(text: str) -> np.ndarray:
     return fp
 
 
+@functools.lru_cache(maxsize=None)
 def ce_key_bytes(text: str) -> bytes:
     """Compute the 64-byte CEUnit ce_key for `text` via the C bridge.
     The trainer prefers the C function so the runtime's ce_distance
     search keys line up byte-for-byte with what the .sss file ships.
 
-    Falls back to a raw 64-byte zero block if libsss_pybridge.so isn't
-    available — older builds will still produce a loadable file (the
-    runtime's v8 path regenerates ce_key from the label on demand)."""
-    try:
-        # When invoked via `python3 scripts/sss_train.py`, sys.path[0]
-        # is `scripts/`, not the repo root, so `tools.sss_memory` is
-        # not importable until we add the parent dir.
-        import sys
-        repo_root = str(Path(__file__).resolve().parent.parent)
-        if repo_root not in sys.path:
-            sys.path.insert(0, repo_root)
-        from tools.sss_memory import ce_feed_bytes
-    except Exception:
-        return b"\x00" * 64
-    try:
-        return ce_feed_bytes(text)
-    except Exception:
-        return b"\x00" * 64
+    Memoised: each distinct token crosses the Python↔ctypes boundary
+    exactly once, even when many cells reference the same word.
+
+    Raises RuntimeError if libsss_pybridge.so isn't loadable. We
+    intentionally do NOT silently fall back to a 64-byte zero key —
+    that would write a v9 file whose ce_distance search returns
+    nonsense, producing models that look fine on disk but search
+    incorrectly at generate time. Rebuild with `make pybridge` and
+    retry."""
+    if _ce_feed_bytes_impl is None:
+        raise RuntimeError(
+            "tools.sss_memory.ce_feed_bytes is unreachable: "
+            f"{_CE_BRIDGE_ERROR}. Rebuild with `make pybridge` so the "
+            "trainer can derive each cell's ce_key from C ce_feed.")
+    return _ce_feed_bytes_impl(text)
 
 
 def load_image(path: Path, size: int) -> np.ndarray:
