@@ -14,6 +14,7 @@ import http.server
 import json
 import os
 import sys
+import tempfile
 import threading
 import traceback
 from pathlib import Path
@@ -166,6 +167,96 @@ def _run_upgrade(cycles: int):
     return unified.run_upgrade_loop(int(cycles))
 
 
+# ── ingest plumbing ──────────────────────────────────────────
+INGEST_MAX_BYTES = 50 * 1024 * 1024     # 50 MB hard cap
+
+
+class _BadRequest(ValueError):
+    """Client sent a malformed request — translate to HTTP 400."""
+
+
+class _PayloadTooLarge(ValueError):
+    """Body exceeds the configured cap — translate to HTTP 413."""
+
+
+def _parse_multipart(handler, max_size: int = INGEST_MAX_BYTES):
+    """Stdlib-only multipart/form-data parser. Returns a list of
+    (field_name, filename, bytes) for every part that carries a file.
+    Avoids `cgi.FieldStorage` (deprecated in 3.13).
+
+    Splits on the CRLF-anchored boundary `\\r\\n--<boundary>`, not on
+    a bare `--<boundary>`, so the literal byte sequence appearing
+    inside an uploaded binary can't truncate the file.
+    """
+    ct = handler.headers.get("Content-Type", "")
+    if not ct.lower().startswith("multipart/form-data"):
+        raise _BadRequest("Content-Type must be multipart/form-data")
+    # Pull the boundary out of the Content-Type header.
+    boundary = None
+    for token in ct.split(";"):
+        token = token.strip()
+        if token.lower().startswith("boundary="):
+            boundary = token.split("=", 1)[1].strip().strip('"')
+            break
+    if not boundary:
+        raise _BadRequest("multipart: missing boundary")
+
+    length = int(handler.headers.get("Content-Length", "0") or "0")
+    if length <= 0:
+        raise _BadRequest("multipart: empty body")
+    if length > max_size:
+        raise _PayloadTooLarge(
+            f"upload too large ({length} bytes; max {max_size})")
+    body = handler.rfile.read(length)
+
+    # RFC 7578: every boundary line is preceded by CRLF except the very
+    # first one (which sits at byte 0). Prepend CRLF so all delimiters
+    # share the same shape, then split on the canonical \r\n--boundary.
+    delim = b"\r\n--" + boundary.encode("ascii")
+    parts = (b"\r\n" + body).split(delim)
+
+    files = []
+    # parts[0] is the preamble (typically empty), discard.
+    for chunk in parts[1:]:
+        if chunk.startswith(b"--"):
+            break                         # closing delimiter --boundary--
+        if not chunk.startswith(b"\r\n"):
+            continue                      # malformed; skip
+        chunk = chunk[2:]                 # strip the leading CRLF
+        sep = chunk.find(b"\r\n\r\n")
+        if sep < 0:
+            continue
+        hdr_block = chunk[:sep].decode("latin-1", errors="replace")
+        # Split consumed the trailing \r\n that separates the body from
+        # the next boundary, so `data` is exact — no further trimming.
+        data = chunk[sep + 4:]
+
+        # We only care about parts with a `filename=` (i.e. real files).
+        name = None; filename = None
+        for line in hdr_block.split("\r\n"):
+            if not line.lower().startswith("content-disposition:"):
+                continue
+            for piece in line.split(";"):
+                piece = piece.strip()
+                if piece.startswith("name="):
+                    name = piece[5:].strip().strip('"')
+                elif piece.startswith("filename="):
+                    filename = piece[9:].strip().strip('"')
+        if filename:
+            files.append((name, filename, data))
+    return files
+
+
+def _run_ingest(filepath: str, filename: str):
+    """Drive tools.sss_ingest against the lazily-seeded global pipeline's
+    memory. Acquired under _PIPELINE_LOCK by the caller."""
+    unified = _get_pipeline_module()
+    pipeline = unified._get_pipeline()    # ensures foundation seed
+    from tools import sss_ingest
+    return sss_ingest.ingest_file(filepath, pipeline.memory,
+                                  filename=filename)
+
+
 def _normalize_result(result):
     """Make UI payload from whatever tools.sss_unified returns."""
     image = None
@@ -256,6 +347,59 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 with _PIPELINE_LOCK:
                     report = _run_upgrade(cycles)
                 _json(self, {"ok": True, "cycles": cycles, "report": report})
+            except Exception as e:
+                _json(self, {
+                    "ok": False,
+                    "error": str(e),
+                    "trace": traceback.format_exc().splitlines()[-12:],
+                }, 500)
+            return
+        if path == "/api/ingest":
+            try:
+                files = _parse_multipart(self)
+                if not files:
+                    raise _BadRequest("no file part in upload")
+                # We accept multiple files in one POST but the UI sends
+                # one per request, so this loop usually has length 1.
+                results = []
+                for _name, filename, data in files:
+                    # Persist to a temp path so ingest can use ffmpeg/path-
+                    # based decoders unchanged. Clean up after.
+                    suffix = os.path.splitext(filename)[1] or ".bin"
+                    fd, tmp_path = tempfile.mkstemp(suffix=suffix,
+                                                   prefix="sss_ingest_")
+                    try:
+                        with os.fdopen(fd, "wb") as fp:
+                            fp.write(data)
+                        with _PIPELINE_LOCK:
+                            summary = _run_ingest(tmp_path, filename)
+                        results.append({
+                            "ok": True,
+                            "filename": filename,
+                            "bytes": len(data),
+                            "result": summary,
+                        })
+                    except Exception as e:
+                        results.append({
+                            "ok": False,
+                            "filename": filename,
+                            "error": str(e),
+                        })
+                    finally:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                # If a single file was sent, flatten the response so the
+                # UI can read `result` / `error` directly.
+                if len(results) == 1:
+                    _json(self, {**results[0]})
+                else:
+                    _json(self, {"ok": True, "files": results})
+            except _PayloadTooLarge as e:
+                _json(self, {"ok": False, "error": str(e)}, 413)
+            except _BadRequest as e:
+                _json(self, {"ok": False, "error": str(e)}, 400)
             except Exception as e:
                 _json(self, {
                     "ok": False,

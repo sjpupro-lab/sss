@@ -1,0 +1,129 @@
+"""Smoke test for tools/sss_ingest.
+
+Covers:
+  - extension routing (image / text / video / unknown)
+  - per-type summary shape and counts
+  - PNG and PPM image branches (sss_image_io)
+  - UTF-8 text + latin-1 fallback
+  - memory grows monotonically
+  - resize endpoint mapping (corners hit corners)
+  - video branch only when ffmpeg is on PATH
+
+Run:
+    python3 tools/test_sss_ingest.py
+"""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def main() -> int:
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["SSS_UNIFIED_DIR"] = tmp
+        from tools.sss_unified import SSSPipeline
+        from tools.sss_ingest import ingest_file, _resize_nn
+        from tools.sss_image_io import write_png, write_ppm
+
+        # _resize_nn endpoint check: corners of source map to corners
+        # of target after the linspace fix.
+        src = np.arange(255 * 255, dtype=np.uint8).reshape(255, 255)
+        out = _resize_nn(src, 256, 256)
+        assert out[0, 0] == src[0, 0], "top-left corner lost"
+        assert out[-1, -1] == src[-1, -1], "bottom-right corner lost"
+        print("OK  resize    : endpoints preserved (255→256 round-trip)")
+
+        pipe = SSSPipeline(db_path=os.path.join(tmp, "mem"))
+        pipe.seed_foundation()
+        baseline = pipe.memory.total_cells()
+        assert baseline > 0
+        print(f"OK  seed      : {baseline} cells")
+
+        # ── PNG image ────────────────────────────────────
+        img = np.zeros((96, 128, 3), np.uint8)
+        img[:, :64] = (50, 50, 210)
+        img[:, 64:] = (50, 170, 50)
+        png_path = os.path.join(tmp, "img.png"); write_png(png_path, img)
+        before = pipe.memory.total_cells()
+        s = ingest_file(png_path, pipe.memory)
+        assert s["type"] == "image"
+        assert s["cells_added"] == 5
+        assert set(s["blocks"]) == {"hair", "face", "upper", "lower", "bg"}
+        assert pipe.memory.total_cells() == before + 5
+        print(f"OK  png       : +{s['cells_added']} cells, blocks={list(s['blocks'])}")
+
+        # ── PPM image ────────────────────────────────────
+        ppm_path = os.path.join(tmp, "img.ppm"); write_ppm(ppm_path, img)
+        before = pipe.memory.total_cells()
+        s = ingest_file(ppm_path, pipe.memory)
+        assert s["type"] == "image" and s["cells_added"] == 5
+        assert pipe.memory.total_cells() == before + 5
+        print(f"OK  ppm       : +{s['cells_added']} cells")
+
+        # ── UTF-8 text ───────────────────────────────────
+        txt = os.path.join(tmp, "note.txt")
+        with open(txt, "w", encoding="utf-8") as f:
+            f.write("first line\n빨간 캐릭터\n" + ("a" * 300) + "\n")
+        before = pipe.memory.total_cells()
+        s = ingest_file(txt, pipe.memory)
+        assert s["type"] == "text"
+        assert s["lines"] == 3
+        # first line + korean line + long line split into 2 chunks (300 ASCII bytes).
+        assert s["cells_added"] == 4, s
+        assert pipe.memory.total_cells() == before + 4
+        print(f"OK  txt utf-8 : +{s['cells_added']} cells, lines={s['lines']}")
+
+        # ── latin-1 fallback ────────────────────────────
+        bad = os.path.join(tmp, "bad.txt")
+        with open(bad, "wb") as f:
+            f.write(b"plain\n\xe9\xe9\xe9 not utf8 \xff\n")
+        s = ingest_file(bad, pipe.memory)
+        assert s["type"] == "text"
+        print(f"OK  txt latin1: +{s['cells_added']} cells")
+
+        # ── unknown extension raises ─────────────────────
+        unk = os.path.join(tmp, "x.bin")
+        open(unk, "wb").write(b"\x00")
+        try:
+            ingest_file(unk, pipe.memory)
+        except ValueError as e:
+            print(f"OK  unknown   : raised '{e}'")
+        else:
+            print("FAIL: unknown extension did not raise")
+            return 1
+
+        # ── video (only if ffmpeg available) ─────────────
+        if shutil.which("ffmpeg"):
+            vid = os.path.join(tmp, "test.mp4")
+            cp = subprocess.run([
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "lavfi",
+                "-i", "testsrc=duration=1:size=64x64:rate=12",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", vid
+            ], capture_output=True)
+            if cp.returncode == 0:
+                before = pipe.memory.total_cells()
+                s = ingest_file(vid, pipe.memory)
+                assert s["type"] == "video"
+                assert s["frames_processed"] >= 1
+                assert s["cells_added"] >= 5
+                assert pipe.memory.total_cells() > before
+                print(f"OK  video     : frames={s['frames_processed']}, "
+                      f"+{s['cells_added']} cells")
+            else:
+                tail = cp.stderr.decode("utf-8", errors="replace")[-160:]
+                print(f"SKIP video    : ffmpeg lavfi failed: {tail.strip()}")
+        else:
+            print("SKIP video    : ffmpeg not in PATH")
+
+        print("PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
