@@ -1,16 +1,27 @@
 # ce_core — CE Cell deterministic generation engine.
 CC      = gcc
-CFLAGS  = -Wall -Wextra -O2 -std=c11
+# -I../legacy keeps ce_gen.h reachable for the legacy gen tests
+# (test_pipeline / test_stress_10k / test_gen) after ce_gen.{c,h}
+# moved out of ce_core.
+CFLAGS  = -Wall -Wextra -O2 -I../legacy -std=c11
 LDFLAGS = -lm
 
-# Engine sources (no external deps).
+LEGACY_DIR = ../legacy
+
+# Engine sources (no external deps). ce_gen is no longer the main path
+# (sss_rowvae replaced it); see LEGACY_SRCS below for its build rule.
 SRCS = ce_core.c ce_storage.c ce_search.c ce_engine.c \
-       ce_denoise.c ce_decode.c ce_extend.c ce_gen.c \
+       ce_denoise.c ce_decode.c ce_extend.c \
        ce_storage_io.c ce_feed_image.c ce_image_wave_refine.c \
        slig_signal.c slig_material_harmonic.c \
        slig_pipeline.c slig_codebook.c slig_tick_math.c \
        ce_hybrid_vae.c ce_masked_train.c \
        ce_residual_codebook.c
+
+# legacy — replaced by sss_rowvae. Kept buildable so test_gen /
+# test_pipeline / test_stress_10k still link.
+LEGACY_SRCS = $(LEGACY_DIR)/ce_gen.c
+LEGACY_OBJS = $(LEGACY_SRCS:.c=.o)
 
 # Ingest unit pulls in stb_image.h (vendored, public domain). We compile
 # it with reduced warnings — stb_image is third-party and contains many
@@ -19,7 +30,7 @@ INGEST_SRC = ce_ingest.c
 INGEST_OBJ = ce_ingest.o
 INGEST_CFLAGS = -Wall -O2 -std=c11 -Wno-unused-parameter -Wno-unused-but-set-variable
 
-OBJS = $(SRCS:.c=.o) $(INGEST_OBJ)
+OBJS = $(SRCS:.c=.o) $(LEGACY_OBJS) $(INGEST_OBJ)
 
 BUILD_DIR = build
 
@@ -57,6 +68,11 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 %.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# legacy/*.c → legacy/*.o (kept beside their source; explicit rule so
+# the implicit %.o: %.c pattern doesn't try to drop them in ce_core/).
+$(LEGACY_DIR)/%.o: $(LEGACY_DIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # stb_image lives inside ce_ingest.c — relax warnings just for that TU.
@@ -145,4 +161,4 @@ test: all
 	@echo "=== ALL TESTS PASSED ==="
 
 clean:
-	rm -rf $(BUILD_DIR) $(OBJS)
+	rm -rf $(BUILD_DIR) $(OBJS) $(LEGACY_OBJS)

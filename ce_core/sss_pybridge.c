@@ -4,6 +4,7 @@
 #include "ce_storage.h"
 #include "ce_storage_io.h"
 #include "ce_type.h"
+#include "sss_rowvae.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -161,4 +162,72 @@ int sss_memory_get_keyframe(const sss_memory *m,
     if (idx < 0) return 0;
     memcpy(out, ce_cbytes(&m->storage.entries[idx].keyframe), 64);
     return 1;
+}
+
+/* ── sss_rowvae thin wrapper for ctypes. Returns 0 on success, -1 on
+ * any failure. Output is uint8 RGB packed (out_w * out_h * 3); if the
+ * model's size differs from out_w/out_h, the float image is resampled
+ * with nearest-neighbour mapping that hits both endpoints. */
+static unsigned char clamp_u8_pf(float v) {
+    if (v <= 0.0f) return 0;
+    if (v >= 1.0f) return 255;
+    return (unsigned char)(v * 255.0f + 0.5f);
+}
+
+int sss_pybridge_generate(const char *model_path,
+                          const char *prompt,
+                          uint32_t    seed,
+                          float       detail,
+                          int         steps,
+                          uint8_t    *out_rgb,
+                          uint32_t    out_w,
+                          uint32_t    out_h) {
+    if (!model_path || !prompt || !out_rgb || out_w == 0 || out_h == 0)
+        return -1;
+
+    SSSModel model;
+    memset(&model, 0, sizeof(model));
+    if (sss_model_load(model_path, &model) != 0) return -1;
+
+    SSSImage img;
+    memset(&img, 0, sizeof(img));
+    int rc = sss_generate(&model, prompt, seed, detail, steps, &img);
+    if (rc != 0) {
+        sss_image_free(&img);
+        sss_model_free(&model);
+        return -1;
+    }
+
+    /* Resample if requested size differs from model size. Using
+     * linspace-style endpoint mapping so the corners of the source
+     * map to the corners of the output. */
+    int sH = img.height, sW = img.width;
+    if ((uint32_t)sH == out_h && (uint32_t)sW == out_w) {
+        size_t n = (size_t)sH * (size_t)sW;
+        for (size_t i = 0; i < n; ++i) {
+            out_rgb[i * 3 + 0] = clamp_u8_pf(img.data[i * 3 + 0]);
+            out_rgb[i * 3 + 1] = clamp_u8_pf(img.data[i * 3 + 1]);
+            out_rgb[i * 3 + 2] = clamp_u8_pf(img.data[i * 3 + 2]);
+        }
+    } else {
+        for (uint32_t y = 0; y < out_h; ++y) {
+            uint32_t sy = (out_h <= 1) ? 0
+                : (uint32_t)((double)y * (sH - 1) / (out_h - 1) + 0.5);
+            if (sy >= (uint32_t)sH) sy = sH - 1;
+            for (uint32_t x = 0; x < out_w; ++x) {
+                uint32_t sx = (out_w <= 1) ? 0
+                    : (uint32_t)((double)x * (sW - 1) / (out_w - 1) + 0.5);
+                if (sx >= (uint32_t)sW) sx = sW - 1;
+                size_t spi = (size_t)sy * sW + sx;
+                size_t dpi = (size_t)y  * out_w + x;
+                out_rgb[dpi * 3 + 0] = clamp_u8_pf(img.data[spi * 3 + 0]);
+                out_rgb[dpi * 3 + 1] = clamp_u8_pf(img.data[spi * 3 + 1]);
+                out_rgb[dpi * 3 + 2] = clamp_u8_pf(img.data[spi * 3 + 2]);
+            }
+        }
+    }
+
+    sss_image_free(&img);
+    sss_model_free(&model);
+    return 0;
 }

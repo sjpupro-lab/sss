@@ -1,5 +1,8 @@
 CC      = gcc
-CFLAGS  = -Wall -Wextra -O2 -Iinclude -Ice_core -std=c11
+# -Ilegacy keeps the legacy ce_gen.h reachable for tools/gen_image_ce.c
+# and tests/test_gen_routed.c — both still build, but ce_gen is no
+# longer the main path (rowvae replaced it, see LEGACY_DIR below).
+CFLAGS  = -Wall -Wextra -O2 -Iinclude -Ice_core -Ilegacy -std=c11
 LDFLAGS = -lm
 
 SRC_DIR     = src
@@ -7,6 +10,7 @@ INC_DIR     = include
 TEST_DIR    = tests
 BUILD_DIR   = build
 CE_CORE_DIR = ce_core
+LEGACY_DIR  = legacy
 
 SRCS = $(SRC_DIR)/spatial_grid.c \
        $(SRC_DIR)/spatial_morpheme.c \
@@ -33,7 +37,6 @@ CE_CORE_SRCS = $(CE_CORE_DIR)/ce_core.c \
                $(CE_CORE_DIR)/ce_denoise.c \
                $(CE_CORE_DIR)/ce_decode.c \
                $(CE_CORE_DIR)/ce_extend.c \
-               $(CE_CORE_DIR)/ce_gen.c \
                $(CE_CORE_DIR)/ce_storage_io.c \
                $(CE_CORE_DIR)/ce_feed_image.c \
                $(CE_CORE_DIR)/ce_image_wave_refine.c \
@@ -51,7 +54,13 @@ CE_CORE_SRCS = $(CE_CORE_DIR)/ce_core.c \
 
 CE_CORE_OBJS = $(patsubst $(CE_CORE_DIR)/%.c,$(BUILD_DIR)/ce_core_%.o,$(CE_CORE_SRCS))
 
-OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS)) $(CE_CORE_OBJS)
+# Legacy sources — ce_gen was the original cell-stamp generator. It
+# is preserved for backward compatibility with gen_image_ce / the
+# test_gen_routed test, but sss_rowvae (sss_gen) is the main path now.
+LEGACY_SRCS = $(LEGACY_DIR)/ce_gen.c
+LEGACY_OBJS = $(patsubst $(LEGACY_DIR)/%.c,$(BUILD_DIR)/legacy_%.o,$(LEGACY_SRCS))
+
+OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS)) $(CE_CORE_OBJS) $(LEGACY_OBJS)
 
 TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_recluster test_refine test_image_roundtrip test_image_gen test_tick_math test_material test_gen_routed
 
@@ -70,6 +79,12 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 # with anything in src/. Includes both -Iinclude and -Ice_core so cross-
 # module references compile cleanly.
 $(BUILD_DIR)/ce_core_%.o: $(CE_CORE_DIR)/%.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Legacy objects (legacy_NAME.o). Same isolation pattern as ce_core_:
+# kept reachable for gen_image_ce and test_gen_routed but tagged so
+# nothing accidentally pulls ce_gen into the new sss_rowvae path.
+$(BUILD_DIR)/legacy_%.o: $(LEGACY_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Test targets
@@ -160,10 +175,13 @@ $(BUILD_DIR)/grid2img: tools/grid2img.c $(OBJS) | $(BUILD_DIR)
 $(BUILD_DIR)/train_images_ce: tools/train_images_ce.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
+# legacy — replaced by sss_gen (sss_rowvae engine, below).
+# Kept buildable for reproducibility of older runs; new code paths use
+# sss_gen / scripts/sss_train.py / tools.sss_unified.
 $(BUILD_DIR)/gen_image_ce: tools/gen_image_ce.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
-# Spectrogram-based image generator (sss_rowvae engine).
+# Spectrogram-based image generator (sss_rowvae engine). MAIN PATH.
 $(BUILD_DIR)/sss_gen: tools/sss_gen.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
@@ -198,6 +216,8 @@ wave_debug: $(BUILD_DIR)/wave_debug
 	@echo "  ./build/wave_debug beam.ppm   --dir 7 --sigma 8000 --tick 40"
 	@echo "  ./build/wave_debug horiz.ppm  --dir 0 --sigma 4000"
 
+# demo_tools still bundles gen_image_ce (legacy) for backward
+# compatibility. New work should target sss_gen via scripts/sss_train.py.
 demo_tools: $(BUILD_DIR)/make_demo_dataset $(BUILD_DIR)/train_demo $(BUILD_DIR)/gen_image_ce $(BUILD_DIR)/verify_hybrid
 	@echo "Built demo tools. Pipeline:"
 	@echo "  ./build/make_demo_dataset data/demo"
@@ -208,8 +228,10 @@ train_images_ce: $(BUILD_DIR)/train_images_ce
 	@echo "Built train_images_ce. Example:"
 	@echo "  ./build/train_images_ce build/models/demo  data/img/*.ppm"
 
+# legacy — replaced by sss_rowvae. See sss_gen target above for the
+# main path. This target stays so older datasets/scripts keep working.
 gen_image_ce: $(BUILD_DIR)/gen_image_ce
-	@echo "Built gen_image_ce. Example:"
+	@echo "Built gen_image_ce (legacy — sss_gen is the main path now)."
 	@echo "  ./build/gen_image_ce build/synth/demo.ces \"red apple\" out.ppm 0 50 200"
 
 image_tools: $(BUILD_DIR)/img2grid $(BUILD_DIR)/grid2img

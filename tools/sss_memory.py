@@ -97,6 +97,19 @@ def _load_lib():
     ]
     lib.sss_memory_get_keyframe.restype = ctypes.c_int
 
+    # sss_rowvae generate (added in step 4 of the radio-tuning patch).
+    # Older builds of libsss_pybridge.so don't carry this symbol — the
+    # ctypes bind is wrapped in try/except so the library still loads
+    # for callers that only need the storage bridge.
+    if hasattr(lib, "sss_pybridge_generate"):
+        lib.sss_pybridge_generate.argtypes = [
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32,
+            ctypes.c_float, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_uint32, ctypes.c_uint32,
+        ]
+        lib.sss_pybridge_generate.restype = ctypes.c_int
+
     return lib
 
 
@@ -260,3 +273,38 @@ class CEMemory:
             self._handle, self.canvas_id, _slot_for(block_name),
             int(block_idx), out)
         return bytes(out) if ok else None
+
+
+def sss_generate(model_path: str, prompt: str, *,
+                 seed: int = 1, detail: float = 1.0,
+                 steps: int = 24, size: int = 64) -> "np.ndarray":
+    """Run the C sss_rowvae generator and return the result as a uint8
+    BGR ndarray (H, W, 3). Wrapper around `sss_pybridge_generate`.
+
+    Raises:
+        RuntimeError if the loaded libsss_pybridge.so doesn't carry the
+                     sss_pybridge_generate symbol (older build), if the
+                     model can't be loaded, or generation fails.
+    """
+    lib = _lib()
+    if not hasattr(lib, "sss_pybridge_generate"):
+        raise RuntimeError(
+            "libsss_pybridge.so is missing sss_pybridge_generate; "
+            "rebuild with `make pybridge` after pulling the latest C source")
+
+    H = W = int(size)
+    buf = (ctypes.c_uint8 * (H * W * 3))()
+    rc = lib.sss_pybridge_generate(
+        model_path.encode("utf-8"),
+        prompt.encode("utf-8"),
+        ctypes.c_uint32(int(seed) & 0xFFFFFFFF),
+        ctypes.c_float(float(detail)),
+        ctypes.c_int(int(steps)),
+        buf, ctypes.c_uint32(W), ctypes.c_uint32(H),
+    )
+    if rc != 0:
+        raise RuntimeError(
+            f"sss_pybridge_generate failed (rc={rc}, model={model_path!r})")
+    rgb = np.frombuffer(buf, dtype=np.uint8).reshape(H, W, 3)
+    # Match the rest of SSS: arrays are BGR.
+    return np.ascontiguousarray(rgb[..., ::-1])

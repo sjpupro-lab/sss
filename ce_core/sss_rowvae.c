@@ -235,6 +235,11 @@ static int tokenise(const char *prompt, char **tokens, int *out_count)
     return 0;
 }
 
+/* Single-best matcher across the whole token set. Kept for backward
+ * compatibility — the new path uses find_cells_per_token below, which
+ * returns one cell per token so a multi-word prompt like "red blue"
+ * can place both colours instead of collapsing to one. */
+__attribute__((unused))
 static int best_cell_for_type(const SSSModel *m,
                               uint32_t type,
                               char **tokens, int n)
@@ -252,6 +257,93 @@ static int best_cell_for_type(const SSSModel *m,
     }
     if (best >= 0 && best_d > 1.2f) return -1;
     return best;
+}
+
+/* For each token, find the closest cell of `type`. Threshold 1.2f is
+ * the same cut best_cell_for_type uses. When multiple cells share the
+ * minimum distance (the trainer's 2-column format keeps one cell per
+ * (image, word) with identical fp), one is picked deterministically
+ * from the seed — passing a different seed shuffles the choice across
+ * the tied set, which is the spec's "quality-based probabilistic
+ * selection" approximated as uniform sampling for now. Duplicates
+ * across tokens are dropped. Returns count written into out_indices. */
+static int find_cells_per_token(const SSSModel *m, uint32_t type,
+                                char **tokens, int ntok,
+                                int *out_indices, int max_out,
+                                uint32_t seed)
+{
+    enum { TIE_BUF = 64 };
+    const float TIE_EPS = 1e-4f;
+    int n_out = 0;
+    for (int ti = 0; ti < ntok && n_out < max_out; ++ti) {
+        float fp[SSS_FP_LEN];
+        sss_fingerprint(tokens[ti], fp);
+        float best_d = 1e30f;
+        for (uint32_t j = 0; j < m->num_cells; ++j) {
+            if (m->cells[j].type != type) continue;
+            float d = fp_distance(fp, m->cells[j].fp);
+            if (d < best_d) best_d = d;
+        }
+        if (best_d > 1.2f) continue;
+        int tied[TIE_BUF]; int n_tied = 0;
+        for (uint32_t j = 0; j < m->num_cells && n_tied < TIE_BUF; ++j) {
+            if (m->cells[j].type != type) continue;
+            float d = fp_distance(fp, m->cells[j].fp);
+            if (d <= best_d + TIE_EPS) tied[n_tied++] = (int)j;
+        }
+        if (n_tied <= 0) continue;
+        uint32_t pick = (n_tied > 1)
+            ? ((seed + (uint32_t)ti * 0x9E3779B9u) % (uint32_t)n_tied)
+            : 0u;
+        int chosen = tied[pick];
+        int dup = 0;
+        for (int k = 0; k < n_out; ++k) {
+            if (out_indices[k] == chosen) { dup = 1; break; }
+        }
+        if (!dup) out_indices[n_out++] = chosen;
+    }
+    return n_out;
+}
+
+/* Pick the region cell for a given axis position. When `n` ≥ 2 and
+ * `axis_pos` is within ±fade_pixels of a region boundary, also returns
+ * the next region's cell and the fade weight `t ∈ [0, 1]`. t=0 means
+ * fully `out_a`, t=1 fully `out_b`. */
+static void pick_region_cell(const SSSModel *m, const int *indices, int n,
+                             int axis_pos, int axis_extent, int fade_pixels,
+                             const SSSCell **out_a,
+                             const SSSCell **out_b,
+                             float *out_t)
+{
+    *out_a = NULL; *out_b = NULL; *out_t = 0.0f;
+    if (n <= 0 || axis_extent <= 0) return;
+    int region = (axis_pos * n) / axis_extent;
+    if (region < 0) region = 0;
+    if (region >= n) region = n - 1;
+    *out_a = &m->cells[indices[region]];
+    if (region + 1 < n && fade_pixels > 0) {
+        int boundary = ((region + 1) * axis_extent) / n;
+        if (axis_pos >= boundary - fade_pixels &&
+            axis_pos <= boundary + fade_pixels) {
+            *out_b = &m->cells[indices[region + 1]];
+            float t = (float)(axis_pos - (boundary - fade_pixels))
+                    / (float)(2 * fade_pixels);
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+            *out_t = t;
+        }
+    }
+}
+
+/* Shortest-arc phase blend. Converts each phase to (cos, sin), linearly
+ * mixes, then atan2 back — handles the ±π wrap automatically. */
+static float blend_phase(float pa, float pb, float t)
+{
+    float ca = cosf(pa), sa = sinf(pa);
+    float cb = cosf(pb), sb = sinf(pb);
+    float cm = ca * (1.0f - t) + cb * t;
+    float sm = sa * (1.0f - t) + sb * t;
+    return atan2f(sm, cm);
 }
 
 /* ── Iterative generation ─────────────────────────────────────
@@ -285,12 +377,27 @@ int sss_generate(const SSSModel *m,
     int ntok = 0;
     if (tokenise(prompt, tokens, &ntok) != 0) return -3;
 
-    int ic  = best_cell_for_type(m, SSS_CE_COLOR, tokens, ntok);
-    int is  = best_cell_for_type(m, SSS_CE_SHAPE, tokens, ntok);
-    int ifc = best_cell_for_type(m, SSS_CE_FACE,  tokens, ntok);
-    const SSSCell *cc = (ic  >= 0) ? &m->cells[ic]  : NULL;
-    const SSSCell *cs = (is  >= 0) ? &m->cells[is]  : NULL;
-    const SSSCell *cf = (ifc >= 0) ? &m->cells[ifc] : NULL;
+    /* One cell per token. "red blue" → both red AND blue cells; the
+     * sculpt loop below partitions rows/columns between them and
+     * fades across the band boundaries. */
+    int color_indices[MAX_TOKENS];
+    int shape_indices[MAX_TOKENS];
+    int face_indices[MAX_TOKENS];
+    /* Seed feeds into tie-breaking when same-fp cells exist (multiple
+     * training images per word in the 2-column labels.tsv format). */
+    uint32_t pick_seed = seed ? seed : 0xC0FFEE11u;
+    int n_colors = find_cells_per_token(m, SSS_CE_COLOR, tokens, ntok,
+                                        color_indices, MAX_TOKENS,
+                                        pick_seed);
+    int n_shapes = find_cells_per_token(m, SSS_CE_SHAPE, tokens, ntok,
+                                        shape_indices, MAX_TOKENS,
+                                        pick_seed ^ 0xA5A5A5A5u);
+    int n_faces  = find_cells_per_token(m, SSS_CE_FACE,  tokens, ntok,
+                                        face_indices,  MAX_TOKENS,
+                                        pick_seed ^ 0x5A5A5A5Au);
+    /* Fade band across region boundaries (rows / columns). 2 means a
+     * 5-row transition centred on the boundary. */
+    const int FADE_PIXELS = 2;
 
     if (sss_image_alloc(out, H, W) != 0) {
         for (int i = 0; i < ntok; ++i) free(tokens[i]);
@@ -298,13 +405,9 @@ int sss_generate(const SSSModel *m,
     }
     size_t HW = (size_t)H * (size_t)W;
 
-    /* Initial noise around mid-gray. */
+    /* Workspaces. Allocated up-front because the spectral-noise
+     * initialiser below also needs row_amp / row_phase / row_out. */
     uint32_t rng = seed ? seed : 0xC0FFEE11u;
-    for (size_t i = 0; i < HW * 3; ++i) {
-        out->data[i] = 0.5f + 0.20f * rng_uniform(&rng);
-    }
-
-    /* Workspaces. */
     float *row_in    = (float *)malloc((size_t)W  * sizeof(float));
     float *row_amp   = (float *)malloc((size_t)NF * sizeof(float));
     float *row_phase = (float *)malloc((size_t)NF * sizeof(float));
@@ -326,13 +429,62 @@ int sss_generate(const SSSModel *m,
         return -5;
     }
 
+    /* Spectral noise init — "radio static". Build each row of each
+     * channel as the inverse-FFT of random amp + random phase, instead
+     * of dropping uniform noise on top of mid-gray. The sculpt loop
+     * below then tunes that noise toward the cell targets the way you
+     * tune a radio dial — small amp/phase nudges per pass.
+     *
+     * rng_uniform returns [-1, 1); we map it into [0, 0.3) for amp and
+     * [-π, π) for phase to match the natural FFT ranges. */
+    for (int r = 0; r < H; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            for (int k = 0; k < NF; ++k) {
+                row_amp[k]   = 0.3f * 0.5f * (rng_uniform(&rng) + 1.0f);
+                row_phase[k] = (float)M_PI * rng_uniform(&rng);
+            }
+            sss_irfft(row_amp, row_phase, NF, W, row_out);
+            for (int x = 0; x < W; ++x)
+                out->data[((size_t)r * W + x) * 3 + c] = row_out[x];
+        }
+    }
+    /* Bring it back into the displayable [0, 1] band before sculpting. */
+    for (size_t i = 0; i < HW * 3; ++i) {
+        if (out->data[i] < 0.0f) out->data[i] = 0.0f;
+        else if (out->data[i] > 1.0f) out->data[i] = 1.0f;
+    }
+
+    /* Phase is only blended when the cell carries one matching its
+     * amp shape. Trainers that drop phase leave row_phase / col_phase
+     * to evolve naturally (matches the pre-tuning behaviour). The
+     * inline cell_has_phase macro below is reused for every region
+     * cell picked per row / column. */
+    #define CELL_HAS_PHASE(c) ((c) && (c)->phase \
+                            && (c)->phase_len == (c)->amp_len)
+
     for (int step = 0; step < steps; ++step) {
         /* Cooling schedule: pull hard at the start, just nudge later. */
         float t = (steps > 1) ? (float)step / (float)(steps - 1) : 0.0f;
-        float alpha = 0.95f - 0.65f * t;
+        float alpha       = 0.95f - 0.65f * t;
+        float phase_alpha = alpha * 0.5f;     /* phase tunes more slowly */
 
-        /* ── Y projection: row FFT, blend amps toward COLOR/FACE ── */
+        /* ── Y projection: row FFT, blend amp + phase toward COLOR/FACE ──
+         * Each row picks its own COLOR / FACE cell from the per-token
+         * list (via row index → region). Within FADE_PIXELS of a region
+         * boundary, the row is a weighted blend of the two adjacent
+         * cells so transitions don't show as a hard seam. */
         for (int r = 0; r < H; ++r) {
+            const SSSCell *cc_a, *cc_b; float cc_t;
+            const SSSCell *cf_a, *cf_b; float cf_t;
+            pick_region_cell(m, color_indices, n_colors,
+                             r, H, FADE_PIXELS, &cc_a, &cc_b, &cc_t);
+            pick_region_cell(m, face_indices,  n_faces,
+                             r, H, FADE_PIXELS, &cf_a, &cf_b, &cf_t);
+            int cc_a_phase = CELL_HAS_PHASE(cc_a);
+            int cc_b_phase = CELL_HAS_PHASE(cc_b);
+            int cf_a_phase = CELL_HAS_PHASE(cf_a);
+            int cf_b_phase = CELL_HAS_PHASE(cf_b);
+
             for (int c = 0; c < 3; ++c) {
                 for (int x = 0; x < W; ++x) {
                     row_in[x] = out->data[((size_t)r * W + x) * 3 + c];
@@ -340,11 +492,31 @@ int sss_generate(const SSSModel *m,
                 sss_rfft(row_in, W, row_amp, row_phase);
 
                 for (int k = 0; k < NF; ++k) {
-                    float target;
+                    float target_amp   = row_amp[k];
+                    float target_phase = row_phase[k];
+                    int   has_target_phase = 0;
                     if (k < NF_LOW) {
-                        target = cc
-                            ? cc->amp[((size_t)r * NF_LOW + k) * 3 + c]
-                            : row_amp[k];
+                        if (cc_a) {
+                            size_t idx = ((size_t)r * NF_LOW + k) * 3 + c;
+                            float amp_a = cc_a->amp[idx];
+                            if (cc_b) {
+                                float amp_b = cc_b->amp[idx];
+                                target_amp = amp_a * (1.0f - cc_t)
+                                           + amp_b * cc_t;
+                            } else {
+                                target_amp = amp_a;
+                            }
+                            if (cc_a_phase) {
+                                if (cc_b && cc_b_phase) {
+                                    target_phase = blend_phase(
+                                        cc_a->phase[idx],
+                                        cc_b->phase[idx], cc_t);
+                                } else {
+                                    target_phase = cc_a->phase[idx];
+                                }
+                                has_target_phase = 1;
+                            }
+                        }
                     } else {
                         int kh = k - NF_LOW;
                         /* No FACE match → leave the high band where it is.
@@ -352,11 +524,37 @@ int sss_generate(const SSSModel *m,
                          * schedule and drive every iteration's high-freq
                          * energy toward zero, making FACE de-facto required
                          * for sharp output.) */
-                        target = cf
-                            ? cf->amp[((size_t)r * NF_HIGH + kh) * 3 + c] * detail
-                            : row_amp[k];
+                        if (cf_a) {
+                            size_t idx = ((size_t)r * NF_HIGH + kh) * 3 + c;
+                            float amp_a = cf_a->amp[idx] * detail;
+                            if (cf_b) {
+                                float amp_b = cf_b->amp[idx] * detail;
+                                target_amp = amp_a * (1.0f - cf_t)
+                                           + amp_b * cf_t;
+                            } else {
+                                target_amp = amp_a;
+                            }
+                            if (cf_a_phase) {
+                                if (cf_b && cf_b_phase) {
+                                    target_phase = blend_phase(
+                                        cf_a->phase[idx],
+                                        cf_b->phase[idx], cf_t);
+                                } else {
+                                    target_phase = cf_a->phase[idx];
+                                }
+                                has_target_phase = 1;
+                            }
+                        }
                     }
-                    row_amp[k] = alpha * target + (1.0f - alpha) * row_amp[k];
+                    row_amp[k] = alpha * target_amp
+                               + (1.0f - alpha) * row_amp[k];
+
+                    if (has_target_phase) {
+                        float dph = target_phase - row_phase[k];
+                        while (dph >  (float)M_PI) dph -= 2.0f * (float)M_PI;
+                        while (dph < -(float)M_PI) dph += 2.0f * (float)M_PI;
+                        row_phase[k] += phase_alpha * dph;
+                    }
                 }
                 sss_irfft(row_amp, row_phase, NF, W, row_out);
 
@@ -370,8 +568,10 @@ int sss_generate(const SSSModel *m,
             else if (out->data[i] > 1.0f) out->data[i] = 1.0f;
         }
 
-        /* ── X projection: column FFT of grayscale, blend toward SHAPE,
-         *    then transfer the structural delta back to RGB ── */
+        /* ── X projection: column FFT of grayscale, blend amp + phase
+         *    toward SHAPE, then transfer the structural delta back to RGB
+         *    Note: m->height == m->width is required, so the column FFT
+         *    uses the same NF as the row FFT. */
         for (int y = 0; y < H; ++y) {
             for (int x = 0; x < W; ++x) {
                 size_t pi = (size_t)y * W + x;
@@ -383,16 +583,49 @@ int sss_generate(const SSSModel *m,
         memcpy(new_gray, gray, HW * sizeof(float));
 
         for (int x = 0; x < W; ++x) {
+            const SSSCell *cs_a, *cs_b; float cs_t;
+            pick_region_cell(m, shape_indices, n_shapes,
+                             x, W, FADE_PIXELS, &cs_a, &cs_b, &cs_t);
+            int cs_a_phase = CELL_HAS_PHASE(cs_a);
+            int cs_b_phase = CELL_HAS_PHASE(cs_b);
+
             for (int y = 0; y < H; ++y) {
                 col_in[y] = gray[(size_t)y * W + x];
             }
             sss_rfft(col_in, H, col_amp, col_phase);
 
             for (int k = 0; k < NF; ++k) {
-                float target = cs
-                    ? cs->amp[(size_t)x * NF + k]
-                    : col_amp[k];
-                col_amp[k] = alpha * target + (1.0f - alpha) * col_amp[k];
+                float target_amp   = col_amp[k];
+                float target_phase = col_phase[k];
+                int   has_target_phase = 0;
+                if (cs_a) {
+                    size_t idx = (size_t)x * NF + k;
+                    float amp_a = cs_a->amp[idx];
+                    if (cs_b) {
+                        float amp_b = cs_b->amp[idx];
+                        target_amp = amp_a * (1.0f - cs_t) + amp_b * cs_t;
+                    } else {
+                        target_amp = amp_a;
+                    }
+                    if (cs_a_phase) {
+                        if (cs_b && cs_b_phase) {
+                            target_phase = blend_phase(
+                                cs_a->phase[idx], cs_b->phase[idx], cs_t);
+                        } else {
+                            target_phase = cs_a->phase[idx];
+                        }
+                        has_target_phase = 1;
+                    }
+                }
+                col_amp[k] = alpha * target_amp
+                           + (1.0f - alpha) * col_amp[k];
+
+                if (has_target_phase) {
+                    float dph = target_phase - col_phase[k];
+                    while (dph >  (float)M_PI) dph -= 2.0f * (float)M_PI;
+                    while (dph < -(float)M_PI) dph += 2.0f * (float)M_PI;
+                    col_phase[k] += phase_alpha * dph;
+                }
             }
             sss_irfft(col_amp, col_phase, NF, H, col_out);
 
