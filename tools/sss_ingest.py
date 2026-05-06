@@ -1,8 +1,11 @@
 """SSS ingestion — file → SSS memory cells.
 
 Accepts an arbitrary file (image / text / video), converts it into the
-shape that CEMemory understands (per-block canny + average colour, or
-text-as-grid), and writes the resulting cells into a memory instance.
+shape that CEMemory understands (per-block edge map + average colour,
+or text-as-grid), and writes the resulting cells into a memory
+instance. The edge map is a Sobel-magnitude threshold, not a strict
+Canny — the cell stash uses it as a structure signature, so the
+distinction matters.
 
 Pure-Python image work: no cv2, no Pillow. Image decoding goes through
 tools/sss_image_io for PNG/PPM and through ffmpeg → PPM for everything
@@ -18,7 +21,6 @@ import os
 import shutil
 import subprocess
 import tempfile
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -43,14 +45,25 @@ VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 # numpy-only helpers (no cv2)
 # ────────────────────────────────────────────────────────────
 def _resize_nn(img, target_h=H, target_w=W):
-    """Nearest-neighbour resize to target_h × target_w."""
+    """Nearest-neighbour resize to target_h × target_w.
+
+    Uses linspace endpoint mapping so the corners of the source image
+    map to the corners of the output (no consistent crop bias at the
+    bottom/right edges).
+    """
     h, w = img.shape[:2]
     if h == target_h and w == target_w:
         return img
-    yi = np.clip((np.arange(target_h) * h // max(1, target_h)).astype(np.int64),
-                 0, h - 1)
-    xi = np.clip((np.arange(target_w) * w // max(1, target_w)).astype(np.int64),
-                 0, w - 1)
+    if target_h <= 1:
+        yi = np.zeros(target_h, dtype=np.int64)
+    else:
+        yi = np.linspace(0, h - 1, target_h).round().astype(np.int64)
+    if target_w <= 1:
+        xi = np.zeros(target_w, dtype=np.int64)
+    else:
+        xi = np.linspace(0, w - 1, target_w).round().astype(np.int64)
+    yi = np.clip(yi, 0, max(0, h - 1))
+    xi = np.clip(xi, 0, max(0, w - 1))
     if img.ndim == 2:
         return img[yi[:, None], xi[None, :]]
     return img[yi[:, None], xi[None, :], :]

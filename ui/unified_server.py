@@ -171,14 +171,26 @@ def _run_upgrade(cycles: int):
 INGEST_MAX_BYTES = 50 * 1024 * 1024     # 50 MB hard cap
 
 
+class _BadRequest(ValueError):
+    """Client sent a malformed request — translate to HTTP 400."""
+
+
+class _PayloadTooLarge(ValueError):
+    """Body exceeds the configured cap — translate to HTTP 413."""
+
+
 def _parse_multipart(handler, max_size: int = INGEST_MAX_BYTES):
     """Stdlib-only multipart/form-data parser. Returns a list of
     (field_name, filename, bytes) for every part that carries a file.
-    `cgi.FieldStorage` works but is deprecated in 3.13; this avoids it.
+    Avoids `cgi.FieldStorage` (deprecated in 3.13).
+
+    Splits on the CRLF-anchored boundary `\\r\\n--<boundary>`, not on
+    a bare `--<boundary>`, so the literal byte sequence appearing
+    inside an uploaded binary can't truncate the file.
     """
     ct = handler.headers.get("Content-Type", "")
     if not ct.lower().startswith("multipart/form-data"):
-        raise ValueError("Content-Type must be multipart/form-data")
+        raise _BadRequest("Content-Type must be multipart/form-data")
     # Pull the boundary out of the Content-Type header.
     boundary = None
     for token in ct.split(";"):
@@ -187,30 +199,38 @@ def _parse_multipart(handler, max_size: int = INGEST_MAX_BYTES):
             boundary = token.split("=", 1)[1].strip().strip('"')
             break
     if not boundary:
-        raise ValueError("multipart: missing boundary")
-    delim = b"--" + boundary.encode("ascii")
+        raise _BadRequest("multipart: missing boundary")
 
     length = int(handler.headers.get("Content-Length", "0") or "0")
     if length <= 0:
-        raise ValueError("multipart: empty body")
+        raise _BadRequest("multipart: empty body")
     if length > max_size:
-        raise ValueError(
+        raise _PayloadTooLarge(
             f"upload too large ({length} bytes; max {max_size})")
     body = handler.rfile.read(length)
 
+    # RFC 7578: every boundary line is preceded by CRLF except the very
+    # first one (which sits at byte 0). Prepend CRLF so all delimiters
+    # share the same shape, then split on the canonical \r\n--boundary.
+    delim = b"\r\n--" + boundary.encode("ascii")
+    parts = (b"\r\n" + body).split(delim)
+
     files = []
-    # Body shape: --boundary\r\n<part>\r\n--boundary\r\n<part>\r\n--boundary--\r\n
-    for chunk in body.split(delim):
-        if not chunk or chunk in (b"--\r\n", b"--", b"\r\n"):
-            continue
-        chunk = chunk.lstrip(b"\r\n")
+    # parts[0] is the preamble (typically empty), discard.
+    for chunk in parts[1:]:
+        if chunk.startswith(b"--"):
+            break                         # closing delimiter --boundary--
+        if not chunk.startswith(b"\r\n"):
+            continue                      # malformed; skip
+        chunk = chunk[2:]                 # strip the leading CRLF
         sep = chunk.find(b"\r\n\r\n")
         if sep < 0:
             continue
         hdr_block = chunk[:sep].decode("latin-1", errors="replace")
+        # Split consumed the trailing \r\n that separates the body from
+        # the next boundary, so `data` is exact — no further trimming.
         data = chunk[sep + 4:]
-        if data.endswith(b"\r\n"):
-            data = data[:-2]
+
         # We only care about parts with a `filename=` (i.e. real files).
         name = None; filename = None
         for line in hdr_block.split("\r\n"):
@@ -338,7 +358,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 files = _parse_multipart(self)
                 if not files:
-                    raise ValueError("no file part in upload")
+                    raise _BadRequest("no file part in upload")
                 # We accept multiple files in one POST but the UI sends
                 # one per request, so this loop usually has length 1.
                 results = []
@@ -376,6 +396,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     _json(self, {**results[0]})
                 else:
                     _json(self, {"ok": True, "files": results})
+            except _PayloadTooLarge as e:
+                _json(self, {"ok": False, "error": str(e)}, 413)
+            except _BadRequest as e:
+                _json(self, {"ok": False, "error": str(e)}, 400)
             except Exception as e:
                 _json(self, {
                     "ok": False,
