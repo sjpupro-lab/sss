@@ -851,12 +851,16 @@ def run_upgrade_loop(n_cycles=5, seed=None):
     memory across the whole loop — only their `quality` shifts (which
     is also the selection-probability weight).
 
+    `seed=None` (default) reseeds from OS entropy on every call so
+    repeated calls against the same memory state still pick different
+    cell combos. Pass an explicit int for reproducible runs (tests).
+
     Returns a list of per-cycle dicts:
         {"cycle", "generated", "accepted", "avg_score",
          "best_score", "total_cells"}
     """
     pipeline = _get_pipeline()
-    rng = random.Random(seed if seed is not None else 0xC511)
+    rng = random.Random(seed)
 
     cycles_report = []
     for cycle_idx in range(int(n_cycles)):

@@ -70,9 +70,24 @@
 </div>
 
 <script>
+// The server pipeline is process-global, so /api/unified and /api/upgrade
+// must not run concurrently. Lock both buttons whenever either is in flight.
+function lockButtons(busy) {
+  document.getElementById('btn-gen').disabled = busy;
+  document.getElementById('btn-up').disabled  = busy;
+}
+
+function showError(msg) {
+  const out = document.getElementById('upgrade-out');
+  out.textContent = '';  // clear any previous table/markup
+  const span = document.createElement('span');
+  span.style.color = '#f85149';
+  span.textContent = 'error: ' + msg;
+  out.appendChild(span);
+}
+
 async function run() {
-  const btn = document.getElementById('btn-gen');
-  btn.disabled = true;
+  lockButtons(true);
   try {
     const prompt = document.getElementById('prompt').value;
     const res = await fetch('/api/unified', {
@@ -96,15 +111,14 @@ async function run() {
     document.getElementById('memory').textContent = JSON.stringify(data.memory, null, 2);
     document.getElementById('raw').textContent = JSON.stringify(data.raw, null, 2);
   } finally {
-    btn.disabled = false;
+    lockButtons(false);
   }
 }
 
 async function upgrade() {
   const btn = document.getElementById('btn-up');
   const status = document.getElementById('up-status');
-  const out = document.getElementById('upgrade-out');
-  btn.disabled = true;
+  lockButtons(true);
   const original = btn.textContent;
   btn.textContent = 'Upgrading...';
   status.textContent = 'running self-upgrade loop...';
@@ -116,17 +130,18 @@ async function upgrade() {
     });
     const data = await res.json();
     if (!data.ok) {
-      out.innerHTML = '<span style="color:#f85149">error: ' +
-        (data.error || 'unknown') + '</span>';
+      showError(data.error || 'unknown');
+      status.textContent = 'error';
       return;
     }
     renderUpgradeReport(data.report || []);
     status.textContent = 'done (' + (data.report || []).length + ' cycles)';
   } catch (e) {
-    out.innerHTML = '<span style="color:#f85149">error: ' + e + '</span>';
+    showError(String(e));
+    status.textContent = 'error';
   } finally {
     btn.textContent = original;
-    btn.disabled = false;
+    lockButtons(false);
   }
 }
 

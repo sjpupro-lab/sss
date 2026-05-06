@@ -14,6 +14,7 @@ import http.server
 import json
 import os
 import sys
+import threading
 import traceback
 from pathlib import Path
 from urllib.parse import urlparse
@@ -27,6 +28,12 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(ROOT))
 
 PIPELINE = None
+
+# ThreadingHTTPServer can deliver overlapping requests, but the
+# tools.sss_unified pipeline keeps a process-wide CEMemory instance and
+# is not thread-safe. Serialise every pipeline call through this lock
+# so /api/unified and /api/upgrade can't race each other.
+_PIPELINE_LOCK = threading.Lock()
 
 
 def _json(handler, obj, status=200):
@@ -223,7 +230,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 body = _read_json(self)
                 prompt = str(body.get("prompt") or "red smile character")
-                result = _run_unified(prompt)
+                with _PIPELINE_LOCK:
+                    result = _run_unified(prompt)
                 payload = _normalize_result(result)
                 payload["ok"] = True
                 payload["prompt"] = prompt
@@ -240,7 +248,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 body = _read_json(self)
                 cycles = int(body.get("cycles") or 5)
                 cycles = max(1, min(50, cycles))
-                report = _run_upgrade(cycles)
+                with _PIPELINE_LOCK:
+                    report = _run_upgrade(cycles)
                 _json(self, {"ok": True, "cycles": cycles, "report": report})
             except Exception as e:
                 _json(self, {
