@@ -9,20 +9,33 @@
   .wrap { max-width:1100px; margin:0 auto; padding:16px; }
   h1 { font-size:16px; margin-bottom:12px; }
   input { width:100%; padding:10px; background:#161b22; border:1px solid #30363d; color:#e6edf3; border-radius:6px; }
-  button { margin-top:10px; padding:10px 14px; background:#238636; border:none; color:#fff; border-radius:6px; cursor:pointer; }
+  button { margin-top:10px; padding:10px 14px; border:none; color:#fff; border-radius:6px; cursor:pointer; }
+  button.gen { background:#238636; }
+  button.up  { background:#d97706; margin-left:8px; }
+  button:disabled { opacity:0.5; cursor:wait; }
   .row { display:flex; gap:16px; margin-top:16px; }
   .col { flex:1; }
   .panel { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px; }
   img { width:100%; image-rendering:pixelated; border-radius:6px; }
   .frames img { width:64px; height:64px; }
   pre { font-size:11px; overflow:auto; }
+  table.up-tbl { border-collapse:collapse; width:100%; font-size:12px; }
+  table.up-tbl th, table.up-tbl td { border:1px solid #30363d; padding:4px 8px; text-align:left; }
+  table.up-tbl th { background:#21262d; }
+  .bar-cell { padding:0 !important; vertical-align:middle; }
+  .bar { display:inline-block; height:8px; background:#d97706; border-radius:2px; vertical-align:middle; }
+  .bar-wrap { display:flex; align-items:center; gap:6px; padding:4px 8px; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>SSS Unified Pipeline</h1>
   <input id="prompt" value="red character smile petals" />
-  <button onclick="run()">Generate</button>
+  <div>
+    <button class="gen" id="btn-gen" onclick="run()">Generate</button>
+    <button class="up"  id="btn-up"  onclick="upgrade()">Upgrade</button>
+    <span id="up-status" style="margin-left:10px; color:#8b949e;"></span>
+  </div>
 
   <div class="row">
     <div class="col panel">
@@ -42,34 +55,127 @@
   </div>
 
   <div class="panel" style="margin-top:16px">
+    <div>Upgrade Cycles</div>
+    <div id="upgrade-out" style="margin-top:8px; color:#8b949e; font-size:12px;">
+      Click <b>Upgrade</b> to run a self-upgrade loop. Cells stay in
+      memory; their selection probability shifts by quality after each
+      cycle. No pixel-level noise is added.
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:16px">
     <div>Raw</div>
     <pre id="raw"></pre>
   </div>
 </div>
 
 <script>
+// The server pipeline is process-global, so /api/unified and /api/upgrade
+// must not run concurrently. Lock both buttons whenever either is in flight.
+function lockButtons(busy) {
+  document.getElementById('btn-gen').disabled = busy;
+  document.getElementById('btn-up').disabled  = busy;
+}
+
+function showError(msg) {
+  const out = document.getElementById('upgrade-out');
+  out.textContent = '';  // clear any previous table/markup
+  const span = document.createElement('span');
+  span.style.color = '#f85149';
+  span.textContent = 'error: ' + msg;
+  out.appendChild(span);
+}
+
 async function run() {
-  const prompt = document.getElementById('prompt').value;
-  const res = await fetch('/api/unified', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({prompt})
+  lockButtons(true);
+  try {
+    const prompt = document.getElementById('prompt').value;
+    const res = await fetch('/api/unified', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({prompt})
+    });
+    const data = await res.json();
+
+    document.getElementById('img').src = data.image || '';
+
+    const frames = document.getElementById('frames');
+    frames.innerHTML = '';
+    (data.frames || []).forEach(f => {
+      const im = document.createElement('img');
+      im.src = f;
+      frames.appendChild(im);
+    });
+
+    document.getElementById('scores').textContent = JSON.stringify(data.scores, null, 2);
+    document.getElementById('memory').textContent = JSON.stringify(data.memory, null, 2);
+    document.getElementById('raw').textContent = JSON.stringify(data.raw, null, 2);
+  } finally {
+    lockButtons(false);
+  }
+}
+
+async function upgrade() {
+  const btn = document.getElementById('btn-up');
+  const status = document.getElementById('up-status');
+  lockButtons(true);
+  const original = btn.textContent;
+  btn.textContent = 'Upgrading...';
+  status.textContent = 'running self-upgrade loop...';
+  try {
+    const res = await fetch('/api/upgrade', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({cycles: 5})
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      showError(data.error || 'unknown');
+      status.textContent = 'error';
+      return;
+    }
+    renderUpgradeReport(data.report || []);
+    status.textContent = 'done (' + (data.report || []).length + ' cycles)';
+  } catch (e) {
+    showError(String(e));
+    status.textContent = 'error';
+  } finally {
+    btn.textContent = original;
+    lockButtons(false);
+  }
+}
+
+function renderUpgradeReport(report) {
+  const out = document.getElementById('upgrade-out');
+  if (!report.length) {
+    out.textContent = 'no cycles returned';
+    return;
+  }
+  const maxAvg = Math.max(...report.map(r => r.avg_score || 0), 0.001);
+  let html = '<table class="up-tbl"><thead><tr>' +
+    '<th>cycle</th><th>generated</th><th>accepted</th>' +
+    '<th>avg_score</th><th>best_score</th><th>total_cells</th>' +
+    '<th>avg_score trend</th></tr></thead><tbody>';
+  report.forEach(r => {
+    const avg = r.avg_score || 0;
+    const best = r.best_score || 0;
+    const widthPct = Math.round((avg / maxAvg) * 100);
+    html += '<tr>' +
+      '<td>' + r.cycle + '</td>' +
+      '<td>' + r.generated + '</td>' +
+      '<td>' + r.accepted + '</td>' +
+      '<td>' + avg.toFixed(4) + '</td>' +
+      '<td>' + best.toFixed(4) + '</td>' +
+      '<td>' + r.total_cells + '</td>' +
+      '<td class="bar-cell"><div class="bar-wrap">' +
+        '<span class="bar" style="width:' + widthPct + '%"></span>' +
+        '<span style="font-size:10px; color:#8b949e">' +
+          avg.toFixed(3) + '</span>' +
+      '</div></td>' +
+    '</tr>';
   });
-  const data = await res.json();
-
-  document.getElementById('img').src = data.image || '';
-
-  const frames = document.getElementById('frames');
-  frames.innerHTML = '';
-  (data.frames || []).forEach(f => {
-    const im = document.createElement('img');
-    im.src = f;
-    frames.appendChild(im);
-  });
-
-  document.getElementById('scores').textContent = JSON.stringify(data.scores, null, 2);
-  document.getElementById('memory').textContent = JSON.stringify(data.memory, null, 2);
-  document.getElementById('raw').textContent = JSON.stringify(data.raw, null, 2);
+  html += '</tbody></table>';
+  out.innerHTML = html;
 }
 </script>
 </body>

@@ -22,6 +22,7 @@ then::
 from __future__ import annotations
 
 import os
+import random
 import subprocess
 from collections import defaultdict
 from typing import Optional
@@ -190,14 +191,16 @@ class Planner:
             "raw": prompt,
         }
         p = prompt.lower()
-        for kw in ["그려", "만들어", "생성", "이미지", "캐릭터", "그림"]:
+        for kw in ["그려", "만들어", "생성", "이미지", "캐릭터", "그림",
+                   "draw", "image", "generate", "character", "make"]:
             if kw in p:
                 intent["needs_image"] = True
-        for kw in ["영상", "동영상", "움직", "모션", "애니"]:
+        for kw in ["영상", "동영상", "움직", "모션", "애니",
+                   "video", "motion", "animate", "movie"]:
             if kw in p:
                 intent["needs_video"] = True
                 intent["needs_image"] = True
-        for kw in ["학습", "업그레이드", "개선"]:
+        for kw in ["학습", "업그레이드", "개선", "upgrade", "learn", "improve"]:
             if kw in p:
                 intent["needs_learn"] = True
         for kw, tag in self.COLOR_MAP.items():
@@ -770,6 +773,163 @@ def _get_pipeline():
 def run_sss_pipeline(prompt):
     """One-call entry point. Lazily seeds foundation on first use."""
     return _get_pipeline().run(prompt)
+
+
+# ────────────────────────────────────────────────────────────
+# 7b. Self-upgrade loop
+#     - cycles a fixed prompt set (shape × color × expression)
+#     - cells are sampled from memory with quality-weighted random
+#       picking, so the same prompt can produce different combos
+#     - cells are NEVER deleted; bad results just lower the cell's
+#       quality (= selection probability), good results raise it
+#     - no pixel-level random noise is ever added
+# ────────────────────────────────────────────────────────────
+_UPGRADE_COMBOS = [
+    ("circle", "red",    "smile"),
+    ("circle", "blue",   "sad"),
+    ("rect",   "green",  "surprise"),
+    ("tri",    "yellow", "neutral"),
+    ("circle", "pink",   "talk"),
+    ("rect",   "orange", "smile"),
+    ("tri",    "red",    "surprise"),
+    ("circle", "blue",   "smile"),
+]
+
+
+def _build_intent(shape, color, expr):
+    return {
+        "needs_chat": True,
+        "needs_image": True,
+        "needs_video": False,
+        "needs_learn": True,
+        "tags": [shape, color, expr],
+        "colors": [color],
+        "expressions": [expr],
+        "motions": [],
+        "raw": f"{color} {shape} {expr}",
+    }
+
+
+def _weighted_sample_hits(memory, intent, rng, per_block=3):
+    """Pick cells from each block via quality-weighted random sampling.
+
+    Returns the same `(score, cell, block)` triple shape that
+    `Planner.search_memory` produces, so the generator can consume it
+    unchanged. Tag-matching cells are favoured but unmatched cells can
+    still be drawn — that's where combinatorial diversity comes from.
+    """
+    hits = []
+    tags = intent.get("tags", []) or []
+    for block_name in ROW_BLOCKS:
+        cells = memory.cells.get(block_name, [])
+        if not cells:
+            continue
+        weights = []
+        for cell in cells:
+            match = sum(1 for t in tags if t in cell.get("tags", []))
+            q = max(0.05, float(cell.get("quality", 0.0)))
+            weights.append((match + 0.1) * q)
+        n_pick = min(per_block, len(cells))
+        chosen_idx = set()
+        for _ in range(n_pick * 2):
+            if len(chosen_idx) >= n_pick:
+                break
+            i = rng.choices(range(len(cells)), weights=weights, k=1)[0]
+            chosen_idx.add(i)
+        for i in chosen_idx:
+            cell = cells[i]
+            match = sum(1 for t in tags if t in cell.get("tags", []))
+            hits.append((max(1, match), cell, block_name))
+    return hits
+
+
+def run_upgrade_loop(n_cycles=5, seed=None):
+    """Drive `n_cycles` of generate → evaluate → quality-update.
+
+    No noise is ever added to the rendered pixels; diversity only comes
+    from picking different memory cells per call. Cells are kept in
+    memory across the whole loop — only their `quality` shifts (which
+    is also the selection-probability weight).
+
+    `seed=None` (default) reseeds from OS entropy on every call so
+    repeated calls against the same memory state still pick different
+    cell combos. Pass an explicit int for reproducible runs (tests).
+
+    Returns a list of per-cycle dicts:
+        {"cycle", "generated", "accepted", "avg_score",
+         "best_score", "total_cells"}
+    """
+    pipeline = _get_pipeline()
+    rng = random.Random(seed)
+
+    cycles_report = []
+    for cycle_idx in range(int(n_cycles)):
+        scores_this_cycle = []
+        accepted = 0
+        for shape, color, expr in _UPGRADE_COMBOS:
+            intent = _build_intent(shape, color, expr)
+
+            # Quality-weighted random pick — same prompt → different
+            # cell combos across calls.
+            hits = _weighted_sample_hits(pipeline.memory, intent, rng)
+            if hits:
+                strategy = "recombine" if len(hits) >= len(ROW_BLOCKS) else "sculpt_hybrid"
+            else:
+                strategy = "sculpt_new"
+            search = {
+                "hit": bool(hits),
+                "ratio": min(1.0, len(hits) / max(1, len(ROW_BLOCKS) * 2)),
+                "cells": hits,
+                "strategy": strategy,
+            }
+
+            image = pipeline.generator.generate(intent, search)
+            score = pipeline.evaluator.evaluate(image, intent)
+            final = float(score.get("final", 0.0))
+            scores_this_cycle.append(final)
+
+            # Update quality of the cells we drew. update_quality blends
+            # 0.7 * old + 0.3 * new, so good results nudge up, bad
+            # results nudge down — but the cell stays in memory either
+            # way.
+            for _match, cell, b in hits:
+                cells_in_block = pipeline.memory.cells.get(b, [])
+                try:
+                    idx = cells_in_block.index(cell)
+                except ValueError:
+                    continue
+                pipeline.memory.update_quality(b, idx, final)
+
+            # Accepted runs add fresh cells (more variety, not noise).
+            threshold = 0.20 + pipeline.memory.generation * 0.008
+            if final >= threshold:
+                tags = list(intent["tags"])
+                for bname, (s, e) in ROW_BLOCKS.items():
+                    y0, y1 = int(H * s), int(H * e)
+                    block = image[y0:y1]
+                    canny = cv2.Canny(
+                        cv2.cvtColor(block, cv2.COLOR_BGR2GRAY), 50, 150)
+                    avg = np.mean(block, axis=(0, 1))
+                    bq = score.get("blocks", {}).get(bname, final)
+                    pipeline.memory.add(
+                        bname, canny, avg, bq, tags,
+                        f"upgrade_c{cycle_idx + 1}")
+                pipeline.memory.generation += 1
+                accepted += 1
+
+        cycles_report.append({
+            "cycle": cycle_idx + 1,
+            "generated": len(_UPGRADE_COMBOS),
+            "accepted": accepted,
+            "avg_score": round(
+                float(np.mean(scores_this_cycle)) if scores_this_cycle else 0.0,
+                4),
+            "best_score": round(
+                float(np.max(scores_this_cycle)) if scores_this_cycle else 0.0,
+                4),
+            "total_cells": pipeline.memory.total_cells(),
+        })
+    return cycles_report
 
 
 # ────────────────────────────────────────────────────────────

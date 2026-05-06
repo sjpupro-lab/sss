@@ -57,6 +57,30 @@ def main() -> int:
         assert "score" in r2
         print(f"OK  module-fn: final={r2['score']['final']:.3f}")
 
+        # Self-upgrade loop: report shape + "no deletion" invariant.
+        from tools.sss_unified import run_upgrade_loop
+        cells_before = pipeline.memory.total_cells()
+        report = run_upgrade_loop(n_cycles=2, seed=7)
+        assert isinstance(report, list) and len(report) == 2
+        required = {"cycle", "generated", "accepted",
+                    "avg_score", "best_score", "total_cells"}
+        prev_cells = cells_before
+        for r in report:
+            assert required.issubset(r.keys()), r.keys()
+            assert isinstance(r["cycle"], int)
+            assert isinstance(r["generated"], int)
+            assert isinstance(r["accepted"], int)
+            assert isinstance(r["total_cells"], int)
+            assert isinstance(r["avg_score"], float)
+            assert isinstance(r["best_score"], float)
+            # Cells are never deleted across cycles — only quality shifts.
+            assert r["total_cells"] >= prev_cells, (
+                f"total_cells decreased: {prev_cells} -> {r['total_cells']}")
+            prev_cells = r["total_cells"]
+        print(f"OK  upgrade  : cycles={len(report)} "
+              f"cells={cells_before}->{report[-1]['total_cells']} "
+              f"avg={report[-1]['avg_score']:.3f}")
+
         # Save() round-trip: must produce a .ces and meta.json.
         pipeline.memory.save()
         ces_path = os.path.join(tmp, "mem", "storage.ces")
