@@ -111,13 +111,29 @@ def _get_pipeline_module():
     return unified
 
 
+def _merge_tuple_result(out):
+    """Pipeline returns (result_dict, image, frames). Fold image/frames
+    into the dict so _normalize_result can find them on the usual keys."""
+    if isinstance(out, tuple):
+        result = out[0] if len(out) > 0 else {}
+        image = out[1] if len(out) > 1 else None
+        frames = out[2] if len(out) > 2 else None
+        if isinstance(result, dict):
+            if image is not None:
+                result["image"] = image
+            if frames is not None:
+                result["frames"] = frames
+        return result
+    return out
+
+
 def _run_unified(prompt: str):
     """Run tools.sss_unified with flexible API compatibility."""
     global PIPELINE
     unified = _get_pipeline_module()
 
     if hasattr(unified, "run_sss_pipeline"):
-        return unified.run_sss_pipeline(prompt)
+        return _merge_tuple_result(unified.run_sss_pipeline(prompt))
 
     if PIPELINE is None:
         if not hasattr(unified, "SSSPipeline"):
@@ -127,8 +143,15 @@ def _run_unified(prompt: str):
     for method in ("run", "generate", "__call__"):
         fn = getattr(PIPELINE, method, None)
         if callable(fn):
-            return fn(prompt)
+            return _merge_tuple_result(fn(prompt))
     raise RuntimeError("SSSPipeline exists but has no run/generate/__call__")
+
+
+def _run_upgrade(cycles: int):
+    unified = _get_pipeline_module()
+    if not hasattr(unified, "run_upgrade_loop"):
+        raise RuntimeError("tools.sss_unified has no run_upgrade_loop")
+    return unified.run_upgrade_loop(int(cycles))
 
 
 def _normalize_result(result):
@@ -205,6 +228,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 payload["ok"] = True
                 payload["prompt"] = prompt
                 _json(self, payload)
+            except Exception as e:
+                _json(self, {
+                    "ok": False,
+                    "error": str(e),
+                    "trace": traceback.format_exc().splitlines()[-12:],
+                }, 500)
+            return
+        if path == "/api/upgrade":
+            try:
+                body = _read_json(self)
+                cycles = int(body.get("cycles") or 5)
+                cycles = max(1, min(50, cycles))
+                report = _run_upgrade(cycles)
+                _json(self, {"ok": True, "cycles": cycles, "report": report})
             except Exception as e:
                 _json(self, {
                     "ok": False,
