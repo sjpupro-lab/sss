@@ -14,6 +14,7 @@ import http.server
 import json
 import os
 import sys
+import tempfile
 import threading
 import traceback
 from pathlib import Path
@@ -166,6 +167,76 @@ def _run_upgrade(cycles: int):
     return unified.run_upgrade_loop(int(cycles))
 
 
+# ── ingest plumbing ──────────────────────────────────────────
+INGEST_MAX_BYTES = 50 * 1024 * 1024     # 50 MB hard cap
+
+
+def _parse_multipart(handler, max_size: int = INGEST_MAX_BYTES):
+    """Stdlib-only multipart/form-data parser. Returns a list of
+    (field_name, filename, bytes) for every part that carries a file.
+    `cgi.FieldStorage` works but is deprecated in 3.13; this avoids it.
+    """
+    ct = handler.headers.get("Content-Type", "")
+    if not ct.lower().startswith("multipart/form-data"):
+        raise ValueError("Content-Type must be multipart/form-data")
+    # Pull the boundary out of the Content-Type header.
+    boundary = None
+    for token in ct.split(";"):
+        token = token.strip()
+        if token.lower().startswith("boundary="):
+            boundary = token.split("=", 1)[1].strip().strip('"')
+            break
+    if not boundary:
+        raise ValueError("multipart: missing boundary")
+    delim = b"--" + boundary.encode("ascii")
+
+    length = int(handler.headers.get("Content-Length", "0") or "0")
+    if length <= 0:
+        raise ValueError("multipart: empty body")
+    if length > max_size:
+        raise ValueError(
+            f"upload too large ({length} bytes; max {max_size})")
+    body = handler.rfile.read(length)
+
+    files = []
+    # Body shape: --boundary\r\n<part>\r\n--boundary\r\n<part>\r\n--boundary--\r\n
+    for chunk in body.split(delim):
+        if not chunk or chunk in (b"--\r\n", b"--", b"\r\n"):
+            continue
+        chunk = chunk.lstrip(b"\r\n")
+        sep = chunk.find(b"\r\n\r\n")
+        if sep < 0:
+            continue
+        hdr_block = chunk[:sep].decode("latin-1", errors="replace")
+        data = chunk[sep + 4:]
+        if data.endswith(b"\r\n"):
+            data = data[:-2]
+        # We only care about parts with a `filename=` (i.e. real files).
+        name = None; filename = None
+        for line in hdr_block.split("\r\n"):
+            if not line.lower().startswith("content-disposition:"):
+                continue
+            for piece in line.split(";"):
+                piece = piece.strip()
+                if piece.startswith("name="):
+                    name = piece[5:].strip().strip('"')
+                elif piece.startswith("filename="):
+                    filename = piece[9:].strip().strip('"')
+        if filename:
+            files.append((name, filename, data))
+    return files
+
+
+def _run_ingest(filepath: str, filename: str):
+    """Drive tools.sss_ingest against the lazily-seeded global pipeline's
+    memory. Acquired under _PIPELINE_LOCK by the caller."""
+    unified = _get_pipeline_module()
+    pipeline = unified._get_pipeline()    # ensures foundation seed
+    from tools import sss_ingest
+    return sss_ingest.ingest_file(filepath, pipeline.memory,
+                                  filename=filename)
+
+
 def _normalize_result(result):
     """Make UI payload from whatever tools.sss_unified returns."""
     image = None
@@ -256,6 +327,55 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 with _PIPELINE_LOCK:
                     report = _run_upgrade(cycles)
                 _json(self, {"ok": True, "cycles": cycles, "report": report})
+            except Exception as e:
+                _json(self, {
+                    "ok": False,
+                    "error": str(e),
+                    "trace": traceback.format_exc().splitlines()[-12:],
+                }, 500)
+            return
+        if path == "/api/ingest":
+            try:
+                files = _parse_multipart(self)
+                if not files:
+                    raise ValueError("no file part in upload")
+                # We accept multiple files in one POST but the UI sends
+                # one per request, so this loop usually has length 1.
+                results = []
+                for _name, filename, data in files:
+                    # Persist to a temp path so ingest can use ffmpeg/path-
+                    # based decoders unchanged. Clean up after.
+                    suffix = os.path.splitext(filename)[1] or ".bin"
+                    fd, tmp_path = tempfile.mkstemp(suffix=suffix,
+                                                   prefix="sss_ingest_")
+                    try:
+                        with os.fdopen(fd, "wb") as fp:
+                            fp.write(data)
+                        with _PIPELINE_LOCK:
+                            summary = _run_ingest(tmp_path, filename)
+                        results.append({
+                            "ok": True,
+                            "filename": filename,
+                            "bytes": len(data),
+                            "result": summary,
+                        })
+                    except Exception as e:
+                        results.append({
+                            "ok": False,
+                            "filename": filename,
+                            "error": str(e),
+                        })
+                    finally:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                # If a single file was sent, flatten the response so the
+                # UI can read `result` / `error` directly.
+                if len(results) == 1:
+                    _json(self, {**results[0]})
+                else:
+                    _json(self, {"ok": True, "files": results})
             except Exception as e:
                 _json(self, {
                     "ok": False,
