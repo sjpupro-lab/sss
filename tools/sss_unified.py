@@ -39,6 +39,10 @@ except ImportError:
 # Bridge-backed CEMemory (ce_storage_add_typed under the hood).
 from tools.sss_memory import CEMemory as _BridgedCEMemory
 
+# Stdlib-only PNG / PPM encoder. Used for `imwrite` so the demo writes
+# images even when cv2 isn't installed.
+from tools import sss_image_io
+
 
 # ────────────────────────────────────────────────────────────
 # 0a. cv2 fallback — numpy-only implementations of the OpenCV
@@ -1420,12 +1424,15 @@ def run_demo():
             tracking[prompt].append(sc.get("final", 0))
 
             if image is not None:
-                cv2.imwrite(os.path.join(output_dir, f"run{result['run']:02d}.png"), image)
+                sss_image_io.imwrite(
+                    os.path.join(output_dir,
+                                 f"run{result['run']:02d}.png"), image)
             if frames and len(frames) > 1:
                 fd = os.path.join(output_dir, f"fr_{result['run']:02d}")
                 os.makedirs(fd, exist_ok=True)
                 for fi, fr in enumerate(frames):
-                    cv2.imwrite(os.path.join(fd, f"f_{fi:03d}.png"), fr)
+                    sss_image_io.imwrite(
+                        os.path.join(fd, f"f_{fi:03d}.png"), fr)
                 vp = os.path.join(output_dir, f"vid_{result['run']:02d}.mp4")
                 subprocess.run(
                     ["ffmpeg", "-y", "-framerate", "24",
