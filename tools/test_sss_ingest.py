@@ -27,7 +27,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         os.environ["SSS_UNIFIED_DIR"] = tmp
         from tools.sss_unified import SSSPipeline
-        from tools.sss_ingest import ingest_file, _resize_nn
+        from tools.sss_ingest import (
+            ingest_file, _resize_nn, fingerprint, ingest_csv)
         from tools.sss_image_io import write_png, write_ppm
 
         # _resize_nn endpoint check: corners of source map to corners
@@ -44,26 +45,73 @@ def main() -> int:
         assert baseline > 0
         print(f"OK  seed      : {baseline} cells")
 
-        # ── PNG image ────────────────────────────────────
+        # ── fingerprint matches the C contract ───────────
+        fp = fingerprint("red flower")
+        assert fp.shape == (256,) and fp.dtype == np.float32
+        # L2-normalised: |fp| ≈ 1.0 unless empty.
+        norm = float(np.sqrt(np.sum(fp * fp)))
+        assert abs(norm - 1.0) < 1e-5, norm
+        assert np.allclose(fingerprint(""), 0.0)
+        print(f"OK  fp        : 256-bin L2-normed ({norm:.6f})")
+
+        # ── PNG image WITHOUT label is refused ───────────
         img = np.zeros((96, 128, 3), np.uint8)
         img[:, :64] = (50, 50, 210)
         img[:, 64:] = (50, 170, 50)
         png_path = os.path.join(tmp, "img.png"); write_png(png_path, img)
         before = pipe.memory.total_cells()
         s = ingest_file(png_path, pipe.memory)
+        assert s.get("error") and "라벨" in s["error"], s
+        assert pipe.memory.total_cells() == before
+        print(f"OK  no-label  : refused with '{s['error']}' (no cells added)")
+
+        # ── PNG image WITH label adds 5 cells with amp/phase ─
+        s = ingest_file(png_path, pipe.memory, label="red green stripe")
         assert s["type"] == "image"
         assert s["cells_added"] == 5
+        assert s["tags"] == ["red", "green", "stripe"]
         assert set(s["blocks"]) == {"hair", "face", "upper", "lower", "bg"}
         assert pipe.memory.total_cells() == before + 5
-        print(f"OK  png       : +{s['cells_added']} cells, blocks={list(s['blocks'])}")
+        # Spot-check a cell carries amp + phase.
+        sample = pipe.memory.cells["face"][-1]
+        assert sample["amp"] is not None and sample["phase"] is not None
+        assert len(sample["amp"]) == len(sample["phase"]) > 0
+        print(f"OK  png+label : +{s['cells_added']} cells with amp/phase")
 
-        # ── PPM image ────────────────────────────────────
+        # ── PPM image with label ─────────────────────────
         ppm_path = os.path.join(tmp, "img.ppm"); write_ppm(ppm_path, img)
         before = pipe.memory.total_cells()
-        s = ingest_file(ppm_path, pipe.memory)
+        s = ingest_file(ppm_path, pipe.memory, label="ppm sample")
         assert s["type"] == "image" and s["cells_added"] == 5
         assert pipe.memory.total_cells() == before + 5
-        print(f"OK  ppm       : +{s['cells_added']} cells")
+        print(f"OK  ppm+label : +{s['cells_added']} cells")
+
+        # ── CSV batch ────────────────────────────────────
+        csv_dir = os.path.join(tmp, "csv_dir")
+        os.makedirs(csv_dir, exist_ok=True)
+        a_path = os.path.join(csv_dir, "a.png"); write_png(a_path, img)
+        b_path = os.path.join(csv_dir, "b.png"); write_png(b_path, img)
+        csv_path = os.path.join(csv_dir, "labels.csv")
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("filepath,label\n")          # header — must be skipped
+            f.write("a.png,red apple\n")
+            f.write("b.png,blue sky cloud\n")
+            f.write("missing.png,gone\n")        # error row
+        before = pipe.memory.total_cells()
+        s = ingest_csv(csv_path, pipe.memory, base_dir=csv_dir)
+        assert s["type"] == "csv"
+        assert s["files_ok"] == 2 and s["cells_added"] == 10
+        assert len(s["files_err"]) == 1
+        assert pipe.memory.total_cells() == before + 10
+        print(f"OK  csv       : ok={s['files_ok']}, err={len(s['files_err'])}, "
+              f"+{s['cells_added']} cells")
+
+        # ── ingest_file routes .csv → ingest_csv ─────────
+        before = pipe.memory.total_cells()
+        s = ingest_file(csv_path, pipe.memory, base_dir=csv_dir)
+        assert s["type"] == "csv" and s["files_ok"] == 2
+        assert pipe.memory.total_cells() == before + 10
+        print(f"OK  csv route : ingest_file dispatches to ingest_csv")
 
         # ── UTF-8 text ───────────────────────────────────
         txt = os.path.join(tmp, "note.txt")

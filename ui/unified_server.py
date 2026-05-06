@@ -205,13 +205,16 @@ class _PayloadTooLarge(ValueError):
 
 
 def _parse_multipart(handler, max_size: int = INGEST_MAX_BYTES):
-    """Stdlib-only multipart/form-data parser. Returns a list of
-    (field_name, filename, bytes) for every part that carries a file.
-    Avoids `cgi.FieldStorage` (deprecated in 3.13).
+    """Stdlib-only multipart/form-data parser. Returns
+        (files, fields)
+    where `files` is a list of (field_name, filename, bytes) for every
+    part that carries a filename, and `fields` is a {name: str} dict
+    of every plain text part (e.g. the `label` form input).
 
-    Splits on the CRLF-anchored boundary `\\r\\n--<boundary>`, not on
-    a bare `--<boundary>`, so the literal byte sequence appearing
-    inside an uploaded binary can't truncate the file.
+    Avoids `cgi.FieldStorage` (deprecated in 3.13). Splits on the
+    CRLF-anchored boundary `\\r\\n--<boundary>`, not a bare
+    `--<boundary>`, so the literal byte sequence inside an uploaded
+    binary can't truncate the file.
     """
     ct = handler.headers.get("Content-Type", "")
     if not ct.lower().startswith("multipart/form-data"):
@@ -241,6 +244,7 @@ def _parse_multipart(handler, max_size: int = INGEST_MAX_BYTES):
     parts = (b"\r\n" + body).split(delim)
 
     files = []
+    fields = {}
     # parts[0] is the preamble (typically empty), discard.
     for chunk in parts[1:]:
         if chunk.startswith(b"--"):
@@ -256,7 +260,6 @@ def _parse_multipart(handler, max_size: int = INGEST_MAX_BYTES):
         # the next boundary, so `data` is exact — no further trimming.
         data = chunk[sep + 4:]
 
-        # We only care about parts with a `filename=` (i.e. real files).
         name = None; filename = None
         for line in hdr_block.split("\r\n"):
             if not line.lower().startswith("content-disposition:"):
@@ -269,17 +272,28 @@ def _parse_multipart(handler, max_size: int = INGEST_MAX_BYTES):
                     filename = piece[9:].strip().strip('"')
         if filename:
             files.append((name, filename, data))
-    return files
+        elif name:
+            # Plain form field (e.g. `label`). Decode best-effort
+            # utf-8 — browsers always send form fields as utf-8 today.
+            try:
+                fields[name] = data.decode("utf-8")
+            except UnicodeDecodeError:
+                fields[name] = data.decode("latin-1", errors="replace")
+    return files, fields
 
 
-def _run_ingest(filepath: str, filename: str):
+def _run_ingest(filepath: str, filename: str, *,
+                label: str = "", base_dir: str = ""):
     """Drive tools.sss_ingest against the lazily-seeded global pipeline's
-    memory. Acquired under _PIPELINE_LOCK by the caller."""
+    memory. Acquired under _PIPELINE_LOCK by the caller. `label` is the
+    text the user typed in the UI; `base_dir` resolves CSV relative
+    paths."""
     unified = _get_pipeline_module()
     pipeline = unified._get_pipeline()    # ensures foundation seed
     from tools import sss_ingest
     return sss_ingest.ingest_file(filepath, pipeline.memory,
-                                  filename=filename)
+                                  filename=filename,
+                                  label=label, base_dir=base_dir)
 
 
 def _normalize_result(result):
@@ -423,42 +437,85 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/api/ingest":
             try:
-                files = _parse_multipart(self)
+                files, fields = _parse_multipart(self)
                 if not files:
                     raise _BadRequest("no file part in upload")
-                # We accept multiple files in one POST but the UI sends
-                # one per request, so this loop usually has length 1.
-                results = []
-                for _name, filename, data in files:
-                    # Persist to a temp path so ingest can use ffmpeg/path-
-                    # based decoders unchanged. Clean up after.
-                    suffix = os.path.splitext(filename)[1] or ".bin"
-                    fd, tmp_path = tempfile.mkstemp(suffix=suffix,
-                                                   prefix="sss_ingest_")
-                    try:
-                        with os.fdopen(fd, "wb") as fp:
+                label = (fields.get("label") or "").strip()
+
+                # Stage every uploaded file into one temp dir so a CSV
+                # can resolve sibling images by relative path. Single-
+                # file uploads still hit the same path; the dir is
+                # cleaned up at the end.
+                staging = tempfile.mkdtemp(prefix="sss_ingest_")
+                staged_paths = []
+                try:
+                    for _name, filename, data in files:
+                        # Sanitise: drop any directory component the
+                        # browser may have sent (it shouldn't, but
+                        # belt-and-braces against path traversal).
+                        safe = os.path.basename(filename) or "upload.bin"
+                        path_on_disk = os.path.join(staging, safe)
+                        # If two uploads share a name, suffix the later
+                        # ones — preserves CSV path matching.
+                        if os.path.exists(path_on_disk):
+                            stem, ext = os.path.splitext(safe)
+                            i = 1
+                            while os.path.exists(path_on_disk):
+                                path_on_disk = os.path.join(
+                                    staging, f"{stem}_{i}{ext}")
+                                i += 1
+                        with open(path_on_disk, "wb") as fp:
                             fp.write(data)
-                        with _PIPELINE_LOCK:
-                            summary = _run_ingest(tmp_path, filename)
-                        results.append({
-                            "ok": True,
-                            "filename": filename,
-                            "bytes": len(data),
-                            "result": summary,
-                        })
-                    except Exception as e:
-                        results.append({
-                            "ok": False,
-                            "filename": filename,
-                            "error": str(e),
-                        })
-                    finally:
+                        staged_paths.append((filename, path_on_disk, len(data)))
+
+                    # If a .csv is part of the batch, treat the rest as
+                    # sibling references for path resolution and only
+                    # ingest the CSV(s). Otherwise iterate every file.
+                    csv_paths = [t for t in staged_paths
+                                 if t[0].lower().endswith(".csv")]
+                    to_ingest = csv_paths if csv_paths else staged_paths
+
+                    results = []
+                    for filename, path_on_disk, nbytes in to_ingest:
                         try:
-                            os.unlink(tmp_path)
-                        except OSError:
-                            pass
-                # If a single file was sent, flatten the response so the
-                # UI can read `result` / `error` directly.
+                            with _PIPELINE_LOCK:
+                                summary = _run_ingest(
+                                    path_on_disk, filename,
+                                    label=label, base_dir=staging)
+                            # ingest_file returns {"error": ...} for
+                            # client-fault cases (missing label, etc.)
+                            # without raising. Surface as not-ok.
+                            if isinstance(summary, dict) and summary.get("error"):
+                                results.append({
+                                    "ok": False,
+                                    "filename": filename,
+                                    "bytes": nbytes,
+                                    "error": summary["error"],
+                                    "result": summary,
+                                })
+                            else:
+                                results.append({
+                                    "ok": True,
+                                    "filename": filename,
+                                    "bytes": nbytes,
+                                    "result": summary,
+                                })
+                        except Exception as e:
+                            results.append({
+                                "ok": False,
+                                "filename": filename,
+                                "bytes": nbytes,
+                                "error": str(e),
+                            })
+                finally:
+                    try:
+                        for _, p, _ in staged_paths:
+                            try: os.unlink(p)
+                            except OSError: pass
+                        os.rmdir(staging)
+                    except OSError:
+                        pass
+
                 if len(results) == 1:
                     _json(self, {**results[0]})
                 else:

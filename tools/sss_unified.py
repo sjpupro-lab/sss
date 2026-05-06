@@ -488,8 +488,17 @@ class CEMemory(_BridgedCEMemory):
 
     # ── primary API used by the pipeline ────────────────────────
 
-    def add(self, block, canny, color_avg, quality, tags, source=""):
-        """Append a cell. Routes through bridge -> ce_storage_add_typed."""
+    def add(self, block, canny, color_avg, quality, tags, source="",
+            *, amp=None, phase=None, fp=None):
+        """Append a cell. Routes through bridge -> ce_storage_add_typed.
+
+        Optional spectrogram fields (kept Python-side; CEStorage only
+        sees the canny + color bytes via the bridge):
+            amp   — list of per-(row, channel) rfft amplitudes
+                    (length = block_height * 3, each entry shape (NF,))
+            phase — same shape as amp; per-(row, channel) phases
+            fp    — 256-bin sss-fingerprint of the label text (or None)
+        """
         bridge_block = self._slot_for_block.get(block, "bot")
         cid = super().add_cell(bridge_block, canny, None, color_avg,
                                quality=float(quality), source=source)
@@ -518,6 +527,9 @@ class CEMemory(_BridgedCEMemory):
             "source": source,
             "gen": self.generation,
             "uses": 0,
+            "amp": amp,
+            "phase": phase,
+            "fp": fp,
         }
         cells_for_block.append(cell)
         for t in tags:
@@ -714,9 +726,49 @@ class SculptGenerator:
             varied = np.clip(varied, 0, 255).astype(np.uint8)
         return varied
 
+    def _block_from_amp_phase(self, cells, bh):
+        """Row-partition multiple cells' (per-row, per-channel) rfft
+        spectrograms back into a (bh, W, 3) float32 block.
+
+        `cells` is a list of cell dicts that all carry non-None `amp`
+        and `phase`. Each row of the output is reconstructed from
+        whichever cell owns that region (region = r * n_cells / bh).
+        Cells trained at a different block height map their rows by
+        nearest-neighbour. Returns None if no cell has spectrograms."""
+        with_spec = [c for c in cells
+                     if c.get("amp") is not None and c.get("phase") is not None]
+        if not with_spec:
+            return None
+        block = np.zeros((bh, W, 3), np.float32)
+        n_cells = len(with_spec)
+        for r in range(bh):
+            region = (r * n_cells) // max(1, bh)
+            if region >= n_cells:
+                region = n_cells - 1
+            cell = with_spec[region]
+            amps = cell["amp"]; phases = cell["phase"]
+            cell_bh = max(1, len(amps) // 3)
+            sr = min(int(r * cell_bh / max(1, bh)), cell_bh - 1)
+            for c in range(3):
+                a = np.asarray(amps[sr * 3 + c], dtype=np.float32)
+                p = np.asarray(phases[sr * 3 + c], dtype=np.float32)
+                spec = a * np.exp(1j * p)
+                row_recon = np.fft.irfft(spec, n=W)
+                block[r, :, c] = np.clip(row_recon * 255.0, 0, 255)
+        return block
+
     def _recombine(self, block_name, bh, intent, hits):
         block = np.zeros((bh, W, 3), np.float32)
         block_cells = [(s, c) for s, c, b in hits if b == block_name]
+
+        # When any matching cell carries an FFT spectrogram (the new
+        # labeled-ingest path), prefer that reconstruction over the
+        # old colour/canny blend — the spectrogram is the actual
+        # trained pattern.
+        spec_block = self._block_from_amp_phase(
+            [c for _, c in block_cells], bh)
+        if spec_block is not None:
+            return np.clip(spec_block, 0, 255)
 
         if len(block_cells) >= 2:
             _, struct_cell = max(block_cells, key=lambda x: x[1]["quality"])
@@ -758,6 +810,17 @@ class SculptGenerator:
         return np.clip(cell_block * cell_weight + new_block * (1 - cell_weight), 0, 255)
 
     def _sculpt_new(self, block_name, bh, intent):
+        # Prefer spectrogram reconstruction when memory has any cells
+        # for this block that carry trained amp/phase. Falls back to
+        # the colour-blend init when none do (legacy seed cells, text
+        # cells, video frames).
+        all_block_cells = self.memory.cells.get(block_name, [])
+        if all_block_cells:
+            best = self.memory.get_best(block_name, 4)
+            spec_block = self._block_from_amp_phase(best, bh)
+            if spec_block is not None:
+                return np.clip(spec_block, 0, 255)
+
         block = np.zeros((bh, W, 3), np.float32)
         base_colors = {
             "hair":  self.COLOR_BGR.get("hair_dark", (50, 55, 70)),

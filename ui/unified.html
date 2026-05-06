@@ -33,6 +33,32 @@
   }
   .ingest-row .item.err  { border-color:#7d1f1f; color:#f85149; }
   .ingest-row .item.ok   { border-color:#244c2c; }
+  /* Mode tabs (라벨+파일 / CSV). */
+  .ingest-tabs { display:flex; gap:4px; margin-bottom:10px; }
+  .ingest-tab  {
+    flex:1; min-height:40px; padding:8px 10px;
+    background:#0f1117; color:#8b949e;
+    border:1px solid #30363d; border-radius:6px;
+    cursor:pointer; font-family:monospace; font-size:13px;
+  }
+  .ingest-tab.active { background:#1f6feb; color:#fff; border-color:#1f6feb; }
+  .ingest-tab:hover  { color:#e6edf3; }
+  .ingest-mode { display:none; }
+  .ingest-mode.active { display:flex; flex-direction:column; gap:8px; }
+  /* Label input + train button. Touch-friendly heights for Termux. */
+  .ingest-label {
+    width:100%; min-height:40px; padding:8px 10px;
+    background:#161b22; color:#e6edf3;
+    border:1px solid #30363d; border-radius:6px;
+    font-family:monospace; font-size:14px;
+  }
+  .ingest-train {
+    margin:0; padding:10px 14px; min-height:44px;
+    background:#1f6feb; color:#fff;
+    border:none; border-radius:6px;
+    cursor:pointer; font-family:monospace; font-size:14px;
+  }
+  .ingest-train:disabled { opacity:0.5; cursor:not-allowed; }
   /* Status line for the file ingest panel — bigger than the surrounding
      12px fineprint so the "학습 중 / 학습 완료" feedback is visible at
      a glance on phones. */
@@ -109,13 +135,44 @@
 
   <div class="panel" style="margin-top:16px">
     <div>파일 학습 (Ingest)</div>
-    <div class="ingest-row" style="margin-top:10px">
-      <input type="file" id="ingest-files" class="ingest-pick" multiple
-             accept="image/*,video/*,.txt,.md,.csv,.ppm,.bmp" />
-      <div id="ingest-status">파일을 선택하면 자동으로 학습합니다.</div>
-      <div id="ingest-hint">이미지 / 영상 / 텍스트 (최대 50MB)</div>
-      <div id="ingest-results"></div>
+
+    <div class="ingest-tabs" style="margin-top:10px">
+      <button class="ingest-tab active" id="tab-label" type="button"
+              onclick="switchIngestMode('label')">이미지 + 라벨 직접 입력</button>
+      <button class="ingest-tab" id="tab-csv" type="button"
+              onclick="switchIngestMode('csv')">CSV 파일로 일괄 학습</button>
     </div>
+
+    <!-- Mode A: label + multiple images -->
+    <div class="ingest-mode active" id="mode-label">
+      <input type="text" id="ingest-label" class="ingest-label"
+             placeholder="라벨 (예: red flower garden)" />
+      <input type="file" id="ingest-files" class="ingest-pick" multiple
+             accept="image/*,.ppm,.bmp" />
+      <div id="ingest-files-summary" style="font-size:12px; color:#8b949e">
+        선택된 파일 없음
+      </div>
+      <button type="button" class="ingest-train" id="btn-ingest"
+              onclick="ingestLabeledFiles()">학습 시작</button>
+    </div>
+
+    <!-- Mode B: CSV (path,label rows) + optional sibling images -->
+    <div class="ingest-mode" id="mode-csv">
+      <input type="file" id="ingest-csv" class="ingest-pick"
+             accept=".csv" />
+      <input type="file" id="ingest-csv-images" class="ingest-pick" multiple
+             accept="image/*,.ppm,.bmp" />
+      <div style="font-size:12px; color:#8b949e">
+        CSV 형식: <code>filepath,label</code> (줄당 1개). 같은 폴더의
+        이미지를 함께 선택하면 상대경로가 해소됩니다.
+      </div>
+      <button type="button" class="ingest-train" id="btn-ingest-csv"
+              onclick="ingestCsvBatch()">CSV 학습 시작</button>
+    </div>
+
+    <div id="ingest-status" style="margin-top:8px">대기 중</div>
+    <div id="ingest-hint">이미지 (최대 50MB), 라벨 필수</div>
+    <div id="ingest-results"></div>
   </div>
 
   <div class="panel" style="margin-top:16px">
@@ -126,13 +183,27 @@
 
 <script>
 // The server pipeline is process-global, so /api/unified, /api/upgrade,
-// and /api/ingest must not run concurrently. Lock all three controls
-// whenever any of them is in flight.
+// and /api/ingest must not run concurrently. Lock everything whenever
+// any of them is in flight.
 function lockButtons(busy) {
-  document.getElementById('btn-gen').disabled = busy;
-  document.getElementById('btn-up').disabled  = busy;
-  const f = document.getElementById('ingest-files');
-  if (f) f.disabled = busy;
+  for (const id of ['btn-gen', 'btn-up', 'btn-ingest', 'btn-ingest-csv']) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = busy;
+  }
+  for (const id of ['ingest-label', 'ingest-files',
+                    'ingest-csv', 'ingest-csv-images']) {
+    const el = document.getElementById(id);
+    if (el) el.disabled = busy;
+  }
+}
+
+function switchIngestMode(mode) {
+  // mode is 'label' or 'csv'.
+  for (const m of ['label', 'csv']) {
+    document.getElementById('mode-' + m).classList.toggle('active', m === mode);
+    document.getElementById('tab-' + m).classList.toggle('active', m === mode);
+  }
+  setIngestStatus('대기 중', '');
 }
 
 function escapeHtml(s) {
@@ -217,48 +288,111 @@ function setIngestStatus(text, kind) {
   el.textContent = text;
 }
 
-async function ingestFiles(files) {
-  const results = document.getElementById('ingest-results');
-  if (!files.length) return;
+async function postIngest(formData) {
+  const res = await fetch('/api/ingest', { method: 'POST', body: formData });
+  return res.json();
+}
+
+function summariseResults(filename, data, accum) {
+  if (data && data.ok) {
+    accum.okCount++;
+    accum.cellsTotal += (data.result && data.result.cells_added) || 0;
+  } else {
+    accum.errCount++;
+  }
+  document.getElementById('ingest-results')
+    .appendChild(renderIngestRow(filename, data));
+}
+
+function finishIngest(files, accum, mode) {
+  const total = files.length || 1;
+  if (accum.errCount === 0) {
+    setIngestStatus(
+      `✓ ${accum.okCount}개 ${mode === 'csv' ? 'CSV' : '파일'} 학습 완료`
+      + ` (+${accum.cellsTotal} 셀)`,
+      'done');
+  } else if (accum.okCount === 0) {
+    setIngestStatus(`✗ 학습 실패 (${accum.errCount}/${total})`, 'err');
+  } else {
+    setIngestStatus(
+      `⚠ 일부 학습 완료: 성공 ${accum.okCount} · 실패 ${accum.errCount}`
+      + ` (+${accum.cellsTotal} 셀)`,
+      'partial');
+  }
+}
+
+async function ingestLabeledFiles() {
+  const labelEl = document.getElementById('ingest-label');
+  const label = (labelEl.value || '').trim();
+  const files = Array.from(
+    (document.getElementById('ingest-files').files) || []);
+
+  if (!label) {
+    setIngestStatus('라벨을 입력해주세요', 'err');
+    labelEl.focus();
+    return;
+  }
+  if (!files.length) {
+    setIngestStatus('이미지 파일을 선택해주세요', 'err');
+    return;
+  }
 
   lockButtons(true);
-  results.innerHTML = '';
+  document.getElementById('ingest-results').innerHTML = '';
+  const accum = { okCount: 0, errCount: 0, cellsTotal: 0 };
   let done = 0;
-  let okCount = 0;
-  let errCount = 0;
-  let cellsTotal = 0;
   for (const file of files) {
     setIngestStatus(
       `학습 중... (${done + 1}/${files.length}) ${file.name}`, 'busy');
     const fd = new FormData();
+    fd.append('label', label);
     fd.append('file', file);
     let data;
-    try {
-      const res = await fetch('/api/ingest', { method: 'POST', body: fd });
-      data = await res.json();
-    } catch (e) {
-      data = { ok: false, error: String(e) };
-    }
-    if (data && data.ok) {
-      okCount++;
-      cellsTotal += (data.result && data.result.cells_added) || 0;
-    } else {
-      errCount++;
-    }
-    results.appendChild(renderIngestRow(file.name, data));
+    try { data = await postIngest(fd); }
+    catch (e) { data = { ok: false, error: String(e) }; }
+    summariseResults(file.name, data, accum);
     done++;
   }
+  finishIngest(files, accum, 'label');
+  lockButtons(false);
+}
 
-  if (errCount === 0) {
-    setIngestStatus(
-      `✓ ${okCount}개 파일 학습 완료 (+${cellsTotal} 셀)`, 'done');
-  } else if (okCount === 0) {
-    setIngestStatus(`✗ 학습 실패 (${errCount}/${files.length})`, 'err');
+async function ingestCsvBatch() {
+  const csvFile = (document.getElementById('ingest-csv').files || [])[0];
+  const sibling = Array.from(
+    (document.getElementById('ingest-csv-images').files) || []);
+  if (!csvFile) {
+    setIngestStatus('CSV 파일을 선택해주세요', 'err');
+    return;
+  }
+
+  lockButtons(true);
+  document.getElementById('ingest-results').innerHTML = '';
+  setIngestStatus('CSV 학습 중...', 'busy');
+
+  const fd = new FormData();
+  fd.append('file', csvFile);
+  for (const img of sibling) fd.append('file', img);
+
+  let data;
+  try { data = await postIngest(fd); }
+  catch (e) { data = { ok: false, error: String(e) }; }
+
+  // CSV ingest returns one consolidated result. Treat it as a single
+  // row in the results panel.
+  const accum = { okCount: 0, errCount: 0, cellsTotal: 0 };
+  summariseResults(csvFile.name, data, accum);
+
+  // The CSV summary itself usually has files_ok / files_err counts
+  // — surface those in the status line if present.
+  if (data && data.ok && data.result && data.result.type === 'csv') {
+    const r = data.result;
+    accum.okCount    = r.files_ok  || 0;
+    accum.errCount   = (r.files_err || []).length;
+    accum.cellsTotal = r.cells_added || 0;
+    finishIngest({ length: r.rows || 0 }, accum, 'csv');
   } else {
-    setIngestStatus(
-      `⚠ 일부 학습 완료: 성공 ${okCount} · 실패 ${errCount}`
-      + ` (+${cellsTotal} 셀)`,
-      'partial');
+    finishIngest({ length: 1 }, accum, 'csv');
   }
   lockButtons(false);
 }
@@ -285,15 +419,18 @@ function renderIngestRow(filename, data) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  // No more auto-upload on file select. Show a small "N files
+  // selected" counter so the user knows the picker registered them.
   const picker = document.getElementById('ingest-files');
-  if (!picker) return;
-  picker.addEventListener('change', async (ev) => {
-    const files = Array.from(ev.target.files || []);
-    if (!files.length) return;
-    await ingestFiles(files);
-    // Reset value so picking the same file again still fires `change`.
-    ev.target.value = '';
-  });
+  const summary = document.getElementById('ingest-files-summary');
+  if (picker && summary) {
+    picker.addEventListener('change', () => {
+      const n = (picker.files || []).length;
+      summary.textContent = n
+        ? `${n}개 파일 선택됨`
+        : '선택된 파일 없음';
+    });
+  }
 });
 
 function renderUpgradeReport(report) {
