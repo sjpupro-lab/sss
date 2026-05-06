@@ -36,10 +36,11 @@
   /* Status line for the file ingest panel — bigger than the surrounding
      12px fineprint so the "학습 중 / 학습 완료" feedback is visible at
      a glance on phones. */
-  #ingest-status      { font-size:14px; color:#8b949e; line-height:1.4; }
-  #ingest-status.busy { color:#d97706; }
-  #ingest-status.done { color:#3fb950; font-weight:bold; }
-  #ingest-status.err  { color:#f85149; font-weight:bold; }
+  #ingest-status         { font-size:14px; color:#8b949e; line-height:1.4; }
+  #ingest-status.busy    { color:#d97706; }
+  #ingest-status.done    { color:#3fb950; font-weight:bold; }
+  #ingest-status.partial { color:#d29922; font-weight:bold; }
+  #ingest-status.err     { color:#f85149; font-weight:bold; }
   #ingest-hint        { font-size:11px; color:#6e7681; margin-top:2px; }
   /* Top-bar links. */
   .top-links { display:flex; gap:12px; align-items:center;
@@ -68,7 +69,10 @@
 <div class="wrap">
   <h1>SSS Unified Pipeline</h1>
   <div class="top-links">
-    <a href="/forge" target="_blank" rel="noopener">SSS Forge UI 열기 →</a>
+    <a href="/forge" target="_blank" rel="noopener"
+       title="Forge UI는 별도 서버(ui/server.py)가 필요합니다. /forge 페이지에 실행 방법이 있습니다.">
+      SSS Forge UI 안내 →
+    </a>
   </div>
   <input id="prompt" value="red character smile petals" />
   <div>
@@ -206,9 +210,9 @@ async function upgrade() {
 }
 
 function setIngestStatus(text, kind) {
-  // kind is one of '', 'busy', 'done', 'err'.
+  // kind is one of '', 'busy', 'done', 'partial', 'err'.
   const el = document.getElementById('ingest-status');
-  el.classList.remove('busy', 'done', 'err');
+  el.classList.remove('busy', 'done', 'partial', 'err');
   if (kind) el.classList.add(kind);
   el.textContent = text;
 }
@@ -252,8 +256,9 @@ async function ingestFiles(files) {
     setIngestStatus(`✗ 학습 실패 (${errCount}/${files.length})`, 'err');
   } else {
     setIngestStatus(
-      `학습 완료: 성공 ${okCount} · 실패 ${errCount} (+${cellsTotal} 셀)`,
-      'done');
+      `⚠ 일부 학습 완료: 성공 ${okCount} · 실패 ${errCount}`
+      + ` (+${cellsTotal} 셀)`,
+      'partial');
   }
   lockButtons(false);
 }
