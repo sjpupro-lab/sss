@@ -27,6 +27,14 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # Ensure repo root import works when launched from ui/ or Termux shortcuts.
 sys.path.insert(0, str(ROOT))
 
+# Stdlib-only PNG encoder lives in tools/. No cv2 / Pillow dependency.
+from tools.sss_image_io import numpy_to_png_data_uri  # noqa: E402
+
+try:
+    import numpy as np  # only used to coerce inputs into ndarrays
+except ImportError:
+    np = None
+
 PIPELINE = None
 
 # ThreadingHTTPServer can deliver overlapping requests, but the
@@ -54,41 +62,42 @@ def _read_json(handler):
 
 
 def _png_data_uri(img):
-    """Accept numpy BGR/RGB image or path and return data:image/png URI."""
-    try:
-        import cv2
-        import numpy as np
-    except Exception:
-        cv2 = None
-        np = None
+    """Return a data: URI for a numpy image or a file path.
 
+    - numpy ndarray → encoded as PNG (`data:image/png;base64,...`).
+    - existing .png path → passed through as `data:image/png;base64,...`.
+    - existing .jpg/.jpeg path → passed through as `data:image/jpeg;base64,...`.
+    Anything else (None, missing path, unsupported extension, non-image
+    object) returns None.
+
+    PNG encoding is handled by tools/sss_image_io and uses only stdlib
+    + numpy — no cv2, no Pillow."""
     if img is None:
         return None
+
+    # File-path branch: pass the file's own bytes through. The MIME
+    # reflects what's actually on disk so we don't claim PNG for a JPEG.
     if isinstance(img, (str, os.PathLike)):
         p = Path(img)
         if not p.exists():
             return None
         ext = p.suffix.lower()
-        data = p.read_bytes()
         if ext == ".png":
             mime = "image/png"
         elif ext in (".jpg", ".jpeg"):
             mime = "image/jpeg"
         else:
             return None
+        data = p.read_bytes()
         return f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
-    if cv2 is None or np is None:
+
+    # ndarray branch.
+    if np is None:
         return None
-    arr = img
-    if not hasattr(arr, "shape"):
+    arr = np.asarray(img)
+    if not hasattr(arr, "shape") or arr.ndim < 2:
         return None
-    arr = arr.copy()
-    if arr.dtype != np.uint8:
-        arr = np.clip(arr, 0, 255).astype(np.uint8)
-    ok, buf = cv2.imencode(".png", arr)
-    if not ok:
-        return None
-    return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
+    return numpy_to_png_data_uri(arr)
 
 
 def _as_plain(x, depth=0):
