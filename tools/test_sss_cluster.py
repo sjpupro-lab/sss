@@ -50,8 +50,21 @@ def _train_2col_model(out_dir: str) -> str:
         "--out",    model,
         "--size",   "64",
     ]
-    subprocess.run(cmd, check=True, cwd=ROOT,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Capture stdout/stderr so the test stays quiet on success but
+    # surfaces the trainer's diagnostics on failure (otherwise a
+    # missing dependency or a corrupt PPM looks like a bare "exit 1"
+    # to anyone running this in CI).
+    proc = subprocess.run(cmd, cwd=ROOT,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True)
+    if proc.returncode != 0:
+        sys.stderr.write("[test_sss_cluster] sss_train.py failed:\n")
+        if proc.stdout:
+            sys.stderr.write("--- stdout ---\n" + proc.stdout)
+        if proc.stderr:
+            sys.stderr.write("--- stderr ---\n" + proc.stderr)
+        raise subprocess.CalledProcessError(
+            proc.returncode, cmd, output=proc.stdout, stderr=proc.stderr)
     return model
 
 
@@ -91,11 +104,16 @@ def main() -> int:
               f"face:  {len(face_clusters)} clusters (≥ 2)")
 
         # At least one cluster per type must contain multiple cells —
-        # otherwise the discovery effectively did nothing useful.
+        # otherwise the discovery effectively did nothing useful. Run
+        # the same assertion across all three types so a degenerate
+        # FACE clustering (all singletons) trips the test instead of
+        # sneaking through unchecked.
         check(any(c["size"] >= 2 for c in color_clusters),
               "color: at least one multi-cell cluster")
         check(any(c["size"] >= 2 for c in shape_clusters),
               "shape: at least one multi-cell cluster")
+        check(any(c["size"] >= 2 for c in face_clusters),
+              "face:  at least one multi-cell cluster")
 
         # The morpheme_index for COLOR must contain stems we put in
         # (red/green/blue). The trainer suffixes per image, so the stem

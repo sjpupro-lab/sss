@@ -50,7 +50,6 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Iterable, Tuple
 
 # Use the stable load_sss_model + SSSCell types that tools/sss_restore.py
 # already exposes — saves us redoing the v8/v9 parser.
@@ -113,12 +112,21 @@ def _pairwise_dists(vectors: np.ndarray) -> np.ndarray:
 def _cluster_threshold(distmat: np.ndarray, base: float) -> float:
     """Convert the user's normalised radius into an absolute distance.
 
-    `base` is the pre-clip user threshold (typically 0.35 = 35 %% of
+    `base` is the pre-clip user threshold (typically 0.35 = 35 % of
     the mean off-diagonal distance). For an N×N distance matrix the
     mean is taken over the strictly-upper triangle (skips the zero
-    diagonal). When fewer than two cells participate we fall back to
-    the smallest non-zero element — a one-cell pool always becomes
-    a one-cell cluster anyway."""
+    diagonal).
+
+    Edge-case fallbacks (chosen to match the greedy clusterer's
+    expectations rather than the data):
+      * N ≤ 1 (or empty upper triangle) → return +inf so the caller's
+        `d < threshold` test always succeeds; with only one cell that
+        cell becomes the sole cluster and there's nothing to compare it
+        against, so the threshold value is moot.
+      * mean_d == 0 (every off-diagonal distance is zero — all cells
+        are identical) → return 1e-6 so cells still merge under
+        single-link greedy clustering even though the absolute
+        threshold collapses to zero."""
     n = distmat.shape[0]
     if n <= 1:
         return float("inf")

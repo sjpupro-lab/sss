@@ -154,9 +154,15 @@ static double now_sec(void) {
     struct timespec ts;
     /* clock_gettime(CLOCK_REALTIME) is portable across glibc, musl,
      * macOS, and Bionic (Termux). timespec_get(..., TIME_UTC) is C11
-     * but only landed in Bionic at API 29 — older Android devices
-     * link-fail. The two return the same wall-clock value here. */
+     * and ships in MSVC's UCRT — Windows toolchains may not export
+     * `clock_gettime` at all, so route Windows back through C11.
+     * Older Bionic (< API 29) skipped C11 timespec_get, which is why
+     * we don't use it on POSIX. */
+#if defined(_WIN32)
+    timespec_get(&ts, TIME_UTC);
+#else
     clock_gettime(CLOCK_REALTIME, &ts);
+#endif
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
@@ -489,16 +495,22 @@ int main(int argc, char** argv) {
     /* Resume vs fresh-start. With --load, we hydrate the in-memory
      * SpatialAI from disk and append new keyframes/deltas on top — the
      * delta chain stays valid because ai_load restores both KF and
-     * Delta tables. Without --load (or when the file is missing), we
-     * fall back to a fresh model; this matches the legacy behaviour so
-     * existing scripts keep working unchanged. */
+     * Delta tables. --load is an explicit opt-in: any ai_load() failure
+     * (missing file, bad magic, version skew) is fatal so the user
+     * doesn't accidentally continue training against a fresh model and
+     * silently lose the resume contract. Without --load we always
+     * start from spatial_ai_create() — same legacy behaviour as before. */
     SpatialAI* ai = NULL;
     if (args.load && args.load[0]) {
         SpaiStatus ls = SPAI_OK;
         ai = ai_load(args.load, &ls);
         if (!ai || ls != SPAI_OK) {
-            fprintf(stderr, "[stream] ai_load(%s) failed: status=%d\n",
-                    args.load, (int)ls);
+            /* spai_status_str names the failure mode (OPEN / MAGIC /
+             * VERSION / ...) which is far more actionable than a raw
+             * integer when the user has to debug why their resume
+             * didn't take. */
+            fprintf(stderr, "[stream] ai_load(%s) failed: %s (status=%d)\n",
+                    args.load, spai_status_str(ls), (int)ls);
             return 1;
         }
         printf("[stream] loaded %s: KF=%u Delta=%u (continuing)\n",
