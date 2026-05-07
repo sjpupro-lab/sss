@@ -35,6 +35,17 @@ typedef enum {
      * (index, position, tick, strength) descriptor, not the original
      * patch — see ce_residual_codebook.h. */
     CE_TYPE_RESIDUAL = 4,
+    /* Atmos scene-object signatures — one CEStorage row per scene
+     * object packed by ce_storage_persist_scene_object():
+     *   slot      = scene_id          (caller-supplied logical scene)
+     *   block_idx = scene-local object id
+     *   keyframe  = packed signature (avg color, waves, geometry, motion)
+     *   delta     = delta against the previous object in the same scene
+     *               (zero CEUnit for index 0)
+     * Encoded by ce_storage_persist_scene_object, matched by
+     * ce_storage_match_scene_signature. The packed layout never spills
+     * to JSON — it lives entirely inside the CEUnit byte stream. */
+    CE_TYPE_SCENE    = 5,
 
     CE_TYPE_UNKNOWN = 0xFF
 } CEType;
@@ -46,6 +57,7 @@ static inline const char *ce_type_name(CEType t) {
         case CE_TYPE_AUDIO:    return "audio";
         case CE_TYPE_SLIG:     return "slig";
         case CE_TYPE_RESIDUAL: return "residual";
+        case CE_TYPE_SCENE:    return "scene";
         default:               return "unknown";
     }
 }

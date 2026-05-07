@@ -319,3 +319,149 @@ uint32_t ce_tick_sorted_indices(const CEStorage *s,
     }
     return n;
 }
+
+/* ─── Atmos scene-object persistence (CE_TYPE_SCENE) ────────────────
+ *
+ * The signature packing layout is shared with ce_scene_bridge.c and
+ * matches the byte map advertised in ce_storage.h. Keeping the packer
+ * here (alongside the storage append) guarantees that the bytes that
+ * land in CEStorage are exactly what ce_storage_match_scene_signature
+ * reads — no per-call drift. */
+#include "ce_scene_object.h"
+
+static void scene_object_pack_signature(CEUnit *out,
+                                        const struct CESceneObject_s *obj) {
+    /* Layout (deterministic, byte-exact). 64 bytes total.
+     *
+     *   inc.R.plus[0..3]  = color_r, color_g, color_b, brightness
+     *   inc.R.minus[0..3] = id_lo, id_hi, group_lo, group_hi
+     *   inc.G.plus[0..3]  = waves[0..3].freq
+     *   inc.G.minus[0..3] = waves[4..7].freq
+     *   inc.B.plus[0..3]  = waves[0..3].amp
+     *   inc.B.minus[0..3] = waves[4..7].amp
+     *   inc.A.plus[0..3]  = radius, opacity, cx, cy
+     *   inc.A.minus[0..3] = wave_count, kf_count, color_r, color_g
+     *
+     *   dec.R.plus[0..3]  = waves[0..3].phase
+     *   dec.R.minus[0..3] = waves[4..7].phase
+     *   dec.G.plus[0..3]  = waves[0..3].waveform
+     *   dec.G.minus[0..3] = waves[4..7].waveform
+     *   dec.B.plus[0..3]  = color_b, opacity, master_marker(0xA7), reserved
+     *   dec.B.minus[0..3] = interp_cx_lo, interp_cx_hi, interp_cy_lo, interp_cy_hi
+     *   dec.A.plus[0..3]  = current_key_lo, current_key_hi, scene_marker(0x5C), version(0x02)
+     *   dec.A.minus[0..3] = 0, 0, 0, 0
+     */
+    uint8_t *b = ce_bytes(out);
+    for (int i = 0; i < 64; i++) b[i] = 0;
+
+    int brightness = ((int)obj->color_r + (int)obj->color_g + (int)obj->color_b) / 3;
+
+    b[ 0] = obj->color_r;
+    b[ 1] = obj->color_g;
+    b[ 2] = obj->color_b;
+    b[ 3] = (uint8_t)brightness;
+    b[ 4] = (uint8_t)(obj->id & 0xFF);
+    b[ 5] = (uint8_t)((obj->id >> 8) & 0xFF);
+    b[ 6] = (uint8_t)(obj->group_id & 0xFF);
+    b[ 7] = (uint8_t)((obj->group_id >> 8) & 0xFF);
+    for (int i = 0; i < 4; i++) {
+        b[ 8 + i] = (i < (int)obj->wave_count) ? obj->waves[i].freq : 0;
+        b[12 + i] = (i + 4 < (int)obj->wave_count) ? obj->waves[i + 4].freq : 0;
+    }
+    for (int i = 0; i < 4; i++) {
+        b[16 + i] = (i < (int)obj->wave_count) ? obj->waves[i].amp : 0;
+        b[20 + i] = (i + 4 < (int)obj->wave_count) ? obj->waves[i + 4].amp : 0;
+    }
+    b[24] = obj->radius;
+    b[25] = obj->opacity;
+    b[26] = obj->cx;
+    b[27] = obj->cy;
+    b[28] = obj->wave_count;
+    b[29] = (uint8_t)(obj->keyframe_count & 0xFF);
+    b[30] = obj->color_r;
+    b[31] = obj->color_g;
+
+    for (int i = 0; i < 4; i++) {
+        b[32 + i] = (i < (int)obj->wave_count) ? obj->waves[i].phase : 0;
+        b[36 + i] = (i + 4 < (int)obj->wave_count) ? obj->waves[i + 4].phase : 0;
+    }
+    for (int i = 0; i < 4; i++) {
+        b[40 + i] = (i < (int)obj->wave_count) ? obj->waves[i].waveform : 0;
+        b[44 + i] = (i + 4 < (int)obj->wave_count) ? obj->waves[i + 4].waveform : 0;
+    }
+    b[48] = obj->color_b;
+    b[49] = obj->opacity;
+    b[50] = 0xA7;
+    b[51] = 0;
+    b[52] = (uint8_t)(obj->interp_cx_256 & 0xFF);
+    b[53] = (uint8_t)((obj->interp_cx_256 >> 8) & 0xFF);
+    b[54] = (uint8_t)(obj->interp_cy_256 & 0xFF);
+    b[55] = (uint8_t)((obj->interp_cy_256 >> 8) & 0xFF);
+    b[56] = (uint8_t)(obj->current_key & 0xFF);
+    b[57] = (uint8_t)((obj->current_key >> 8) & 0xFF);
+    b[58] = 0x5C;
+    b[59] = 0x02;
+}
+
+uint32_t ce_storage_persist_scene_object(CEStorage *s,
+                                         uint32_t canvas_id,
+                                         uint16_t scene_id,
+                                         const struct CESceneObject_s *obj) {
+    if (!s || !obj) return 0;
+
+    CEUnit signature;
+    scene_object_pack_signature(&signature, obj);
+
+    /* Chain delta against the most recent CE_TYPE_SCENE entry under
+     * (canvas_id, scene_id). Zero CEUnit if none yet. */
+    CEUnit anchor;
+    ce_init(&anchor);
+    int32_t last_idx = -1;
+    for (uint32_t i = 0; i < s->count; i++) {
+        const CEStorageEntry *e = &s->entries[i];
+        if (e->type != CE_TYPE_SCENE)   continue;
+        if (e->canvas_id != canvas_id)  continue;
+        if (e->slot != scene_id)        continue;
+        last_idx = (int32_t)i;
+    }
+    if (last_idx >= 0) anchor = s->entries[last_idx].keyframe;
+
+    CEUnit delta;
+    ce_delta(&delta, &anchor, &signature);
+
+    ce_storage_add_typed(s, canvas_id, scene_id, obj->id, CE_TYPE_SCENE,
+                         &signature, &delta);
+    return 1;
+}
+
+int ce_storage_match_scene_signature(const CEStorage *s,
+                                     const struct CESceneObject_s *query,
+                                     uint16_t scene_id_filter,
+                                     uint16_t *out_object_id,
+                                     uint32_t *out_distance) {
+    if (!s || !query) return 0;
+
+    CEUnit q;
+    scene_object_pack_signature(&q, query);
+
+    int found = 0;
+    uint32_t best = 0xFFFFFFFFu;
+    uint16_t best_id = 0;
+    for (uint32_t i = 0; i < s->count; i++) {
+        const CEStorageEntry *e = &s->entries[i];
+        if (e->type != CE_TYPE_SCENE) continue;
+        if (scene_id_filter != 0 && e->slot != scene_id_filter) continue;
+        uint32_t d = ce_distance(&q, &e->keyframe);
+        if (!found || d < best) {
+            best = d;
+            best_id = e->block_idx;
+            found = 1;
+        }
+    }
+    if (found) {
+        if (out_object_id) *out_object_id = best_id;
+        if (out_distance)  *out_distance  = best;
+        return 1;
+    }
+    return 0;
+}
