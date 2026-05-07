@@ -18,6 +18,7 @@ import tempfile
 import threading
 import traceback
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -296,6 +297,71 @@ def _run_ingest(filepath: str, filename: str, *,
                                   label=label, base_dir=base_dir)
 
 
+def _run_restore(src_path: str, mask_path: Optional[str], *,
+                 mode: str, prompt: str, strength: float, scale: int,
+                 target: str) -> dict:
+    """Drive tools.sss_restore. Returns
+        {"src": np.ndarray, "out": np.ndarray, "mask"?: np.ndarray,
+         "metrics": {"mse": float, "psnr": float, "elapsed_ms": float}}
+    The mask is included in the response only for `restore` mode so the
+    UI can show what region was repaired (auto-detected or supplied)."""
+    import time
+    from tools import sss_restore as _restore
+    from tools.sss_ingest import _read_image_any
+    src = _read_image_any(src_path)
+    mask = None
+    if mask_path is not None and os.path.exists(mask_path):
+        mask_img = _read_image_any(mask_path)
+        # White → damaged, dark → clean. Threshold at 127 on the mean
+        # of the three channels.
+        mask = (mask_img.mean(axis=2) > 127).astype(np.float32)
+
+    rest = _restore.SSSRestore(prompt=prompt)
+    t0 = time.perf_counter()
+    if mode == "restore":
+        if mask is None:
+            mask = _restore.auto_detect_damage(src)
+        out = rest.restore(src, mask)
+    elif mode == "upscale":
+        out = rest.upscale(src, scale=max(1, min(4, int(scale))))
+    elif mode == "sharpen":
+        out = rest.sharpen(src, strength=strength)
+    elif mode == "denoise":
+        out = rest.denoise(src, strength=strength)
+    elif mode in ("color", "color_correct"):
+        out = rest.color_correct(src, target_prompt=target or prompt)
+    elif mode == "enhance":
+        out = rest.enhance(src, prompt=prompt)
+    else:
+        raise ValueError(f"unsupported mode: {mode!r}")
+    elapsed = (time.perf_counter() - t0) * 1000.0
+
+    # MSE / PSNR are only well-defined when in/out share a shape (so
+    # not for upscale). Report 0 / inf in that case so the UI doesn't
+    # blow up trying to format `nan`.
+    if out.shape == src.shape:
+        diff = out.astype(np.float32) - src.astype(np.float32)
+        mse  = float(np.mean(diff * diff))
+        psnr = float("inf") if mse < 1e-9 else 10.0 * float(np.log10(255.0 * 255.0 / mse))
+    else:
+        mse  = 0.0
+        psnr = 0.0
+
+    metrics = {
+        "mse":   round(mse, 2),
+        "psnr":  round(psnr, 2) if psnr != float("inf") else 99.0,
+        "elapsed_ms": round(elapsed, 1),
+    }
+    out_payload = {"src": src, "out": out, "metrics": metrics}
+    if mask is not None and mode == "restore":
+        # Render the mask as a grayscale BGR overlay so _png_data_uri
+        # sends back something the browser can show next to the
+        # before / after pair.
+        m_u8 = (mask * 255.0).clip(0, 255).astype(np.uint8)
+        out_payload["mask"] = np.stack([m_u8, m_u8, m_u8], axis=-1)
+    return out_payload
+
+
 def _normalize_result(result):
     """Make UI payload from whatever tools.sss_unified returns."""
     image = None
@@ -520,6 +586,88 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     _json(self, {**results[0]})
                 else:
                     _json(self, {"ok": True, "files": results})
+            except _PayloadTooLarge as e:
+                _json(self, {"ok": False, "error": str(e)}, 413)
+            except _BadRequest as e:
+                _json(self, {"ok": False, "error": str(e)}, 400)
+            except Exception as e:
+                _json(self, {
+                    "ok": False,
+                    "error": str(e),
+                    "trace": traceback.format_exc().splitlines()[-12:],
+                }, 500)
+            return
+        if path == "/api/restore":
+            try:
+                files, fields = _parse_multipart(self)
+                image_data = None
+                image_filename = ""
+                mask_data = None
+                mask_filename = ""
+                for name, filename, data in files:
+                    if name == "image":
+                        image_data = data
+                        image_filename = filename or ""
+                    elif name == "mask":
+                        mask_data = data
+                        mask_filename = filename or ""
+                if image_data is None:
+                    raise _BadRequest("no `image` part in upload")
+
+                mode      = (fields.get("mode") or "enhance").strip().lower()
+                prompt    = (fields.get("prompt") or "").strip()
+                target    = (fields.get("target") or "").strip()
+                strength  = float(fields.get("strength") or 0.5)
+                scale     = int(fields.get("scale") or 2)
+
+                # Stage the upload to a temp file so the loader can use
+                # the same ffmpeg-aware path tools.sss_ingest uses for
+                # "anything not PNG/PPM".
+                staging = tempfile.mkdtemp(prefix="sss_restore_")
+                try:
+                    # Preserve the upload's extension so the loader can
+                    # route by format (PNG/PPM via sss_image_io,
+                    # everything else via ffmpeg). Default to .ppm when
+                    # the browser didn't send a filename, since PPM is
+                    # the only format the stdlib loader handles without
+                    # the extension hint.
+                    img_ext = os.path.splitext(image_filename)[1].lower() or ".png"
+                    src_path = os.path.join(staging, "input" + img_ext)
+                    with open(src_path, "wb") as fp:
+                        fp.write(image_data)
+                    mask_path = None
+                    if mask_data is not None:
+                        mask_ext = os.path.splitext(mask_filename)[1].lower() or ".png"
+                        mask_path = os.path.join(staging, "mask" + mask_ext)
+                        with open(mask_path, "wb") as fp:
+                            fp.write(mask_data)
+
+                    with _PIPELINE_LOCK:
+                        result = _run_restore(
+                            src_path, mask_path,
+                            mode=mode, prompt=prompt,
+                            strength=strength, scale=scale,
+                            target=target)
+                    payload = {
+                        "ok": True,
+                        "mode": mode,
+                        "image": _png_data_uri(result["out"]),
+                        "input": _png_data_uri(result["src"]),
+                        "shape_in":  list(result["src"].shape),
+                        "shape_out": list(result["out"].shape),
+                        "metrics":   result["metrics"],
+                    }
+                    if "mask" in result:
+                        payload["mask"] = _png_data_uri(result["mask"])
+                    _json(self, payload)
+                finally:
+                    try:
+                        for fn in os.listdir(staging):
+                            try: os.unlink(os.path.join(staging, fn))
+                            except OSError: pass
+                        os.rmdir(staging)
+                    except OSError:
+                        pass
             except _PayloadTooLarge as e:
                 _json(self, {"ok": False, "error": str(e)}, 413)
             except _BadRequest as e:
