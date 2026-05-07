@@ -89,6 +89,21 @@
   .bar-cell { padding:0 !important; vertical-align:middle; }
   .bar { display:inline-block; height:8px; background:#d97706; border-radius:2px; vertical-align:middle; }
   .bar-wrap { display:flex; align-items:center; gap:6px; padding:4px 8px; }
+  /* Restore / Enhance section. Chip-style radios, before/after grid. */
+  .rest-mode {
+    display:inline-flex; align-items:center; gap:6px;
+    padding:8px 12px; min-height:38px;
+    background:#0f1117; color:#8b949e;
+    border:1px solid #30363d; border-radius:6px;
+    cursor:pointer; font-size:13px;
+  }
+  .rest-mode input { width:auto; }
+  .rest-mode.active { background:#1f6feb; color:#fff; border-color:#1f6feb; }
+  .rest-mode:hover  { color:#e6edf3; }
+  #rest-status.busy   { color:#d97706; }
+  #rest-status.done   { color:#3fb950; font-weight:bold; }
+  #rest-status.err    { color:#f85149; font-weight:bold; }
+  #rest-strength { width:100%; }
 </style>
 </head>
 <body>
@@ -176,6 +191,74 @@
   </div>
 
   <div class="panel" style="margin-top:16px">
+    <div>이미지 향상 (Restore / Enhance)</div>
+    <div style="font-size:12px; color:#8b949e; margin-top:4px">
+      행+열 FFT 기반. 손상 영역은 순차 행 추론으로 복원하고,
+      정상 픽셀은 절대 건드리지 않습니다.
+    </div>
+
+    <input type="file" id="rest-file" class="ingest-pick" accept="image/*,.ppm,.bmp"
+           style="margin-top:10px" />
+    <div id="rest-file-summary" style="font-size:12px; color:#8b949e">
+      선택된 파일 없음
+    </div>
+
+    <input type="text" id="rest-prompt" class="ingest-label"
+           placeholder="참조 검색 프롬프트 (예: cat face)" />
+
+    <div style="margin-top:10px; font-size:13px;">모드</div>
+    <div id="rest-modes" style="display:flex; flex-wrap:wrap; gap:6px; margin-top:6px">
+      <label class="rest-mode active"  data-mode="restore">  <input type="radio" name="rest-mode" value="restore"  checked /> 복원</label>
+      <label class="rest-mode"         data-mode="upscale">  <input type="radio" name="rest-mode" value="upscale"  /> 업스케일</label>
+      <label class="rest-mode"         data-mode="sharpen">  <input type="radio" name="rest-mode" value="sharpen"  /> 선명하게</label>
+      <label class="rest-mode"         data-mode="denoise">  <input type="radio" name="rest-mode" value="denoise"  /> 노이즈 제거</label>
+      <label class="rest-mode"         data-mode="color">    <input type="radio" name="rest-mode" value="color"    /> 색보정</label>
+      <label class="rest-mode"         data-mode="enhance">  <input type="radio" name="rest-mode" value="enhance"  /> 종합 향상</label>
+    </div>
+
+    <div style="margin-top:10px; font-size:13px;">강도 / 옵션</div>
+    <div style="display:flex; gap:10px; align-items:center; margin-top:6px">
+      <input type="range" id="rest-strength" min="0" max="100" value="50"
+             style="flex:1" />
+      <span id="rest-strength-val" style="width:48px; text-align:right; font-size:13px">50%</span>
+    </div>
+    <div id="rest-extra" style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap">
+      <label style="font-size:12px; color:#8b949e; flex:1">
+        업스케일 배율
+        <select id="rest-scale" style="width:100%; min-height:36px; padding:6px;
+                background:#161b22; color:#e6edf3; border:1px solid #30363d; border-radius:6px">
+          <option value="2" selected>2×</option>
+          <option value="3">3×</option>
+          <option value="4">4×</option>
+        </select>
+      </label>
+      <label style="font-size:12px; color:#8b949e; flex:1">
+        색보정 키워드
+        <input type="text" id="rest-target" placeholder="warm / cool / vivid / bright / dim / 라벨"
+               style="width:100%; min-height:32px; padding:6px;
+                      background:#161b22; color:#e6edf3; border:1px solid #30363d;
+                      border-radius:6px; font-family:monospace; font-size:12px" />
+      </label>
+    </div>
+
+    <button type="button" class="ingest-train" id="btn-rest"
+            onclick="runRestore()" style="margin-top:10px">실행</button>
+    <div id="rest-status" style="font-size:14px; color:#8b949e; margin-top:8px; line-height:1.4">
+      대기 중
+    </div>
+
+    <div class="row" id="rest-result" style="display:none">
+      <div class="col panel"><div>원본</div><img id="rest-input" /></div>
+      <div class="col panel"><div>처리 후</div><img id="rest-output" /></div>
+    </div>
+    <div class="panel" id="rest-mask-panel" style="display:none; margin-top:10px">
+      <div>손상 마스크 (자동 감지 결과 또는 업로드한 마스크)</div>
+      <img id="rest-mask" />
+    </div>
+    <div id="rest-metrics" style="font-size:12px; color:#8b949e; margin-top:8px"></div>
+  </div>
+
+  <div class="panel" style="margin-top:16px">
     <div>Raw</div>
     <pre id="raw"></pre>
   </div>
@@ -186,7 +269,7 @@
 // and /api/ingest must not run concurrently. Lock everything whenever
 // any of them is in flight.
 function lockButtons(busy) {
-  for (const id of ['btn-gen', 'btn-up', 'btn-ingest', 'btn-ingest-csv']) {
+  for (const id of ['btn-gen', 'btn-up', 'btn-ingest', 'btn-ingest-csv', 'btn-rest']) {
     const el = document.getElementById(id);
     if (el) el.disabled = busy;
   }
@@ -482,6 +565,117 @@ function renderUpgradeReport(report) {
   });
   html += '</tbody></table>';
   out.innerHTML = html;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Restore / Enhance — single image upload + mode pick + before/after.
+// Talks to /api/restore in ui/unified_server.py.
+// ─────────────────────────────────────────────────────────────
+(function() {
+  const file   = document.getElementById('rest-file');
+  const summary = document.getElementById('rest-file-summary');
+  const slider = document.getElementById('rest-strength');
+  const sLabel = document.getElementById('rest-strength-val');
+  const radios = document.querySelectorAll('input[name="rest-mode"]');
+  const modes  = document.querySelectorAll('.rest-mode');
+
+  if (!file) return;   // panel not present in this build
+
+  file.addEventListener('change', () => {
+    if (file.files && file.files.length > 0) {
+      const f = file.files[0];
+      summary.textContent = f.name + ' (' + Math.round(f.size / 1024) + ' KB)';
+    } else {
+      summary.textContent = '선택된 파일 없음';
+    }
+  });
+
+  slider.addEventListener('input', () => {
+    sLabel.textContent = slider.value + '%';
+  });
+
+  // Active-state highlight on chip click — wraps the native radio.
+  modes.forEach(label => {
+    label.addEventListener('click', () => {
+      modes.forEach(l => l.classList.remove('active'));
+      label.classList.add('active');
+    });
+  });
+})();
+
+async function runRestore() {
+  const fileEl = document.getElementById('rest-file');
+  const status = document.getElementById('rest-status');
+  const result = document.getElementById('rest-result');
+  const inImg  = document.getElementById('rest-input');
+  const outImg = document.getElementById('rest-output');
+  const maskPanel = document.getElementById('rest-mask-panel');
+  const maskImg   = document.getElementById('rest-mask');
+  const metricsEl = document.getElementById('rest-metrics');
+
+  if (!fileEl.files || fileEl.files.length === 0) {
+    status.textContent = '파일을 먼저 선택해주세요.';
+    status.className = 'err';
+    return;
+  }
+  const mode = (document.querySelector('input[name="rest-mode"]:checked') || {}).value || 'enhance';
+  const prompt   = (document.getElementById('rest-prompt').value || '').trim();
+  const target   = (document.getElementById('rest-target').value || '').trim();
+  const strength = (parseInt(document.getElementById('rest-strength').value, 10) || 50) / 100.0;
+  const scale    = parseInt(document.getElementById('rest-scale').value, 10) || 2;
+
+  const fd = new FormData();
+  fd.append('image', fileEl.files[0]);
+  fd.append('mode', mode);
+  fd.append('prompt', prompt);
+  fd.append('target', target);
+  fd.append('strength', String(strength));
+  fd.append('scale', String(scale));
+
+  status.textContent = '처리 중…';
+  status.className = 'busy';
+  lockButtons(true);
+  result.style.display = 'none';
+  maskPanel.style.display = 'none';
+  metricsEl.textContent = '';
+
+  try {
+    const res = await fetch('/api/restore', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!data.ok) {
+      status.textContent = '오류: ' + (data.error || res.status);
+      status.className = 'err';
+      document.getElementById('raw').textContent = JSON.stringify(data, null, 2);
+      return;
+    }
+    inImg.src  = data.input;
+    outImg.src = data.image;
+    result.style.display = 'flex';
+    if (data.mask) {
+      maskImg.src = data.mask;
+      maskPanel.style.display = 'block';
+    }
+    const m = data.metrics || {};
+    const psnr = (m.psnr === 99 || m.psnr === Infinity) ? '∞' : m.psnr.toFixed(2);
+    metricsEl.textContent =
+      'mode=' + mode +
+      '   in=' + (data.shape_in || []).join('×') +
+      '   out=' + (data.shape_out || []).join('×') +
+      '   MSE=' + m.mse +
+      '   PSNR=' + psnr + ' dB' +
+      '   elapsed=' + m.elapsed_ms + ' ms';
+    status.textContent = '완료';
+    status.className = 'done';
+    document.getElementById('raw').textContent = JSON.stringify({
+      mode, shape_in: data.shape_in, shape_out: data.shape_out,
+      metrics: data.metrics
+    }, null, 2);
+  } catch (e) {
+    status.textContent = '실패: ' + e;
+    status.className = 'err';
+  } finally {
+    lockButtons(false);
+  }
 }
 </script>
 </body>
