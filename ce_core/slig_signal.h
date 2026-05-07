@@ -344,21 +344,6 @@ void slig_canvas_to_u8_sub(uint8_t          *out_dim_dim, int dim,
 void slig_reconstruct_at_dim(uint8_t           *out_dim_dim, int dim,
                              const SligCellSet *set);
 
-/* Classifier-free guidance — render once, then push every pixel away
- * from the achromatic baseline (128) by `scale`:
- *
- *     out[i] = clamp( 128 + scale * (cond[i] - 128) , 0, 255 )
- *
- * The 128 baseline is the "unconditional" expectation for both luma
- * (mid-gray) and chroma (no offset). scale = 1.0 is a no-op (just
- * the conditional render); scale > 1 amplifies the prompt's deviation
- * from neutral. Inner loop is pure integer (Q8 fixed-point on scale). */
-void slig_render_guided(
-    uint8_t              *out_image,
-    const SligRenderItem *items, uint32_t num_items,
-    float                 guidance_scale,
-    const uint16_t        grid_A[256][256]);
-
 void slig_place_by_grid_coords(
     SligCanvas       *canvas,
     const SligSignal *sig,
@@ -367,21 +352,12 @@ void slig_place_by_grid_coords(
 
 /* ── Spatial masks for layout-driven rendering ────────────
  *
- *  slig_apply_masked applies one signal modulated by a 256² mask
- *  byte-plane (0 = skip, 255 = full effect). Internally renders
- *  the signal into a scratch canvas and blends `scratch * mask /
- *  255` into the destination — preserves canvas additive semantics.
- *
  *  slig_make_mask_left/right/top/bottom build a one-axis half-plane
  *  mask with a soft `feather`-pixel gradient at the boundary. They
  *  power the direction-keyword path in ai_generate_image_v2_guided
  *  ("왼쪽 산", "오른쪽 바다", …).
  *
  *  Buffer layout: row-major uint8 array, length = SLIG_CANVAS_DIM². */
-void slig_apply_masked(SligCanvas       *c,
-                       const SligSignal *sig,
-                       const uint8_t    *mask_256x256);
-
 void slig_make_mask_left  (uint8_t *out_256x256, int boundary, int feather);
 void slig_make_mask_right (uint8_t *out_256x256, int boundary, int feather);
 void slig_make_mask_top   (uint8_t *out_256x256, int boundary, int feather);

@@ -5,6 +5,9 @@
 #include "ce_storage_io.h"
 #include "ce_type.h"
 #include "sss_rowvae.h"
+#include "ce_scene_object.h"
+#include "ce_scene_bridge.h"
+#include "ce_move_profile.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -250,4 +253,100 @@ uint32_t sss_pybridge_ce_distance(const uint8_t a_64[64], const uint8_t b_64[64]
     memcpy(ce_bytes(&a), a_64, 64);
     memcpy(ce_bytes(&b), b_64, 64);
     return ce_distance(&a, &b);
+}
+
+/* ── Atmos scene-object pybridge wrappers ─────────────────────────── */
+
+struct sss_atmos_scene {
+    CEScene         scene;
+    CESceneProfiles profiles;
+};
+
+sss_atmos_scene *sss_atmos_scene_create(void) {
+    sss_atmos_scene *s = (sss_atmos_scene *)calloc(1, sizeof(*s));
+    if (!s) return NULL;
+    ce_scene_init(&s->scene);
+    /* profiles is zero-initialised by calloc — count = 0, all clear. */
+    return s;
+}
+
+void sss_atmos_scene_destroy(sss_atmos_scene *s) {
+    if (!s) return;
+    free(s);
+}
+
+uint16_t sss_atmos_scene_build_from_rgba(sss_atmos_scene *s,
+                                         const uint8_t *rgba,
+                                         int width, int height,
+                                         uint16_t base_id) {
+    if (!s || !rgba || width <= 0 || height <= 0) return 0;
+    return ce_scene_build_from_rgba(&s->scene, &s->profiles,
+                                    rgba, width, height, base_id);
+}
+
+uint16_t sss_atmos_scene_object_count(const sss_atmos_scene *s) {
+    if (!s) return 0;
+    return s->scene.object_count;
+}
+
+uint16_t sss_atmos_scene_dump_objects(const sss_atmos_scene *s,
+                                      uint8_t *out_rows,
+                                      uint16_t max_rows) {
+    if (!s || !out_rows) return 0;
+    uint16_t n = s->scene.object_count;
+    if (max_rows < n) n = max_rows;
+    /* Motion type comes from the profiles bag when the scene was built
+     * via build_from_rgba; hand-built scenes default to STATIC so the
+     * row layout is always 8 bytes / object. */
+    for (uint16_t i = 0; i < n; ++i) {
+        const CESceneObject *o = &s->scene.objects[i];
+        uint8_t motion = (i < s->profiles.count)
+            ? (uint8_t)s->profiles.profiles[i].type : 0u;
+        uint8_t base_cx = (i < s->profiles.count)
+            ? s->profiles.base_cx[i] : o->cx;
+        uint8_t base_cy = (i < s->profiles.count)
+            ? s->profiles.base_cy[i] : o->cy;
+        uint8_t *row = out_rows + (size_t)i * 8u;
+        row[0] = (uint8_t)(o->id & 0xFFu);
+        row[1] = (uint8_t)((o->id >> 8) & 0xFFu);
+        row[2] = motion;
+        row[3] = base_cx;
+        row[4] = base_cy;
+        row[5] = o->color_r;
+        row[6] = o->color_g;
+        row[7] = o->color_b;
+    }
+    return n;
+}
+
+void sss_atmos_scene_tick(sss_atmos_scene *s) {
+    if (!s) return;
+    /* Always run the profile-aware tick: when profiles.count == 0
+     * (hand-built scene that never went through build_from_rgba) the
+     * inner ce_scene_tick still applies and the per-profile offset
+     * loop is a no-op, so this entry point handles both cases. */
+    ce_scene_tick_with_profiles(&s->scene, &s->profiles);
+}
+
+void sss_atmos_scene_seek(sss_atmos_scene *s, uint32_t target_tick) {
+    if (!s) return;
+    ce_scene_seek(&s->scene, target_tick);
+}
+
+void sss_atmos_scene_render(const sss_atmos_scene *s,
+                            uint8_t *out_rgb, int width, int height) {
+    if (!s || !out_rgb || width <= 0 || height <= 0) return;
+    /* Zero the frame so additive accumulation never leaks state from a
+     * previous render the caller's buffer happened to hold. */
+    memset(out_rgb, 0, (size_t)width * (size_t)height * 3u);
+    ce_scene_render(&s->scene, out_rgb, width, height);
+}
+
+uint16_t sss_atmos_scene_persist(sss_memory *mem,
+                                 const sss_atmos_scene *s,
+                                 uint32_t canvas_id,
+                                 uint16_t scene_id) {
+    if (!mem || !s) return 0;
+    return ce_scene_persist_to_storage(&mem->storage, canvas_id,
+                                       scene_id, &s->scene);
 }

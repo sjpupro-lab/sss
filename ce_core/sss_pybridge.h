@@ -84,6 +84,74 @@ void        sss_pybridge_ce_feed(const char *text,
 uint32_t    sss_pybridge_ce_distance(const uint8_t a_64[64],
                                      const uint8_t b_64[64]);
 
+/* ── Atmos scene-object production entry points ─────────────────────
+ *
+ * These wrappers expose ce_scene_build_from_rgba / ce_scene_render /
+ * ce_scene_tick_with_profiles / ce_scene_persist_to_storage to Python
+ * (and any other ctypes consumer) so the Atmos engine can drive
+ * production code paths — restore-time object detection
+ * (tools/sss_unified.py), motion frame generation
+ * (scripts/make_anim_frames.py), and direct CE storage round-trips.
+ *
+ * The handle is opaque (`sss_atmos_scene`); it carries a CEScene plus
+ * the matching CESceneProfiles bag in lock-step. Build → tick → render
+ * is the standard cycle. Bytes everywhere — no float crosses the ABI. */
+
+typedef struct sss_atmos_scene sss_atmos_scene;
+
+/* Allocate an empty scene + profiles bag. Returns NULL on OOM.
+ * Caller must call sss_atmos_scene_destroy. */
+sss_atmos_scene *sss_atmos_scene_create(void);
+void             sss_atmos_scene_destroy(sss_atmos_scene *s);
+
+/* Decompose `rgba` (row-major, width*height*4 bytes) into Atmos scene
+ * objects via ce_scene_build_from_rgba. Returns the number of objects
+ * produced; 0 on bad input. Subsequent calls overwrite the scene. */
+uint16_t sss_atmos_scene_build_from_rgba(sss_atmos_scene *s,
+                                         const uint8_t *rgba,
+                                         int width, int height,
+                                         uint16_t base_id);
+
+/* Number of scene objects currently in the scene. */
+uint16_t sss_atmos_scene_object_count(const sss_atmos_scene *s);
+
+/* Copy per-object summary (id, motion-type, base_cx, base_cy, color)
+ * into the caller's array — one row per object, 8 bytes per row:
+ *   [0..1] = id           (uint16, little-endian)
+ *   [2]    = motion_type  (CEMotionType: 0=STATIC, 1=FLOW, 2=RIGID,
+ *                          3=ORGANIC, 4=PARTICLE)
+ *   [3]    = base_cx
+ *   [4]    = base_cy
+ *   [5]    = color_r
+ *   [6]    = color_g
+ *   [7]    = color_b
+ * out_rows must be at least object_count * 8 bytes. Returns objects
+ * written. */
+uint16_t sss_atmos_scene_dump_objects(const sss_atmos_scene *s,
+                                      uint8_t *out_rows,
+                                      uint16_t max_rows);
+
+/* Advance the scene by one tick, layering profile-driven displacement
+ * on top of the keyframe interpolation (ce_scene_tick_with_profiles). */
+void sss_atmos_scene_tick(sss_atmos_scene *s);
+
+/* Seek to a specific tick (ce_scene_seek). */
+void sss_atmos_scene_seek(sss_atmos_scene *s, uint32_t target_tick);
+
+/* Render the current scene state into out_rgb (width*height*3 bytes).
+ * Caller owns the buffer. Buffer is zeroed before rendering so callers
+ * never see stale pixels from a previous frame. */
+void sss_atmos_scene_render(const sss_atmos_scene *s,
+                            uint8_t *out_rgb, int width, int height);
+
+/* Persist every object in the scene through ce_scene_persist_to_storage
+ * into the given sss_memory's CEStorage under (canvas_id, scene_id).
+ * Returns objects written; 0 on bad input. */
+uint16_t sss_atmos_scene_persist(sss_memory *mem,
+                                 const sss_atmos_scene *s,
+                                 uint32_t canvas_id,
+                                 uint16_t scene_id);
+
 #ifdef __cplusplus
 }
 #endif

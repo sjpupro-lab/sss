@@ -1251,55 +1251,13 @@ void slig_image_upsample(uint8_t *dst, int dst_dim,
 }
 
 /* ══════════════════════════════════════════════════
- *  Classifier-Free Guidance
- *
- *  out[i] = clamp(128 + scale × (cond[i] − 128), 0, 255)
- *
- *  scale is converted to Q8 fixed-point so the per-pixel loop is
- *  integer-only (subtract, multiply, shift). Common scale values:
- *    1.0  → identity (just the conditional render)
- *    1.5  → moderate emphasis
- *    2.0  → strong emphasis (described as "두 배 강조" upstream)
- *    3.0  → caricatured / oversaturated
- * ══════════════════════════════════════════════════ */
-
-void slig_render_guided(uint8_t              *out_image,
-                        const SligRenderItem *items, uint32_t num_items,
-                        float                 guidance_scale,
-                        const uint16_t        grid_A[256][256]) {
-    int n = SLIG_CANVAS_DIM * SLIG_CANVAS_DIM;
-    slig_render_sequential(out_image, items, num_items, grid_A);
-    if (guidance_scale == 1.0f) return;
-
-    int s_q8 = (int)(guidance_scale * 256.0f);
-    if (s_q8 < 0) s_q8 = 0;
-    for (int i = 0; i < n; i++) {
-        int diff = (int)out_image[i] - 128;
-        int v    = 128 + (s_q8 * diff) / 256;
-        if (v < 0)   v = 0;
-        if (v > 255) v = 255;
-        out_image[i] = (uint8_t)v;
-    }
-}
-
-/* ══════════════════════════════════════════════════
  *  Spatial masks for layout-driven rendering
+ *  (slig_render_guided + slig_apply_masked were removed in the
+ *   integrate-engines pass — the only callers were legacy v1
+ *   prompt routes that the SSS rowvae path has fully replaced.
+ *   The half-plane mask helpers below stay because
+ *   spatial_image_gen.c still uses them for direction keywords.)
  * ══════════════════════════════════════════════════ */
-
-void slig_apply_masked(SligCanvas       *c,
-                       const SligSignal *sig,
-                       const uint8_t    *mask) {
-    if (!c || !sig || !mask) return;
-    SligCanvas tmp;
-    slig_canvas_clear(&tmp);
-    slig_apply(&tmp, sig);
-    for (int y = 0; y < SLIG_CANVAS_DIM; y++) {
-        for (int x = 0; x < SLIG_CANVAS_DIM; x++) {
-            int m = mask[y * SLIG_CANVAS_DIM + x];
-            c->pixels[y][x] += (tmp.pixels[y][x] * m) / 255;
-        }
-    }
-}
 
 /* Half-plane mask along an axis. Half == 0 ("above the boundary")
  * means the lower coordinate range is opaque (255), upper is
