@@ -1,3 +1,8 @@
+/* CLOCK_REALTIME / clock_gettime live behind _POSIX_C_SOURCE on glibc
+ * — declare it before any system header is pulled in below. Termux's
+ * Bionic doesn't need this guard but it's cheap and harmless. */
+#define _POSIX_C_SOURCE 200809L
+
 /*
  * stream_train.c — streaming training for SPATIAL-PATTERN-AI
  *
@@ -48,6 +53,7 @@
 typedef struct {
     const char* input;
     const char* save;
+    const char* load;            /* --load <path>; NULL = fresh model */
     const char* event_log;       /* --log <path>; NULL = disabled */
     uint32_t    max_clauses;
     uint32_t    checkpoint;
@@ -60,12 +66,17 @@ typedef struct {
 
 static void usage(const char* prog) {
     fprintf(stderr,
-        "usage: %s --input <path> [--max N] [--save path] [--checkpoint N]\n"
+        "usage: %s --input <path> [--max N] [--save path] [--load path] [--checkpoint N]\n"
         "       [--log path] [--threshold F | --target-delta R] [--verbose] [--verify]\n"
         "\n"
         "  --input <path>        input text file, one clause per line (required)\n"
         "  --max <N>             max clauses to ingest (default %d)\n"
         "  --save <path>         final model path (default build/models/stream_auto.spai)\n"
+        "  --load <path>         load existing .spai and continue training. Without\n"
+        "                        this flag a fresh model is created. The trainer\n"
+        "                        appends keyframes/deltas to the loaded model so a\n"
+        "                        long corpus can be split across multiple invocations\n"
+        "                        (e.g., resumed after a Termux process kill).\n"
         "  --checkpoint <N>      save every N clauses (default %d, 0 disables)\n"
         "  --log <path>          emit a binary training-event log consumed by\n"
         "                        tools/animate_training.py (clause-level cell\n"
@@ -86,6 +97,7 @@ static void usage(const char* prog) {
 static int parse_args(int argc, char** argv, StreamArgs* a) {
     a->input             = NULL;
     a->save              = "build/models/stream_auto.spai";
+    a->load              = NULL;
     a->event_log         = NULL;
     a->max_clauses       = DEFAULT_MAX;
     a->checkpoint        = DEFAULT_CKPT;
@@ -105,6 +117,8 @@ static int parse_args(int argc, char** argv, StreamArgs* a) {
             a->max_clauses = (uint32_t)v;
         } else if (strcmp(k, "--save") == 0 && i + 1 < argc) {
             a->save = argv[++i];
+        } else if (strcmp(k, "--load") == 0 && i + 1 < argc) {
+            a->load = argv[++i];
         } else if (strcmp(k, "--checkpoint") == 0 && i + 1 < argc) {
             long v = strtol(argv[++i], NULL, 10);
             if (v < 0) v = 0;
@@ -138,7 +152,11 @@ static int parse_args(int argc, char** argv, StreamArgs* a) {
 
 static double now_sec(void) {
     struct timespec ts;
-    timespec_get(&ts, TIME_UTC);
+    /* clock_gettime(CLOCK_REALTIME) is portable across glibc, musl,
+     * macOS, and Bionic (Termux). timespec_get(..., TIME_UTC) is C11
+     * but only landed in Bionic at API 29 — older Android devices
+     * link-fail. The two return the same wall-clock value here. */
+    clock_gettime(CLOCK_REALTIME, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
@@ -468,10 +486,29 @@ int main(int argc, char** argv) {
 
     morpheme_init();
 
-    SpatialAI* ai = spatial_ai_create();
-    if (!ai) {
-        fprintf(stderr, "[stream] spatial_ai_create failed\n");
-        return 1;
+    /* Resume vs fresh-start. With --load, we hydrate the in-memory
+     * SpatialAI from disk and append new keyframes/deltas on top — the
+     * delta chain stays valid because ai_load restores both KF and
+     * Delta tables. Without --load (or when the file is missing), we
+     * fall back to a fresh model; this matches the legacy behaviour so
+     * existing scripts keep working unchanged. */
+    SpatialAI* ai = NULL;
+    if (args.load && args.load[0]) {
+        SpaiStatus ls = SPAI_OK;
+        ai = ai_load(args.load, &ls);
+        if (!ai || ls != SPAI_OK) {
+            fprintf(stderr, "[stream] ai_load(%s) failed: status=%d\n",
+                    args.load, (int)ls);
+            return 1;
+        }
+        printf("[stream] loaded %s: KF=%u Delta=%u (continuing)\n",
+               args.load, ai->kf_count, ai->df_count);
+    } else {
+        ai = spatial_ai_create();
+        if (!ai) {
+            fprintf(stderr, "[stream] spatial_ai_create failed\n");
+            return 1;
+        }
     }
 
     /* Threshold precedence: explicit --threshold > --target-delta
