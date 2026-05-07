@@ -146,6 +146,50 @@ uint32_t ce_storage_load_slig_sets(const CEStorage *s,
                                    uint32_t canvas_id,
                                    struct SligCellSet *out);
 
+/* ─── Atmos scene-object persistence (CE_TYPE_SCENE) ─────────
+ *
+ *   Each CESceneObject is packed into one CEUnit signature and appended
+ *   as a CE_TYPE_SCENE entry:
+ *       canvas_id  = caller-supplied (one per logical scene/canvas)
+ *       slot       = scene_id                      (0..65535)
+ *       block_idx  = obj->id                       (0..65535)
+ *       keyframe   = packed scene-object signature
+ *       delta      = delta against the previous object stored under the
+ *                    same (canvas_id, slot)        (zero CEUnit for the
+ *                    first object in a scene)
+ *
+ *   The signature layout is byte-deterministic and lives entirely inside
+ *   the 64-byte CEUnit — no JSON, no external sidecar. See
+ *   ce_scene_bridge.c for the exact byte map (matches what the matcher
+ *   below reads).
+ *
+ *   Returns 1 on success, 0 if either pointer is NULL.
+ */
+struct CESceneObject_s; /* forward; full definition in ce_scene_object.h */
+uint32_t ce_storage_persist_scene_object(CEStorage *s,
+                                         uint32_t canvas_id,
+                                         uint16_t scene_id,
+                                         const struct CESceneObject_s *obj);
+
+/* Find the closest CE_TYPE_SCENE signature in `s` to the query object's
+ * packed signature. Distance is ce_distance() on the keyframe CEUnit
+ * (sum of absolute byte differences across 64 bytes, range [0, 16320]).
+ *
+ *   scene_id_filter — if non-zero, restrict the search to entries whose
+ *                     slot == scene_id_filter; if zero, search all
+ *                     CE_TYPE_SCENE entries.
+ *   out_object_id   — receives the matched entry's block_idx (object id).
+ *   out_distance    — receives the SAD distance (smaller = better).
+ *
+ * Returns 1 if a match was found, 0 if no CE_TYPE_SCENE entries exist
+ * (with the optional scene_id_filter applied).
+ */
+int ce_storage_match_scene_signature(const CEStorage *s,
+                                     const struct CESceneObject_s *query,
+                                     uint16_t scene_id_filter,
+                                     uint16_t *out_object_id,
+                                     uint32_t *out_distance);
+
 #ifdef __cplusplus
 }
 #endif

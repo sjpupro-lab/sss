@@ -50,7 +50,10 @@ CE_CORE_SRCS = $(CE_CORE_DIR)/ce_core.c \
                $(CE_CORE_DIR)/ce_residual_codebook.c \
                $(CE_CORE_DIR)/sss_rowvae.c \
                $(CE_CORE_DIR)/sss_io.c \
-               $(CE_CORE_DIR)/sss_pybridge.c
+               $(CE_CORE_DIR)/sss_pybridge.c \
+               $(CE_CORE_DIR)/ce_scene_object.c \
+               $(CE_CORE_DIR)/ce_move_profile.c \
+               $(CE_CORE_DIR)/ce_scene_bridge.c
 
 CE_CORE_OBJS = $(patsubst $(CE_CORE_DIR)/%.c,$(BUILD_DIR)/ce_core_%.o,$(CE_CORE_SRCS))
 
@@ -62,7 +65,7 @@ LEGACY_OBJS = $(patsubst $(LEGACY_DIR)/%.c,$(BUILD_DIR)/legacy_%.o,$(LEGACY_SRCS
 
 OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS)) $(CE_CORE_OBJS) $(LEGACY_OBJS)
 
-TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_recluster test_refine test_image_roundtrip test_image_gen test_tick_math test_material test_gen_routed
+TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_recluster test_refine test_image_roundtrip test_image_gen test_tick_math test_material test_gen_routed test_scene_atmos
 
 .PHONY: all clean test bench_context bench_refine image_tools pybridge
 
@@ -158,6 +161,13 @@ $(BUILD_DIR)/test_material: $(TEST_DIR)/test_material.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/test_gen_routed: $(TEST_DIR)/test_gen_routed.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+# ─── Atmos scene-object test ─────────────────────────────────
+# Verifies STATIC fixed position, FLOW monotonic motion, seek(0)
+# restore, 60-frame PPM render with no blank frame, and CE Cell
+# storage signature match. Output PPMs land in build/atmos_frames/.
+$(BUILD_DIR)/test_scene_atmos: $(TEST_DIR)/test_scene_atmos.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/bench_v3: tools/bench_v3.c $(OBJS) | $(BUILD_DIR)
