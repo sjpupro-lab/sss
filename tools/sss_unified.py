@@ -43,6 +43,54 @@ from tools.sss_memory import CEMemory as _BridgedCEMemory
 # images even when cv2 isn't installed.
 from tools import sss_image_io
 
+# Optional Atmos scene-object decomposition. Requires libsss_pybridge.so
+# (build via `make pybridge`). Imported lazily in decompose_scene_objects
+# so module import never breaks when the .so is missing.
+_ATMOS_AVAILABLE: Optional[bool] = None
+
+
+def _atmos_module():
+    """Return the tools.sss_atmos module, or None if libsss_pybridge.so
+    is missing. Cached so subsequent calls are cheap."""
+    global _ATMOS_AVAILABLE
+    if _ATMOS_AVAILABLE is False:
+        return None
+    try:
+        from tools import sss_atmos
+        _ATMOS_AVAILABLE = True
+        return sss_atmos
+    except Exception:
+        _ATMOS_AVAILABLE = False
+        return None
+
+
+def decompose_scene_objects(image_rgb: np.ndarray, base_id: int = 0):
+    """Run ce_scene_build_from_rgba on a uint8 RGB ndarray.
+
+    Returns a list of `ObjectSummary` rows (id, motion_type / motion_name,
+    base_cx/cy, color RGB) — empty list when the Atmos pybridge is not
+    available or the image yields no clusters. The caller decides what
+    to do with the decomposition (persist, render, log, …).
+    """
+    atm = _atmos_module()
+    if atm is None or image_rgb is None:
+        return []
+    arr = np.ascontiguousarray(image_rgb, dtype=np.uint8)
+    if arr.ndim != 3 or arr.shape[2] not in (3, 4):
+        return []
+    h, w = arr.shape[:2]
+    if arr.shape[2] == 3:
+        rgba = np.empty((h, w, 4), dtype=np.uint8)
+        rgba[..., :3] = arr
+        rgba[..., 3]  = 255
+    else:
+        rgba = arr
+    try:
+        with atm.AtmosScene.from_rgba(rgba, w, h, base_id=base_id) as scene:
+            return list(scene.objects)
+    except Exception:
+        return []
+
 
 # ────────────────────────────────────────────────────────────
 # 0a. cv2 fallback — numpy-only implementations of the OpenCV
@@ -1524,6 +1572,26 @@ class SSSPipeline:
                 if sc["final"] > best_score:
                     best_score = sc["final"]
                     image = cand
+
+        # Optional Atmos scene decomposition. When SSS_ATMOS=1 in the
+        # env, decompose the generated image into scene-objects via
+        # ce_scene_build_from_rgba and attach the summary to the result
+        # (production hook for the Atmos object-detection path). The
+        # decomposition is best-effort: import or runtime errors just
+        # leave atmos_objects out of the result instead of failing run.
+        if image is not None and os.environ.get("SSS_ATMOS") == "1":
+            atmos_objs = decompose_scene_objects(image)
+            if atmos_objs:
+                result["atmos_objects"] = [
+                    {
+                        "id": o.id,
+                        "motion": o.motion_name,
+                        "cx": o.base_cx,
+                        "cy": o.base_cy,
+                        "color": [o.color_r, o.color_g, o.color_b],
+                    }
+                    for o in atmos_objs
+                ]
 
         if intent["needs_video"] and image is not None:
             frames = self.motion.generate_frames(image, intent, n_frames=24)

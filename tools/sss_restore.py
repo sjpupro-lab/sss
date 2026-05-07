@@ -401,6 +401,36 @@ class SSSRestore:
         item = self._refs.get(ctype)
         return item[0] if item else None
 
+    # ── Atmos object decomposition ─────────────────────────────
+    def decompose_objects(self, image: np.ndarray):
+        """Run ce_scene_build_from_rgba on the supplied (H, W, 3) uint8
+        image. Returns a list of `tools.sss_atmos.ObjectSummary` rows
+        (motion type + position + colour) for downstream restore-time
+        per-object handling. Empty list when the Atmos pybridge is not
+        available or no clusters survived. The caller decides how to
+        feed the decomposition back into the restore loop — the helper
+        does not modify `self`. """
+        try:
+            from tools import sss_atmos
+        except Exception:
+            return []
+        if image is None or image.ndim != 3:
+            return []
+        h, w, c = image.shape
+        if c == 3:
+            rgba = np.empty((h, w, 4), dtype=np.uint8)
+            rgba[..., :3] = np.ascontiguousarray(image, dtype=np.uint8)
+            rgba[..., 3]  = 255
+        elif c == 4:
+            rgba = np.ascontiguousarray(image, dtype=np.uint8)
+        else:
+            return []
+        try:
+            with sss_atmos.AtmosScene.from_rgba(rgba, w, h) as scene:
+                return list(scene.objects)
+        except Exception:
+            return []
+
     # ── 1) restore: pyramid + sequential row/col inference ─────
     def restore(self, image: np.ndarray, mask: Optional[np.ndarray] = None,
                 levels=(32, 64, 128, 256)) -> np.ndarray:

@@ -1,16 +1,19 @@
 CC      = gcc
-# -Ilegacy keeps the legacy ce_gen.h reachable for tools/gen_image_ce.c
-# and tests/test_gen_routed.c — both still build, but ce_gen is no
-# longer the main path (rowvae replaced it, see LEGACY_DIR below).
+# -Ilegacy keeps the legacy ce_gen.h reachable for tests/test_gen_routed.c
+# (the only remaining default-test consumer of ce_gen). The deprecated
+# CLI tools (gen_image_ce, train_demo, train_images_ce) live in
+# legacy_deprecated/ and only build when the user explicitly asks for
+# the `legacy_demo` target — they're not in the default `all` or `test`.
 CFLAGS  = -Wall -Wextra -O2 -Iinclude -Ice_core -Ilegacy -std=c11
 LDFLAGS = -lm
 
-SRC_DIR     = src
-INC_DIR     = include
-TEST_DIR    = tests
-BUILD_DIR   = build
-CE_CORE_DIR = ce_core
-LEGACY_DIR  = legacy
+SRC_DIR             = src
+INC_DIR             = include
+TEST_DIR            = tests
+BUILD_DIR           = build
+CE_CORE_DIR         = ce_core
+LEGACY_DIR          = legacy
+LEGACY_DEPRECATED_DIR = legacy_deprecated
 
 SRCS = $(SRC_DIR)/spatial_grid.c \
        $(SRC_DIR)/spatial_morpheme.c \
@@ -57,9 +60,10 @@ CE_CORE_SRCS = $(CE_CORE_DIR)/ce_core.c \
 
 CE_CORE_OBJS = $(patsubst $(CE_CORE_DIR)/%.c,$(BUILD_DIR)/ce_core_%.o,$(CE_CORE_SRCS))
 
-# Legacy sources — ce_gen was the original cell-stamp generator. It
-# is preserved for backward compatibility with gen_image_ce / the
-# test_gen_routed test, but sss_rowvae (sss_gen) is the main path now.
+# Legacy sources — ce_gen was the original cell-stamp generator. The
+# tests/test_gen_routed test still drives ce_gen end-to-end so we keep
+# it linkable inside the default OBJS list. sss_rowvae (sss_gen +
+# tests/test_scene_atmos) is the production path now.
 LEGACY_SRCS = $(LEGACY_DIR)/ce_gen.c
 LEGACY_OBJS = $(patsubst $(LEGACY_DIR)/%.c,$(BUILD_DIR)/legacy_%.o,$(LEGACY_SRCS))
 
@@ -67,7 +71,9 @@ OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS)) $(CE_CORE_OBJS) $(LEG
 
 TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_recluster test_refine test_image_roundtrip test_image_gen test_tick_math test_material test_gen_routed test_scene_atmos
 
-.PHONY: all clean test bench_context bench_refine image_tools pybridge
+.PHONY: all clean test bench_context bench_refine image_tools pybridge \
+        legacy_demo demo_tools train_images_ce gen_image_ce \
+        sss_animate sss_gen verify_hybrid wave_debug
 
 all: $(BUILD_DIR) $(OBJS)
 	@echo "Build complete."
@@ -182,13 +188,13 @@ $(BUILD_DIR)/img2grid: tools/img2grid.c $(OBJS) | $(BUILD_DIR)
 $(BUILD_DIR)/grid2img: tools/grid2img.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
-$(BUILD_DIR)/train_images_ce: tools/train_images_ce.c $(OBJS) | $(BUILD_DIR)
+# Legacy CLI tools live in legacy_deprecated/. They are not part of the
+# default `all` or `test` targets but stay buildable on demand for
+# reproducibility of older runs.
+$(BUILD_DIR)/train_images_ce: $(LEGACY_DEPRECATED_DIR)/train_images_ce.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
-# legacy — replaced by sss_gen (sss_rowvae engine, below).
-# Kept buildable for reproducibility of older runs; new code paths use
-# sss_gen / scripts/sss_train.py / tools.sss_unified.
-$(BUILD_DIR)/gen_image_ce: tools/gen_image_ce.c $(OBJS) | $(BUILD_DIR)
+$(BUILD_DIR)/gen_image_ce: $(LEGACY_DEPRECATED_DIR)/gen_image_ce.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 # Spectrogram-based image generator (sss_rowvae engine). MAIN PATH.
@@ -201,10 +207,22 @@ sss_gen: $(BUILD_DIR)/sss_gen
 	@echo "      --root data/sss_demo --out build/models/demo.sss --size 64"
 	@echo "  ./build/sss_gen build/models/demo.sss \"red circle draw\" out.ppm 1 1.0"
 
+# Atmos motion frame generator. Decomposes a PPM into scene-objects via
+# ce_scene_build_from_rgba, then renders N animated frames driven by
+# ce_scene_tick_with_profiles + ce_scene_render. This is the production
+# entry point for the Atmos engine — no Python ctypes round-trip needed.
+$(BUILD_DIR)/sss_animate: tools/sss_animate.c $(OBJS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+
+sss_animate: $(BUILD_DIR)/sss_animate
+	@echo "Built sss_animate. Examples:"
+	@echo "  ./build/sss_animate input.ppm  build/atmos_anim 60"
+	@echo "  ./build/sss_animate input.ppm  build/atmos_anim 120 256 256"
+
 $(BUILD_DIR)/make_demo_dataset: tools/make_demo_dataset.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< -o $@
 
-$(BUILD_DIR)/train_demo: tools/train_demo.c $(OBJS) | $(BUILD_DIR)
+$(BUILD_DIR)/train_demo: $(LEGACY_DEPRECATED_DIR)/train_demo.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/verify_hybrid: tools/verify_hybrid.c $(OBJS) | $(BUILD_DIR)
@@ -226,20 +244,23 @@ wave_debug: $(BUILD_DIR)/wave_debug
 	@echo "  ./build/wave_debug beam.ppm   --dir 7 --sigma 8000 --tick 40"
 	@echo "  ./build/wave_debug horiz.ppm  --dir 0 --sigma 4000"
 
-# demo_tools still bundles gen_image_ce (legacy) for backward
-# compatibility. New work should target sss_gen via scripts/sss_train.py.
-demo_tools: $(BUILD_DIR)/make_demo_dataset $(BUILD_DIR)/train_demo $(BUILD_DIR)/gen_image_ce $(BUILD_DIR)/verify_hybrid
-	@echo "Built demo tools. Pipeline:"
+# demo_tools is the legacy SLIG/cell-stamp demo pipeline. It now lives
+# behind `make legacy_demo` so the default `make` and `make test` keep
+# clear of the deprecated paths. See legacy_deprecated/ for sources.
+legacy_demo: $(BUILD_DIR)/make_demo_dataset $(BUILD_DIR)/train_demo $(BUILD_DIR)/gen_image_ce $(BUILD_DIR)/verify_hybrid
+	@echo "Built legacy demo tools. Pipeline:"
 	@echo "  ./build/make_demo_dataset data/demo"
 	@echo "  ./build/train_demo data/demo build/models/demo"
 	@echo "  ./build/gen_image_ce build/models/demo.ces \"red apple\" out.ppm 0 50 200"
 
+# Backward-compat alias — same as legacy_demo. Older docs reference
+# `make demo_tools`, so keep the spelling working.
+demo_tools: legacy_demo
+
 train_images_ce: $(BUILD_DIR)/train_images_ce
-	@echo "Built train_images_ce. Example:"
+	@echo "Built train_images_ce (legacy). Example:"
 	@echo "  ./build/train_images_ce build/models/demo  data/img/*.ppm"
 
-# legacy — replaced by sss_rowvae. See sss_gen target above for the
-# main path. This target stays so older datasets/scripts keep working.
 gen_image_ce: $(BUILD_DIR)/gen_image_ce
 	@echo "Built gen_image_ce (legacy — sss_gen is the main path now)."
 	@echo "  ./build/gen_image_ce build/synth/demo.ces \"red apple\" out.ppm 0 50 200"
