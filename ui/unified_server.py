@@ -362,6 +362,262 @@ def _run_restore(src_path: str, mask_path: Optional[str], *,
     return out_payload
 
 
+# ── Forge bridge (ported from ui/server.py) ──────────────────
+# The deprecated ui/server.py + ui/index.html UI ran a parallel HTTP
+# bridge for the C engine binaries (gen_image_ce, sss_gen, train_demo,
+# stream_train, chat). The unified server now hosts the same surface
+# under /api/generate /api/train* /api/chat /api/models /api/upload
+# /api/browse /api/job /api/stream — the UI drops the standalone Forge
+# server. ui/server.py + ui/index.html move to legacy_deprecated/ so
+# older docs that referenced port 8080 still find a working binary.
+
+import subprocess
+import time
+import uuid
+
+BUILD_DIR    = ROOT / "build"
+MODELS_DIR   = BUILD_DIR / "models"
+DATA_DIR     = ROOT / "data"
+UPLOADS_DIR  = DATA_DIR / "uploads"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+# job_id → {"proc": Popen|None, "log": [str], "done": bool,
+#           "exit_code": int|None, "result": dict, "started_at": float}
+# Held in-process. The original Forge server's structure 1:1 — UI code
+# already speaks this shape.
+_JOBS: dict = {}
+_JOBS_LOCK = threading.Lock()
+
+
+def _safe_under_root(p) -> Optional[Path]:
+    """Resolve `p` and reject anything outside ROOT. Returns the
+    resolved Path or None when `p` escapes the repo. Used by /api/browse
+    so the file picker can't traverse the host filesystem."""
+    try:
+        target = Path(p).expanduser().resolve()
+    except (OSError, ValueError):
+        return None
+    root = ROOT.resolve()
+    try:
+        target.relative_to(root)
+        return target
+    except ValueError:
+        return None
+
+
+def _scan_models():
+    """Catalogue build/models/*.{ces,spai,sss} for the model picker."""
+    out = []
+    if not MODELS_DIR.exists():
+        return out
+    for f in sorted(MODELS_DIR.iterdir()):
+        if f.suffix in (".ces", ".spai", ".sss"):
+            out.append({
+                "name":    f.stem,
+                "type":    f.suffix[1:],
+                "path":    str(f),
+                "size_kb": round(f.stat().st_size / 1024, 1),
+            })
+    return out
+
+
+def _ppm_to_png_uri(path: str) -> Optional[str]:
+    """Convert a P6 PPM at `path` to a `data:image/png;base64,...` URI.
+    Reuses the unified server's _png_data_uri ndarray path so we share
+    one PNG encoder (cv2 when present, sss_image_io otherwise)."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    with open(p, "rb") as f:
+        magic = f.readline().strip()
+        if magic not in (b"P6", b"P3"):
+            return None
+        line = f.readline()
+        while line.startswith(b"#"):
+            line = f.readline()
+        try:
+            w, h = (int(t) for t in line.split())
+        except ValueError:
+            return None
+        try:
+            maxval = int(f.readline().strip())
+        except ValueError:
+            return None
+        if magic == b"P6":
+            data = f.read()
+        else:
+            data = bytes(int(t) for t in f.read().split())
+    if maxval != 255:
+        data = bytes(int(b * 255 / maxval) for b in data)
+    if len(data) < w * h * 3:
+        return None
+    arr = np.frombuffer(data[:w * h * 3], dtype=np.uint8).reshape(h, w, 3)
+    return _png_data_uri(arr)
+
+
+def _analyze_ppm(path: str) -> dict:
+    """16×16 block-wise energy + edge maps + 16-bin RGB histograms +
+    channel dominance. Used by /api/viz-generate to drive the Forge
+    "Signal" tab. Pure-Python integer arithmetic; no extra deps."""
+    p = Path(path)
+    if not p.exists():
+        return {}
+    with open(p, "rb") as f:
+        f.readline()                          # magic (P6 only path)
+        line = f.readline()
+        while line.startswith(b"#"):
+            line = f.readline()
+        w, h = (int(t) for t in line.split())
+        f.readline()                          # maxval
+        data = f.read()
+    arr = np.frombuffer(data[:w * h * 3], dtype=np.uint8).reshape(h, w, 3)
+    bw, bh = 16, 16
+    block_w = max(w // bw, 1)
+    block_h = max(h // bh, 1)
+    energy = np.zeros((bh, bw), dtype=np.float32)
+    edge   = np.zeros((bh, bw), dtype=np.float32)
+    for by in range(bh):
+        for bx in range(bw):
+            y0 = by * block_h; y1 = min(y0 + block_h, h)
+            x0 = bx * block_w; x1 = min(x0 + block_w, w)
+            blk = arr[y0:y1, x0:x1]
+            if blk.size == 0:
+                continue
+            energy[by, bx] = float(blk.mean())
+            if blk.shape[1] >= 2:
+                grad = np.abs(blk[:, 1:].astype(np.int32) - blk[:, :-1].astype(np.int32))
+                edge[by, bx] = float(grad.mean())
+    hist_r, _ = np.histogram(arr[..., 0], bins=16, range=(0, 256))
+    hist_g, _ = np.histogram(arr[..., 1], bins=16, range=(0, 256))
+    hist_b, _ = np.histogram(arr[..., 2], bins=16, range=(0, 256))
+    total = float(arr.shape[0] * arr.shape[1]) or 1.0
+    sum_r = float(arr[..., 0].sum())
+    sum_g = float(arr[..., 1].sum())
+    sum_b = float(arr[..., 2].sum())
+    s = sum_r + sum_g + sum_b + 1.0
+    return {
+        "width":  int(w),
+        "height": int(h),
+        "hist_r": [round(v / total, 4) for v in hist_r.tolist()],
+        "hist_g": [round(v / total, 4) for v in hist_g.tolist()],
+        "hist_b": [round(v / total, 4) for v in hist_b.tolist()],
+        "energy_map": [[round(v, 1) for v in row] for row in energy.tolist()],
+        "edge_map":   [[round(v, 1) for v in row] for row in edge.tolist()],
+        "dominance":  {
+            "r": round(sum_r / s, 3),
+            "g": round(sum_g / s, 3),
+            "b": round(sum_b / s, 3),
+        },
+    }
+
+
+def _job_run(job_id: str, cmd, cwd=None, on_done=None) -> None:
+    """Background thread: run `cmd`, append every stdout line to
+    _JOBS[job_id]['log']. Survives crashes (ERROR row appended).
+    `on_done` is invoked with the job dict after exit."""
+    job = _JOBS[job_id]
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cwd=cwd or str(ROOT), text=True, bufsize=1,
+        )
+        job["proc"] = proc
+        for line in proc.stdout:
+            job["log"].append(line.rstrip("\n"))
+        proc.wait()
+        job["exit_code"] = proc.returncode
+    except Exception as e:
+        job["log"].append(f"[ERROR] {e}")
+        job["exit_code"] = -1
+    finally:
+        job["done"] = True
+        if on_done is not None:
+            try:
+                on_done(job)
+            except Exception as e:
+                job["log"].append(f"[on_done ERROR] {e}")
+
+
+def _job_start(cmd, cwd=None, on_done=None) -> str:
+    """Allocate a job slot and kick off the worker thread. Returns the
+    short hex id the UI uses for the SSE stream."""
+    job_id = uuid.uuid4().hex[:8]
+    with _JOBS_LOCK:
+        _JOBS[job_id] = {
+            "proc": None, "log": [], "done": False,
+            "exit_code": None, "result": {}, "started_at": time.time(),
+        }
+    t = threading.Thread(target=_job_run,
+                         args=(job_id, cmd, cwd, on_done),
+                         daemon=True)
+    t.start()
+    return job_id
+
+
+# ── Atmos: scene decompose + motion preview ───────────────────
+# New production hook — exposed on /api/atmos so the UI can drive
+# tools.sss_atmos.AtmosScene without re-shelling sss_animate. Returns
+# the per-object summary plus N PNG-data-URI animation frames.
+def _run_atmos_decompose(image_bytes: bytes, *, n_frames: int = 24,
+                         frame_size: int = 256, base_id: int = 0,
+                         filename: str = "") -> dict:
+    """Read a PNG/PPM upload, run ce_scene_build_from_rgba, then
+    render `n_frames` ticks at `frame_size` × `frame_size`.
+    Returns {"objects": [...], "frames": [data_uri, ...]}."""
+    n_frames  = max(0, min(120, int(n_frames)))
+    frame_size = max(32, min(1024, int(frame_size)))
+
+    # Persist upload so tools.sss_ingest._read_image_any can route
+    # PNG/PPM/etc. by extension. Cleaned up at the end. Preserve the
+    # original extension so the loader hits the right decoder — PNG and
+    # PPM read paths are completely separate inside sss_image_io.
+    ext = os.path.splitext(filename)[1].lower() or ".png"
+    staging = tempfile.mkdtemp(prefix="sss_atmos_")
+    try:
+        path = os.path.join(staging, "input" + ext)
+        with open(path, "wb") as fp:
+            fp.write(image_bytes)
+        from tools.sss_ingest import _read_image_any
+        from tools.sss_atmos import AtmosScene, MOTION_NAMES  # noqa: F401
+        src = _read_image_any(path)            # (H, W, 3) uint8
+    finally:
+        try:
+            for fn in os.listdir(staging):
+                try: os.unlink(os.path.join(staging, fn))
+                except OSError: pass
+            os.rmdir(staging)
+        except OSError:
+            pass
+
+    h, w, _ = src.shape
+    rgba = np.empty((h, w, 4), dtype=np.uint8)
+    rgba[..., :3] = src
+    rgba[..., 3]  = 255
+
+    objects = []
+    frames  = []
+    with AtmosScene.from_rgba(rgba, w, h, base_id=base_id) as scene:
+        for o in scene.objects:
+            objects.append({
+                "id":     o.id,
+                "motion": o.motion_name,
+                "cx":     o.base_cx,
+                "cy":     o.base_cy,
+                "color":  [o.color_r, o.color_g, o.color_b],
+            })
+        for _ in range(n_frames):
+            frame = scene.render(width=frame_size, height=frame_size)
+            frames.append(_png_data_uri(frame))
+            scene.tick()
+    return {
+        "object_count": len(objects),
+        "objects":      objects,
+        "frames":       frames,
+        "size":         frame_size,
+    }
+
+
 def _normalize_result(result):
     """Make UI payload from whatever tools.sss_unified returns."""
     image = None
@@ -388,13 +644,18 @@ def _normalize_result(result):
     intent = {}
     memory = {}
     strategy = "unknown"
+    atmos_objects = None
     if isinstance(result, dict):
         scores = result.get("scores") or result.get("score") or result.get("eval") or {}
         intent = result.get("intent") or {}
         memory = result.get("memory") or result.get("memory_stats") or {}
         strategy = result.get("strategy") or result.get("mode") or strategy
+        # Surface the SSS_ATMOS=1 decomposition that
+        # tools.sss_unified.SSSPipeline.run attaches to the result dict
+        # so the UI can render the Atmos panel without a second call.
+        atmos_objects = result.get("atmos_objects")
 
-    return {
+    payload = {
         "image": image_uri,
         "frames": frame_uris,
         "scores": _as_plain(scores),
@@ -403,6 +664,9 @@ def _normalize_result(result):
         "strategy": strategy,
         "raw": plain,
     }
+    if atmos_objects is not None:
+        payload["atmos_objects"] = _as_plain(atmos_objects)
+    return payload
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -465,6 +729,108 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/health":
             _json(self, {"ok": True, "root": str(ROOT)})
             return
+
+        # ── Forge: model picker + filesystem browser ─────────
+        if path == "/api/models":
+            _json(self, {"models": _scan_models()})
+            return
+
+        if path == "/api/browse":
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            req_dir = qs.get("dir", [str(ROOT / "data")])[0]
+            target = _safe_under_root(req_dir)
+            if target is None:
+                _json(self, {"error": "access denied"}, 403); return
+            if not target.exists() or not target.is_dir():
+                _json(self, {"error": f"not a directory: {req_dir}"}, 400)
+                return
+            entries = []
+            try:
+                items = sorted(target.iterdir(),
+                               key=lambda p: (not p.is_dir(), p.name.lower()))
+            except PermissionError:
+                _json(self, {"error": "permission denied"}, 403); return
+            for item in items:
+                try:
+                    is_dir = item.is_dir()
+                    size_kb = (round(item.stat().st_size / 1024, 1)
+                               if not is_dir else 0)
+                except OSError:
+                    continue
+                entries.append({
+                    "name": item.name,
+                    "is_dir": is_dir,
+                    "size_kb": size_kb,
+                    "rel": str(item.relative_to(ROOT)),
+                })
+            root = ROOT.resolve()
+            parent = None
+            if target != root:
+                parent_path = target.parent.resolve()
+                try:
+                    parent_path.relative_to(root)
+                    parent = str(parent_path)
+                except ValueError:
+                    parent = None
+            _json(self, {
+                "path": str(target),
+                "rel_path": (str(target.relative_to(root))
+                             if target != root else ""),
+                "parent": parent,
+                "root":   str(root),
+                "entries": entries,
+            })
+            return
+
+        # ── Forge: SSE log stream (and fallback /api/job/<id>) ──
+        if path.startswith("/api/stream/"):
+            job_id = path.split("/")[-1]
+            with _JOBS_LOCK:
+                job = _JOBS.get(job_id)
+            if job is None:
+                _json(self, {"error": "job not found"}, 404); return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            sent = 0
+            try:
+                while True:
+                    while sent < len(job["log"]):
+                        line = job["log"][sent]
+                        self.wfile.write(
+                            f"data: {json.dumps({'line': line})}\n\n".encode())
+                        self.wfile.flush()
+                        sent += 1
+                    if job["done"]:
+                        result = {"done": True, "exit_code": job["exit_code"]}
+                        result.update(job.get("result", {}))
+                        self.wfile.write(
+                            f"data: {json.dumps(result)}\n\n".encode())
+                        self.wfile.flush()
+                        break
+                    time.sleep(0.1)
+            except (BrokenPipeError, ConnectionResetError):
+                pass                          # client navigated away
+            return
+
+        if path.startswith("/api/job/"):
+            job_id = path.split("/")[-1]
+            with _JOBS_LOCK:
+                job = _JOBS.get(job_id)
+            if job is None:
+                _json(self, {"error": "job not found"}, 404); return
+            _json(self, {
+                "done":       job["done"],
+                "exit_code":  job["exit_code"],
+                "log":        job["log"][-50:],
+                "result":     job.get("result", {}),
+                "started_at": job.get("started_at"),
+            })
+            return
+
         _json(self, {"error": "not found"}, 404)
 
     def do_POST(self):
@@ -679,6 +1045,284 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "trace": traceback.format_exc().splitlines()[-12:],
                 }, 500)
             return
+
+        # ── Forge: image generation (sss_gen / gen_image_ce) ──
+        if path == "/api/generate" or path == "/api/viz-generate":
+            try:
+                body = _read_json(self)
+                model = body.get("model", str(MODELS_DIR / "demo.sss"))
+                prompt = body.get("prompt", "red")
+                seed = str(body.get("seed", 1))
+                if not Path(model).exists():
+                    _json(self, {"error": f"model not found: {model}"}, 400)
+                    return
+
+                out_name = f"gen_{uuid.uuid4().hex[:6]}.ppm"
+                out_path = BUILD_DIR / out_name
+
+                if model.endswith(".sss"):
+                    bin_path = BUILD_DIR / "sss_gen"
+                    if not bin_path.exists():
+                        _json(self, {"error": "sss_gen binary not found — "
+                                              "run `make sss_gen`"}, 400)
+                        return
+                    detail = f"{float(body.get('detail', 1.5)):.3f}"
+                    steps  = str(int(body.get("steps", 120)))
+                    cmd = [str(bin_path), model, prompt, str(out_path),
+                           seed, detail, steps]
+                    if body.get("atmos"):
+                        cmd.append("--atmos")
+                    if body.get("out_w"):
+                        cmd += ["--out-w", str(int(body["out_w"]))]
+                    if body.get("out_h"):
+                        cmd += ["--out-h", str(int(body["out_h"]))]
+                else:
+                    bin_path = BUILD_DIR / "gen_image_ce"
+                    if not bin_path.exists():
+                        _json(self, {"error": "gen_image_ce binary not "
+                                              "found — run `make legacy_demo` "
+                                              "(legacy .ces path)"}, 400)
+                        return
+                    steps = str(int(body.get("steps", 50)))
+                    wave  = str(int(body.get("wave_iters", 200)))
+                    hybrid   = bool(body.get("hybrid", False))
+                    guidance = f"{float(body.get('guidance', 1.0)):.3f}"
+                    cmd = [str(bin_path), model, prompt, str(out_path),
+                           seed, steps, wave]
+                    if hybrid:
+                        cmd += ["--hybrid", "--guidance", guidance]
+
+                want_viz = (path == "/api/viz-generate")
+
+                def on_done(job, _out=out_path, _viz=want_viz):
+                    if _out.exists():
+                        job["result"]["image"] = _ppm_to_png_uri(str(_out))
+                        job["result"]["ppm_path"] = str(_out)
+                        if _viz:
+                            try:
+                                job["result"]["analysis"] = _analyze_ppm(str(_out))
+                            except Exception as e:
+                                job["result"]["analysis_error"] = str(e)
+                        for line in job["log"]:
+                            if line.startswith("wrote ") or "mean RGB" in line:
+                                job["result"]["info"] = line
+
+                job_id = _job_start(cmd, on_done=on_done)
+                _json(self, {"job_id": job_id})
+            except Exception as e:
+                _json(self, {"error": str(e),
+                             "trace": traceback.format_exc().splitlines()[-8:]
+                            }, 500)
+            return
+
+        # ── Forge: training ───────────────────────────────────
+        if path == "/api/train":
+            try:
+                body = _read_json(self)
+                dataset  = body.get("dataset",  str(ROOT / "data" / "demo"))
+                out_base = body.get("out_base", str(MODELS_DIR / "demo"))
+                masked_epochs = int(body.get("masked_epochs", 0))
+                bin_path = BUILD_DIR / "train_demo"
+                if not bin_path.exists():
+                    _json(self, {"error": "train_demo binary not found — "
+                                          "run `make legacy_demo`"}, 400)
+                    return
+                cmd = [str(bin_path), dataset, out_base]
+                if masked_epochs > 0:
+                    cmd += ["--masked-epochs", str(masked_epochs)]
+
+                def on_done(job, _base=out_base):
+                    ces  = Path(_base + ".ces")
+                    spai = Path(_base + ".spai")
+                    job["result"]["ces_exists"]  = ces.exists()
+                    job["result"]["spai_exists"] = spai.exists()
+                    if ces.exists():
+                        job["result"]["ces_size_kb"] = round(
+                            ces.stat().st_size / 1024, 1)
+
+                _json(self, {"job_id": _job_start(cmd, on_done=on_done)})
+            except Exception as e:
+                _json(self, {"error": str(e)}, 500)
+            return
+
+        if path == "/api/train-sss":
+            try:
+                body = _read_json(self)
+                labels    = body.get("labels")
+                root_dir  = body.get("root")
+                out_model = body.get("out", str(MODELS_DIR / "custom.sss"))
+                size = str(int(body.get("size", 64)))
+                if not labels or not root_dir:
+                    _json(self, {"error": "labels and root are required"}, 400)
+                    return
+                if not Path(labels).exists():
+                    _json(self, {"error": f"labels file not found: {labels}"}, 400)
+                    return
+                if not Path(root_dir).is_dir():
+                    _json(self, {"error": f"root dir not found: {root_dir}"}, 400)
+                    return
+                if not out_model.endswith(".sss"):
+                    out_model += ".sss"
+                Path(out_model).parent.mkdir(parents=True, exist_ok=True)
+                cmd = [
+                    "python3", str(ROOT / "scripts" / "sss_train.py"),
+                    "--labels", labels,
+                    "--root",   root_dir,
+                    "--out",    out_model,
+                    "--size",   size,
+                ]
+
+                def on_done(job, _path=out_model):
+                    p = Path(_path)
+                    job["result"]["sss_exists"] = p.exists()
+                    if p.exists():
+                        job["result"]["sss_size_kb"] = round(
+                            p.stat().st_size / 1024, 1)
+                        job["result"]["sss_path"] = str(p)
+
+                _json(self, {"job_id": _job_start(cmd, on_done=on_done)})
+            except Exception as e:
+                _json(self, {"error": str(e)}, 500)
+            return
+
+        if path == "/api/train-text":
+            try:
+                body = _read_json(self)
+                input_file = body.get("input",
+                                      str(ROOT / "data" / "wiki5k.txt"))
+                max_lines  = str(int(body.get("max", 5000)))
+                out_model  = body.get("out", str(MODELS_DIR / "text_model.spai"))
+                bin_path = BUILD_DIR / "stream_train"
+                if not bin_path.exists():
+                    _json(self, {"error": "stream_train binary not found — "
+                                          "run `make stream`"}, 400)
+                    return
+                cmd = [str(bin_path), "--input", input_file,
+                       "--max", max_lines, "--save", out_model, "--verify"]
+                _json(self, {"job_id": _job_start(cmd)})
+            except Exception as e:
+                _json(self, {"error": str(e)}, 500)
+            return
+
+        # ── Forge: chat (single-turn) ─────────────────────────
+        if path == "/api/chat":
+            try:
+                body = _read_json(self)
+                model   = body.get("model", "")
+                message = body.get("message", "")
+                bin_path = BUILD_DIR / "chat"
+                if not bin_path.exists():
+                    _json(self, {"error": "chat binary not found — "
+                                          "run `make chat`"}, 400)
+                    return
+                if not model or not Path(model).exists():
+                    _json(self, {"error": "model path required"}, 400); return
+                # Single-turn: pipe message + :q. The Forge UI treats this
+                # as one request → one reply, so we don't keep state.
+                input_text = f"{message}\n:q\n"
+                result = subprocess.run(
+                    [str(bin_path), "--load", model],
+                    input=input_text, capture_output=True,
+                    text=True, timeout=30, cwd=str(ROOT),
+                )
+                lines = result.stdout.strip().split("\n")
+                response_lines = []
+                capture = False
+                for line in lines:
+                    # The chat REPL echoes the user prompt back inline; flip
+                    # `capture` after we see it so we only return the reply.
+                    if ">" in line and message in line:
+                        capture = True; continue
+                    if (capture and not line.startswith("[chat]")
+                            and line.strip() != ":q"):
+                        if line.strip():
+                            response_lines.append(line)
+                _json(self, {
+                    "response": ("\n".join(response_lines)
+                                 if response_lines else "(no response)"),
+                    "raw":      lines[-20:],
+                })
+            except subprocess.TimeoutExpired:
+                _json(self, {"error": "timeout"}, 500)
+            except Exception as e:
+                _json(self, {"error": str(e)}, 500)
+            return
+
+        # ── Forge: dataset upload (multipart, save to data/uploads) ──
+        if path == "/api/upload":
+            try:
+                files, fields = _parse_multipart(self)
+                session = "sess_" + uuid.uuid4().hex[:8]
+                session_name = (fields.get("session") or "").strip()
+                if session_name:
+                    safe = "".join(c for c in session_name
+                                   if c.isalnum() or c in "._-")[:40]
+                    if safe:
+                        session = safe
+                target_dir = UPLOADS_DIR / session
+                target_dir.mkdir(parents=True, exist_ok=True)
+                saved = []
+                labels_path = None
+                for name, fname, data in files:
+                    if not fname:
+                        continue
+                    fname = Path(fname).name
+                    if not fname:
+                        continue
+                    dst = target_dir / fname
+                    with open(dst, "wb") as f:
+                        f.write(data)
+                    saved.append({"name": fname, "size": len(data)})
+                    if (name == "labels" or fname.endswith(".tsv")
+                            or fname == "labels.txt"):
+                        labels_path = str(dst)
+                _json(self, {
+                    "dir":        str(target_dir),
+                    "rel_dir":    str(target_dir.relative_to(ROOT)),
+                    "labels":     labels_path,
+                    "rel_labels": (str(Path(labels_path).relative_to(ROOT))
+                                   if labels_path else None),
+                    "files":      saved,
+                })
+            except _PayloadTooLarge as e:
+                _json(self, {"error": str(e)}, 413)
+            except _BadRequest as e:
+                _json(self, {"error": str(e)}, 400)
+            except Exception as e:
+                _json(self, {"error": str(e)}, 500)
+            return
+
+        # ── Atmos: scene decompose + motion preview (NEW) ─────
+        if path == "/api/atmos":
+            try:
+                files, fields = _parse_multipart(self)
+                if not files:
+                    raise _BadRequest("no `image` part in upload")
+                # Take the first uploaded file regardless of field name —
+                # the UI uses `image`, but cURL examples often hand-roll
+                # the form and forget to set it.
+                _name, _filename, data = files[0]
+                n_frames   = int(fields.get("n_frames")   or 24)
+                frame_size = int(fields.get("frame_size") or 256)
+                base_id    = int(fields.get("base_id")    or 0)
+                result = _run_atmos_decompose(
+                    data, n_frames=n_frames,
+                    frame_size=frame_size, base_id=base_id,
+                    filename=_filename or "")
+                result["ok"] = True
+                _json(self, result)
+            except _BadRequest as e:
+                _json(self, {"ok": False, "error": str(e)}, 400)
+            except _PayloadTooLarge as e:
+                _json(self, {"ok": False, "error": str(e)}, 413)
+            except Exception as e:
+                _json(self, {
+                    "ok": False,
+                    "error": str(e),
+                    "trace": traceback.format_exc().splitlines()[-8:],
+                }, 500)
+            return
+
         _json(self, {"error": "not found"}, 404)
 
 
