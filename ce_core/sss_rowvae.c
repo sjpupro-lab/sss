@@ -561,6 +561,29 @@ static int reconstruct_shape_cell(const SSSCell *cell,
     return 0;
 }
 
+/* Minimum ce_distance from `cell`'s ce_key to any prompt token's
+ * ce_feed. Used by the sculpt loop to break ties in pools where the
+ * candidate-collection order doesn't reflect closeness — e.g. FACE,
+ * which doesn't get its own row-by-row scoring round, picks its
+ * winner directly by this metric so a multi-token prompt
+ * ("mymelody pink rabbit") lands on the cell whose ce_key matches
+ * the strongest token (mymelody at d=0), not whichever pool slot
+ * happened to be filled first. */
+static uint32_t min_token_distance(const SSSCell *cell,
+                                   char **tokens, int ntok)
+{
+    uint32_t best = 0xFFFFFFFFu;
+    for (int ti = 0; ti < ntok; ++ti) {
+        CEUnit q;
+        ce_init(&q);
+        ce_feed(&q, (const uint8_t *)tokens[ti],
+                (uint32_t)strlen(tokens[ti]));
+        uint32_t d = ce_distance(&q, &cell->ce_key);
+        if (d < best) best = d;
+    }
+    return best;
+}
+
 /* argmax over n floats. Returns 0 when n == 0. */
 static int argmax_f(const float *a, int n)
 {
@@ -794,11 +817,24 @@ int sss_generate(const SSSModel *m,
 
     /* Final winners (in pool space). FACE doesn't get its own sculpt
      * round — it acts as the high-frequency residual the radio mixes
-     * into the mid band — so we just take the best-matching FACE cell
-     * (index 0 of the pool, which is the closest tie-class member). */
+     * into the mid band — so we pick the FACE cell with the lowest
+     * min ce_distance to any prompt token. Pool index 0 is NOT a safe
+     * proxy here: find_candidate_cells inserts in token order, so a
+     * prompt like "mymelody pink rabbit" leaves the pool as
+     * [mymelody, kitty, keroppi] only because "mymelody" came first;
+     * reorder the tokens and the index-0 winner shifts. min-distance
+     * fixes that. */
     int winner_c = (nc > 0) ? argmax_f(c_scores, nc) : -1;
     int winner_s = (ns > 0) ? argmax_f(s_scores, ns) : -1;
-    int winner_f = (nf > 0) ? 0 : -1;
+    int winner_f = -1;
+    if (nf > 0) {
+        uint32_t best_d = 0xFFFFFFFFu;
+        for (int i = 0; i < nf; ++i) {
+            uint32_t d = min_token_distance(&m->cells[face_idx[i]],
+                                            tokens, ntok);
+            if (d < best_d) { best_d = d; winner_f = i; }
+        }
+    }
 
     free(amp_pad); free(phase_pad); free(axis_out);
     /* pool_color / pool_shape / pool_face are still needed by Stage 2
@@ -826,19 +862,25 @@ int sss_generate(const SSSModel *m,
     /* Target spectrograms.
      *   tgt_row_amp / phase  layout: [r * 3 * NF + c * NF + k]
      *   tgt_col_amp / phase  layout: [x * 3 * NF + c * NF + k]
-     */
-    float *tgt_row_amp   = (float *)malloc((size_t)H * 3 * NF * sizeof(float));
-    float *tgt_row_phase = (float *)malloc((size_t)H * 3 * NF * sizeof(float));
-    float *tgt_col_amp   = (float *)malloc((size_t)W * 3 * NF * sizeof(float));
-    float *tgt_col_phase = (float *)malloc((size_t)W * 3 * NF * sizeof(float));
+     * tgt_*_has[idx] == 0 means "no source contributed to this bin" —
+     * the radio loop must skip the blend instead of pulling the
+     * measured amp toward 0 (which would slowly collapse the image
+     * to flat black). */
+    float   *tgt_row_amp   = (float   *)malloc((size_t)H * 3 * NF * sizeof(float));
+    float   *tgt_row_phase = (float   *)malloc((size_t)H * 3 * NF * sizeof(float));
+    uint8_t *tgt_row_has   = (uint8_t *)calloc((size_t)H * 3 * NF, sizeof(uint8_t));
+    float   *tgt_col_amp   = (float   *)malloc((size_t)W * 3 * NF * sizeof(float));
+    float   *tgt_col_phase = (float   *)malloc((size_t)W * 3 * NF * sizeof(float));
+    uint8_t *tgt_col_has   = (uint8_t *)calloc((size_t)W * 3 * NF, sizeof(uint8_t));
 
     if (!row_in || !row_amp || !row_phase || !row_out
      || !col_in || !col_amp || !col_phase || !col_out
-     || !tgt_row_amp || !tgt_row_phase || !tgt_col_amp || !tgt_col_phase) {
+     || !tgt_row_amp || !tgt_row_phase || !tgt_row_has
+     || !tgt_col_amp || !tgt_col_phase || !tgt_col_has) {
         free(row_in); free(row_amp); free(row_phase); free(row_out);
         free(col_in); free(col_amp); free(col_phase); free(col_out);
-        free(tgt_row_amp); free(tgt_row_phase);
-        free(tgt_col_amp); free(tgt_col_phase);
+        free(tgt_row_amp); free(tgt_row_phase); free(tgt_row_has);
+        free(tgt_col_amp); free(tgt_col_phase); free(tgt_col_has);
         free(pool_color); free(pool_shape); free(pool_face);
         sss_image_free(out);
         for (int i = 0; i < ntok; ++i) free(tokens[i]);
@@ -870,8 +912,8 @@ int sss_generate(const SSSModel *m,
                 free(ha); free(hp); free(hsa); free(hsp); free(hfa); free(hfp);
                 free(row_in); free(row_amp); free(row_phase); free(row_out);
                 free(col_in); free(col_amp); free(col_phase); free(col_out);
-                free(tgt_row_amp); free(tgt_row_phase);
-                free(tgt_col_amp); free(tgt_col_phase);
+                free(tgt_row_amp); free(tgt_row_phase); free(tgt_row_has);
+                free(tgt_col_amp); free(tgt_col_phase); free(tgt_col_has);
                 free(pool_color); free(pool_shape); free(pool_face);
                 sss_image_free(out);
                 for (int i = 0; i < ntok; ++i) free(tokens[i]);
@@ -912,43 +954,51 @@ int sss_generate(const SSSModel *m,
                     sss_rfft(row_in, W, bfa, bfp);
                 }
                 for (int k = 0; k < NF; ++k) {
-                    float ta, tp;
+                    float ta = 0.0f, tp = 0.0f;
+                    int   has = 0;
                     if (k < NF_LOW && cimg) {
-                        ta = bca[k]; tp = bcp[k];
+                        ta = bca[k]; tp = bcp[k]; has = 1;
                     } else if (k < NF_LOW * 2 && fimg && simg) {
                         ta = bsa[k] * 0.6f + bfa[k] * 0.4f * detail;
-                        tp = bfp[k];
+                        tp = bfp[k]; has = 1;
                     } else if (simg) {
-                        ta = bsa[k]; tp = bsp[k];
+                        ta = bsa[k]; tp = bsp[k]; has = 1;
                     } else if (fimg && k >= NF_LOW) {
-                        ta = bfa[k] * detail; tp = bfp[k];
+                        ta = bfa[k] * detail; tp = bfp[k]; has = 1;
                     } else if (cimg) {
-                        ta = bca[k]; tp = bcp[k];
-                    } else {
-                        ta = 0.0f; tp = 0.0f;
+                        ta = bca[k]; tp = bcp[k]; has = 1;
                     }
+                    /* No source for this bin → leave has=0 so the
+                     * radio loop skips the blend (don't pull the
+                     * measured amp toward 0). */
                     size_t idx = ((size_t)r * 3 + (size_t)c) * (size_t)NF + (size_t)k;
                     tgt_row_amp[idx]   = ta;
                     tgt_row_phase[idx] = tp;
+                    tgt_row_has[idx]   = (uint8_t)has;
                 }
             }
         }
 
         /* Column targets — pure SHAPE, per channel (identical across
-         * channels because shape was gray-broadcast at reconstruction). */
+         * channels because shape was gray-broadcast at reconstruction).
+         * No SHAPE winner → leave has=0 so the column tune loop is a
+         * no-op for that bin. */
         for (int x = 0; x < W; ++x) {
             for (int c = 0; c < 3; ++c) {
                 if (simg) {
                     for (int y = 0; y < H; ++y)
                         col_in[y] = simg[((size_t)y * W + x) * 3 + c];
                     sss_rfft(col_in, H, bsa, bsp);
-                } else {
-                    for (int k = 0; k < NF; ++k) { bsa[k] = 0.0f; bsp[k] = 0.0f; }
                 }
                 for (int k = 0; k < NF; ++k) {
                     size_t idx = ((size_t)x * 3 + (size_t)c) * (size_t)NF + (size_t)k;
-                    tgt_col_amp[idx]   = bsa[k];
-                    tgt_col_phase[idx] = bsp[k];
+                    if (simg) {
+                        tgt_col_amp[idx]   = bsa[k];
+                        tgt_col_phase[idx] = bsp[k];
+                        tgt_col_has[idx]   = 1u;
+                    }
+                    /* else: tgt_col_has is calloc-zeroed, so the loop
+                     * leaves the measured spectrum untouched. */
                 }
             }
         }
@@ -981,6 +1031,13 @@ int sss_generate(const SSSModel *m,
         else if (out->data[i] > 1.0f) out->data[i] = 1.0f;
     }
 
+    /* If no pool produced a winner, every target bin would be has=0 →
+     * the radio loop below is a no-op. Skip it entirely so the caller
+     * sees the spectral-noise canvas as the documented behaviour for
+     * the "no matching cells" case, instead of paying for `steps`
+     * empty FFT iterations. */
+    int have_any_target = (winner_c >= 0) || (winner_s >= 0) || (winner_f >= 0);
+
     /* Steps-aware cooling: more steps → smaller per-step nudges, so a
      * 60 / 120 step run converges into a cleaner image than the 24-step
      * preview. AM (coarse) → FM (fine) → digital (snap). */
@@ -989,7 +1046,7 @@ int sss_generate(const SSSModel *m,
                      :                 0.30f;
     float decay = base_alpha * 0.68f;
 
-    for (int step = 0; step < steps; ++step) {
+    for (int step = 0; have_any_target && step < steps; ++step) {
         float t = (steps > 1) ? (float)step / (float)(steps - 1) : 0.0f;
         float alpha       = base_alpha - decay * t;
         if (alpha < 0.05f) alpha = 0.05f;
@@ -1004,6 +1061,7 @@ int sss_generate(const SSSModel *m,
                 sss_rfft(row_in, W, row_amp, row_phase);
                 for (int k = 0; k < NF; ++k) {
                     size_t idx = ((size_t)r * 3 + (size_t)c) * (size_t)NF + (size_t)k;
+                    if (!tgt_row_has[idx]) continue;
                     float ta = tgt_row_amp[idx];
                     float tp = tgt_row_phase[idx];
                     row_amp[k] = alpha * ta + (1.0f - alpha) * row_amp[k];
@@ -1035,6 +1093,7 @@ int sss_generate(const SSSModel *m,
                 sss_rfft(col_in, H, col_amp, col_phase);
                 for (int k = 0; k < NF; ++k) {
                     size_t idx = ((size_t)x * 3 + (size_t)c) * (size_t)NF + (size_t)k;
+                    if (!tgt_col_has[idx]) continue;
                     float ta = tgt_col_amp[idx];
                     float tp = tgt_col_phase[idx];
                     col_amp[k] = alpha * ta + (1.0f - alpha) * col_amp[k];
@@ -1057,8 +1116,8 @@ int sss_generate(const SSSModel *m,
 
     free(row_in); free(row_amp); free(row_phase); free(row_out);
     free(col_in); free(col_amp); free(col_phase); free(col_out);
-    free(tgt_row_amp); free(tgt_row_phase);
-    free(tgt_col_amp); free(tgt_col_phase);
+    free(tgt_row_amp); free(tgt_row_phase); free(tgt_row_has);
+    free(tgt_col_amp); free(tgt_col_phase); free(tgt_col_has);
     free(pool_color); free(pool_shape); free(pool_face);
     for (int i = 0; i < ntok; ++i) free(tokens[i]);
 

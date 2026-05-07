@@ -61,7 +61,7 @@ produced by the scripts in this repo on the bundled `data/sanrio`
   - [Tick-sorted dynamic decode](#6-tick-sorted-dynamic-decode)
 - [End-to-end demo](#end-to-end-demo)
 - [Verified results](#verified-results)
-- [Spectrogram engine — sss_rowvae](#spectrogram-engine--sss_rowvae)
+- [Spectrogram engine — sss_rowvae (Sculpt + Radio)](#spectrogram-engine--sss_rowvae-sculpt--radio)
 - [Python perception / orchestration layer](#python-perception--orchestration-layer)
 - [End-to-end benchmarks on real character images](#end-to-end-benchmarks-on-real-character-images)
 - [Build & run](#build--run)
