@@ -10,13 +10,17 @@ Then open:
 from __future__ import annotations
 
 import base64
+import collections
 import http.server
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
+import uuid
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
@@ -371,10 +375,6 @@ def _run_restore(src_path: str, mask_path: Optional[str], *,
 # server. ui/server.py + ui/index.html move to legacy_deprecated/ so
 # older docs that referenced port 8080 still find a working binary.
 
-import subprocess
-import time
-import uuid
-
 BUILD_DIR    = ROOT / "build"
 MODELS_DIR   = BUILD_DIR / "models"
 DATA_DIR     = ROOT / "data"
@@ -404,6 +404,48 @@ def _safe_under_root(p) -> Optional[Path]:
         return target
     except ValueError:
         return None
+
+
+def _safe_output_path(p, *, default_dir: Path,
+                      allowed_suffixes=None) -> Optional[Path]:
+    """Validate a user-supplied training-output path.
+
+    Accepts either:
+      - a bare filename (str without separators) → joined under
+        `default_dir`, or
+      - an absolute / relative path → resolved and required to live
+        under ROOT (rejects ../ traversal and absolute paths outside
+        the repo).
+
+    `allowed_suffixes` (e.g. {".sss", ".spai", ".ces"}) is enforced when
+    set so a request can't write a `.sh` over `data/`. Returns the
+    resolved Path or None when the request is unsafe."""
+    if not p:
+        return None
+    p_str = str(p).strip()
+    if not p_str:
+        return None
+    # Bare filename ("custom.sss") → land inside default_dir. Same rule
+    # as ce_storage_io: a basename never traverses, so we can skip the
+    # ROOT relativisation in this branch.
+    if "/" not in p_str and "\\" not in p_str:
+        candidate = default_dir / p_str
+    else:
+        try:
+            cand = Path(p_str).expanduser()
+            if not cand.is_absolute():
+                cand = (ROOT / cand)
+            candidate = cand.resolve()
+        except (OSError, ValueError):
+            return None
+        try:
+            candidate.relative_to(ROOT.resolve())
+        except ValueError:
+            return None
+    if allowed_suffixes is not None:
+        if candidate.suffix.lower() not in allowed_suffixes:
+            return None
+    return candidate
 
 
 def _scan_models():
@@ -444,12 +486,39 @@ def _ppm_to_png_uri(path: str) -> Optional[str]:
             maxval = int(f.readline().strip())
         except ValueError:
             return None
+        # PPM allows maxval up to 65535 (16-bit). The P6 binary path
+        # stores 16-bit samples as two big-endian bytes, but every
+        # caller in this server emits 8-bit P6 PPMs, so the 16-bit
+        # branch only matters if a user uploads one — reject it
+        # explicitly instead of silently returning a corrupted PNG.
         if magic == b"P6":
+            if maxval > 255:
+                return None
             data = f.read()
+            samples = list(data[:w * h * 3])
         else:
-            data = bytes(int(t) for t in f.read().split())
-    if maxval != 255:
-        data = bytes(int(b * 255 / maxval) for b in data)
+            # P3 ASCII path: parse to ints first, rescale to 0..255,
+            # *then* coerce to a bytes-compatible range. Doing
+            # `bytes(int(t) ...)` directly raises on maxval>255.
+            try:
+                samples = [int(t) for t in f.read().split()]
+            except ValueError:
+                return None
+            if maxval <= 0:
+                return None
+            if maxval != 255:
+                # Round-half-up rescale so 0 stays 0 and maxval stays 255.
+                scale = 255.0 / float(maxval)
+                samples = [max(0, min(255, int(round(s * scale))))
+                           for s in samples]
+            else:
+                samples = [max(0, min(255, s)) for s in samples]
+            data = bytes(samples)
+    if magic == b"P6" and maxval != 255:
+        # P6 8-bit with non-255 maxval: rescale per byte. No overflow
+        # because both sides fit in 0..255.
+        scale = 255.0 / float(maxval)
+        data = bytes(max(0, min(255, int(round(b * scale)))) for b in data)
     if len(data) < w * h * 3:
         return None
     arr = np.frombuffer(data[:w * h * 3], dtype=np.uint8).reshape(h, w, 3)
@@ -473,17 +542,25 @@ def _analyze_ppm(path: str) -> dict:
         data = f.read()
     arr = np.frombuffer(data[:w * h * 3], dtype=np.uint8).reshape(h, w, 3)
     bw, bh = 16, 16
-    block_w = max(w // bw, 1)
-    block_h = max(h // bh, 1)
     energy = np.zeros((bh, bw), dtype=np.float32)
     edge   = np.zeros((bh, bw), dtype=np.float32)
+    # Proportional partition — each block covers
+    #   [int(idx*size/N), int((idx+1)*size/N)).
+    # Floor division (`w // 16`) would drop the rightmost / bottom
+    # pixels whenever w or h aren't multiples of 16 (e.g. w=65 → 5
+    # pixels never sampled). Proportional partitioning sweeps every
+    # pixel exactly once and degrades gracefully for w,h < 16 too.
     for by in range(bh):
+        y0 = (by * h) // bh
+        y1 = ((by + 1) * h) // bh
+        if y1 <= y0:
+            continue
         for bx in range(bw):
-            y0 = by * block_h; y1 = min(y0 + block_h, h)
-            x0 = bx * block_w; x1 = min(x0 + block_w, w)
-            blk = arr[y0:y1, x0:x1]
-            if blk.size == 0:
+            x0 = (bx * w) // bw
+            x1 = ((bx + 1) * w) // bw
+            if x1 <= x0:
                 continue
+            blk = arr[y0:y1, x0:x1]
             energy[by, bx] = float(blk.mean())
             if blk.shape[1] >= 2:
                 grad = np.abs(blk[:, 1:].astype(np.int32) - blk[:, :-1].astype(np.int32))
@@ -512,6 +589,53 @@ def _analyze_ppm(path: str) -> dict:
     }
 
 
+# Per-job log cap. The Forge predecessor stored every stdout line
+# unbounded; long training runs (stream_train, sss_train) would eat
+# memory until the server died. The deque caps in-place — older lines
+# fall off the back but the SSE stream never blocks because the
+# producer keeps writing.
+_JOB_LOG_MAX        = 2000      # ~200 KB worst case (100B / line)
+# Completed-job retention. Entries hang around long enough for a slow
+# poll-only client to see the result, then get pruned. Cleanup runs on
+# every _job_start so a running server with traffic stays bounded;
+# idle servers naturally accumulate < _JOB_MAX_TOTAL jobs.
+_JOB_TTL_SECONDS    = 60 * 60   # 1h after exit
+_JOB_MAX_TOTAL      = 64        # hard cap regardless of TTL
+
+
+def _prune_jobs() -> None:
+    """Drop completed jobs older than _JOB_TTL_SECONDS, then enforce the
+    _JOB_MAX_TOTAL cap by evicting the oldest done jobs first. Must be
+    called under _JOBS_LOCK."""
+    now = time.time()
+    expired = [
+        jid for jid, j in _JOBS.items()
+        if j.get("done")
+        and j.get("finished_at", j.get("started_at", now)) + _JOB_TTL_SECONDS < now
+    ]
+    for jid in expired:
+        _JOBS.pop(jid, None)
+    if len(_JOBS) > _JOB_MAX_TOTAL:
+        # Sort done jobs by finished_at ascending and pop until we fit.
+        # Live jobs are always preserved; if every slot is live, we let
+        # the dict grow this once — caller wins.
+        done_sorted = sorted(
+            (jid for jid, j in _JOBS.items() if j.get("done")),
+            key=lambda jid: _JOBS[jid].get("finished_at",
+                                           _JOBS[jid].get("started_at", 0)),
+        )
+        excess = len(_JOBS) - _JOB_MAX_TOTAL
+        for jid in done_sorted[:excess]:
+            _JOBS.pop(jid, None)
+
+
+def _job_log_append(job: dict, line: str) -> None:
+    """Append one log line, bumping the monotonic counter SSE consumers
+    use to detect dropped (rolled-out-of-deque) lines."""
+    job["log"].append(line)
+    job["log_total"] = job.get("log_total", 0) + 1
+
+
 def _job_run(job_id: str, cmd, cwd=None, on_done=None) -> None:
     """Background thread: run `cmd`, append every stdout line to
     _JOBS[job_id]['log']. Survives crashes (ERROR row appended).
@@ -524,19 +648,20 @@ def _job_run(job_id: str, cmd, cwd=None, on_done=None) -> None:
         )
         job["proc"] = proc
         for line in proc.stdout:
-            job["log"].append(line.rstrip("\n"))
+            _job_log_append(job, line.rstrip("\n"))
         proc.wait()
         job["exit_code"] = proc.returncode
     except Exception as e:
-        job["log"].append(f"[ERROR] {e}")
+        _job_log_append(job, f"[ERROR] {e}")
         job["exit_code"] = -1
     finally:
+        job["finished_at"] = time.time()
         job["done"] = True
         if on_done is not None:
             try:
                 on_done(job)
             except Exception as e:
-                job["log"].append(f"[on_done ERROR] {e}")
+                _job_log_append(job, f"[on_done ERROR] {e}")
 
 
 def _job_start(cmd, cwd=None, on_done=None) -> str:
@@ -544,9 +669,16 @@ def _job_start(cmd, cwd=None, on_done=None) -> str:
     short hex id the UI uses for the SSE stream."""
     job_id = uuid.uuid4().hex[:8]
     with _JOBS_LOCK:
+        # Garbage-collect stale jobs before adding a new slot. Cheap —
+        # the dict tops out at _JOB_MAX_TOTAL.
+        _prune_jobs()
         _JOBS[job_id] = {
-            "proc": None, "log": [], "done": False,
-            "exit_code": None, "result": {}, "started_at": time.time(),
+            "proc": None,
+            "log":  collections.deque(maxlen=_JOB_LOG_MAX),
+            "log_total": 0,
+            "done": False, "exit_code": None,
+            "result": {}, "started_at": time.time(),
+            "finished_at": None,
         }
     t = threading.Thread(target=_job_run,
                          args=(job_id, cmd, cwd, on_done),
@@ -571,8 +703,29 @@ def _run_atmos_decompose(image_bytes: bytes, *, n_frames: int = 24,
     # Persist upload so tools.sss_ingest._read_image_any can route
     # PNG/PPM/etc. by extension. Cleaned up at the end. Preserve the
     # original extension so the loader hits the right decoder — PNG and
-    # PPM read paths are completely separate inside sss_image_io.
-    ext = os.path.splitext(filename)[1].lower() or ".png"
+    # PPM read paths are completely separate inside sss_image_io. When
+    # the upload arrived without a filename (curl --data-binary, or a
+    # client that forgot to set Content-Disposition: filename=) sniff
+    # the magic header so we don't always default to .png and silently
+    # mis-route PPM uploads.
+    ext = os.path.splitext(filename)[1].lower()
+    if not ext:
+        head = image_bytes[:8]
+        if head.startswith(b"\x89PNG\r\n\x1a\n"):
+            ext = ".png"
+        elif head.startswith(b"P6") or head.startswith(b"P3"):
+            ext = ".ppm"
+        elif head.startswith(b"\xff\xd8\xff"):
+            ext = ".jpg"
+        elif head[:6] in (b"GIF87a", b"GIF89a"):
+            ext = ".gif"
+        elif head.startswith(b"BM"):
+            ext = ".bmp"
+        else:
+            # Last-resort: keep the historical .png fallback so the
+            # error message comes out of the PNG decoder rather than
+            # _read_image_any choking on an unknown extension.
+            ext = ".png"
     staging = tempfile.mkdtemp(prefix="sss_atmos_")
     try:
         path = os.path.join(staging, "input" + ext)
@@ -795,16 +948,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
+            # `sent` is a logical line number, not a deque index. The
+            # ring-buffer log can drop older lines, so we compare against
+            # the producer's monotonic counter and only emit
+            # currently-retained tail entries.
             sent = 0
             try:
                 while True:
-                    while sent < len(job["log"]):
-                        line = job["log"][sent]
-                        self.wfile.write(
-                            f"data: {json.dumps({'line': line})}\n\n".encode())
-                        self.wfile.flush()
-                        sent += 1
-                    if job["done"]:
+                    log_total = job.get("log_total", 0)
+                    if sent < log_total:
+                        snapshot = list(job["log"])
+                        retained_start = log_total - len(snapshot)
+                        if sent < retained_start:
+                            # Lines fell off the back. Tell the client
+                            # so it doesn't think the gap is a server
+                            # bug; jump forward to the oldest retained.
+                            dropped = retained_start - sent
+                            self.wfile.write(
+                                ("data: " + json.dumps(
+                                    {"line": f"[…{dropped} earlier "
+                                             "log line(s) dropped — "
+                                             "ring buffer rolled]"}
+                                ) + "\n\n").encode())
+                            sent = retained_start
+                        for i in range(sent - retained_start, len(snapshot)):
+                            self.wfile.write(
+                                ("data: " + json.dumps(
+                                    {"line": snapshot[i]}) + "\n\n").encode())
+                            self.wfile.flush()
+                            sent += 1
+                    if job["done"] and sent >= job.get("log_total", 0):
                         result = {"done": True, "exit_code": job["exit_code"]}
                         result.update(job.get("result", {}))
                         self.wfile.write(
@@ -822,12 +995,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 job = _JOBS.get(job_id)
             if job is None:
                 _json(self, {"error": "job not found"}, 404); return
+            # `job["log"]` is a deque; islice gives the last 50 retained
+            # lines without paying for a full list copy. log_total tells
+            # the client how many lines were ever produced (for
+            # reconciliation against the SSE stream).
+            from itertools import islice
+            log_dq = job["log"]
+            tail_n = min(50, len(log_dq))
+            tail = list(islice(log_dq, len(log_dq) - tail_n, len(log_dq)))
             _json(self, {
-                "done":       job["done"],
-                "exit_code":  job["exit_code"],
-                "log":        job["log"][-50:],
-                "result":     job.get("result", {}),
-                "started_at": job.get("started_at"),
+                "done":         job["done"],
+                "exit_code":    job["exit_code"],
+                "log":          tail,
+                "log_total":    job.get("log_total", 0),
+                "log_retained": len(log_dq),
+                "result":       job.get("result", {}),
+                "started_at":   job.get("started_at"),
+                "finished_at":  job.get("finished_at"),
             })
             return
 
@@ -1095,15 +1279,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 want_viz = (path == "/api/viz-generate")
 
                 def on_done(job, _out=out_path, _viz=want_viz):
+                    # Encode the PPM to PNG, run analysis if requested,
+                    # then delete the on-disk PPM. The Forge predecessor
+                    # left these in build/ forever — over a long-running
+                    # server those add up to gigabytes. The data URI we
+                    # already embedded is the durable artefact.
                     if _out.exists():
-                        job["result"]["image"] = _ppm_to_png_uri(str(_out))
-                        job["result"]["ppm_path"] = str(_out)
-                        if _viz:
+                        try:
+                            job["result"]["image"] = _ppm_to_png_uri(str(_out))
+                            if _viz:
+                                try:
+                                    job["result"]["analysis"] = _analyze_ppm(str(_out))
+                                except Exception as e:
+                                    job["result"]["analysis_error"] = str(e)
+                        finally:
                             try:
-                                job["result"]["analysis"] = _analyze_ppm(str(_out))
-                            except Exception as e:
-                                job["result"]["analysis_error"] = str(e)
-                        for line in job["log"]:
+                                _out.unlink()
+                            except OSError:
+                                pass
+                        for line in list(job["log"]):
                             if line.startswith("wrote ") or "mean RGB" in line:
                                 job["result"]["info"] = line
 
@@ -1119,19 +1313,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/train":
             try:
                 body = _read_json(self)
-                dataset  = body.get("dataset",  str(ROOT / "data" / "demo"))
-                out_base = body.get("out_base", str(MODELS_DIR / "demo"))
+                dataset_in  = body.get("dataset",  str(ROOT / "data" / "demo"))
+                out_base_in = body.get("out_base", "demo")
                 masked_epochs = int(body.get("masked_epochs", 0))
                 bin_path = BUILD_DIR / "train_demo"
                 if not bin_path.exists():
                     _json(self, {"error": "train_demo binary not found — "
                                           "run `make legacy_demo`"}, 400)
                     return
-                cmd = [str(bin_path), dataset, out_base]
+                # Path safety: refuse to read datasets or write outputs
+                # outside the repo root — a malformed `out_base` could
+                # otherwise overwrite arbitrary files when the server is
+                # bound to a non-local interface.
+                dataset_p = _safe_under_root(dataset_in)
+                if dataset_p is None or not dataset_p.exists():
+                    _json(self, {"error": "dataset must be a path under "
+                                          f"{ROOT}"}, 400)
+                    return
+                out_base_p = _safe_output_path(
+                    out_base_in, default_dir=MODELS_DIR)
+                if out_base_p is None:
+                    _json(self, {"error": "out_base must be a basename or "
+                                          "a path under the repo root"}, 400)
+                    return
+                out_base_p.parent.mkdir(parents=True, exist_ok=True)
+                cmd = [str(bin_path), str(dataset_p), str(out_base_p)]
                 if masked_epochs > 0:
                     cmd += ["--masked-epochs", str(masked_epochs)]
 
-                def on_done(job, _base=out_base):
+                def on_done(job, _base=str(out_base_p)):
                     ces  = Path(_base + ".ces")
                     spai = Path(_base + ".spai")
                     job["result"]["ces_exists"]  = ces.exists()
@@ -1148,26 +1358,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/train-sss":
             try:
                 body = _read_json(self)
-                labels    = body.get("labels")
-                root_dir  = body.get("root")
-                out_model = body.get("out", str(MODELS_DIR / "custom.sss"))
+                labels_in    = body.get("labels")
+                root_dir_in  = body.get("root")
+                out_model_in = body.get("out", "custom.sss")
                 size = str(int(body.get("size", 64)))
-                if not labels or not root_dir:
+                if not labels_in or not root_dir_in:
                     _json(self, {"error": "labels and root are required"}, 400)
                     return
-                if not Path(labels).exists():
-                    _json(self, {"error": f"labels file not found: {labels}"}, 400)
+                # Same path-safety pattern as /api/train above. The
+                # spec-train script is also invoked locally so we want
+                # `labels` and `root` to live inside the repo too.
+                labels_p = _safe_under_root(labels_in)
+                if labels_p is None or not labels_p.exists():
+                    _json(self, {"error": f"labels must be a path under "
+                                          f"{ROOT}"}, 400)
                     return
-                if not Path(root_dir).is_dir():
-                    _json(self, {"error": f"root dir not found: {root_dir}"}, 400)
+                root_p = _safe_under_root(root_dir_in)
+                if root_p is None or not root_p.is_dir():
+                    _json(self, {"error": f"root must be a directory under "
+                                          f"{ROOT}"}, 400)
                     return
-                if not out_model.endswith(".sss"):
-                    out_model += ".sss"
-                Path(out_model).parent.mkdir(parents=True, exist_ok=True)
+                out_model_p = _safe_output_path(
+                    out_model_in, default_dir=MODELS_DIR,
+                    allowed_suffixes={".sss"})
+                if out_model_p is None:
+                    # Tolerate users typing "name" (no extension) by
+                    # auto-appending .sss before validating.
+                    fallback = (out_model_in if out_model_in.endswith(".sss")
+                                else out_model_in + ".sss")
+                    out_model_p = _safe_output_path(
+                        fallback, default_dir=MODELS_DIR,
+                        allowed_suffixes={".sss"})
+                if out_model_p is None:
+                    _json(self, {"error": "out must be a *.sss basename or "
+                                          "a path under the repo root"}, 400)
+                    return
+                out_model_p.parent.mkdir(parents=True, exist_ok=True)
+                out_model = str(out_model_p)
                 cmd = [
                     "python3", str(ROOT / "scripts" / "sss_train.py"),
-                    "--labels", labels,
-                    "--root",   root_dir,
+                    "--labels", str(labels_p),
+                    "--root",   str(root_p),
                     "--out",    out_model,
                     "--size",   size,
                 ]
@@ -1188,17 +1419,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/train-text":
             try:
                 body = _read_json(self)
-                input_file = body.get("input",
-                                      str(ROOT / "data" / "wiki5k.txt"))
-                max_lines  = str(int(body.get("max", 5000)))
-                out_model  = body.get("out", str(MODELS_DIR / "text_model.spai"))
+                input_in    = body.get("input",
+                                       str(ROOT / "data" / "wiki5k.txt"))
+                max_lines   = str(int(body.get("max", 5000)))
+                out_model_in = body.get("out", "text_model.spai")
                 bin_path = BUILD_DIR / "stream_train"
                 if not bin_path.exists():
                     _json(self, {"error": "stream_train binary not found — "
                                           "run `make stream`"}, 400)
                     return
-                cmd = [str(bin_path), "--input", input_file,
-                       "--max", max_lines, "--save", out_model, "--verify"]
+                # Path-safety: input corpus must be under the repo;
+                # output must land in MODELS_DIR (basename) or under the
+                # repo root, with a .spai suffix.
+                input_p = _safe_under_root(input_in)
+                if input_p is None or not input_p.exists():
+                    _json(self, {"error": f"input must be a path under "
+                                          f"{ROOT}"}, 400)
+                    return
+                out_p = _safe_output_path(
+                    out_model_in, default_dir=MODELS_DIR,
+                    allowed_suffixes={".spai"})
+                if out_p is None:
+                    fallback = (out_model_in if out_model_in.endswith(".spai")
+                                else out_model_in + ".spai")
+                    out_p = _safe_output_path(
+                        fallback, default_dir=MODELS_DIR,
+                        allowed_suffixes={".spai"})
+                if out_p is None:
+                    _json(self, {"error": "out must be a *.spai basename or "
+                                          "a path under the repo root"}, 400)
+                    return
+                out_p.parent.mkdir(parents=True, exist_ok=True)
+                cmd = [str(bin_path), "--input", str(input_p),
+                       "--max", max_lines, "--save", str(out_p), "--verify"]
                 _json(self, {"job_id": _job_start(cmd)})
             except Exception as e:
                 _json(self, {"error": str(e)}, 500)
