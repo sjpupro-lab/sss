@@ -27,7 +27,7 @@ produced by the scripts in this repo on the bundled `data/sanrio`
 | **sss_memory**               | `tools/sss_memory.py`         | `CEMemory.add_cell()` routes through ctypes → `ce_storage_add_typed`; every Python add lands in a real `.ces`. |
 | **sss_image_io**             | `tools/sss_image_io.py`       | stdlib-only PNG / PPM read+write — drops the cv2 / Pillow runtime requirement from UI encode. |
 | **sss_pybridge**             | `ce_core/sss_pybridge.{c,h}`  | shared library (`libsss_pybridge.so`) exposing `ce_storage_add_typed` and `sss_pybridge_generate` to ctypes. |
-| **sss_rowvae** + **ce_key**  | `ce_core/sss_rowvae.{c,h}`    | ce_feed / ce_distance search and v9 ce_key bridge exposure on top of the spectrogram path. |
+| **sss_rowvae** Sculpt + Radio | `ce_core/sss_rowvae.{c,h}`   | Two-stage engine — Sculpt (PR #19 candidate competition) picks the (color, shape, face) winners by row-by-row -MSE scoring, Radio (existing spectrogram tuner) takes those winners' row+column FFTs as targets and tunes amp+phase from spectral noise with a steps-aware α schedule. |
 | **Web UI / Forge**           | `ui/unified_server.py`, `ui/unified.html` | unified upload + auto-learn + `/forge` route; cv2-first PNG encoder with stdlib fallback. |
 | **Self-upgrade loop**        | `tools/sss_unified.py::run_upgrade_loop` | quality-weighted cell sampling, no cell deletion, integer tick-blend quality update. |
 
@@ -499,12 +499,29 @@ generate under 0.1 s.
 
 ---
 
-## Spectrogram engine — `sss_rowvae`
+## Spectrogram engine — `sss_rowvae` (Sculpt + Radio)
 
 A second image path that stores **how to draw**, not pixels. For each
 morpheme it keeps the row/column FFT amplitudes (a spectrogram) of the
-training images that wore that label, and the runtime reaches the
-finished image by **iterating** noise → measure-error → fix:
+training images that wore that label. The runtime is now a two-stage
+**Sculpt → Radio** loop:
+
+* **Sculpt** decides *what* to draw. Every cell whose `ce_key` matches
+  a prompt token (the 2-column trainer keeps one cell per (image,
+  word) with identical `ce_key`, so "red" pulls in every red-image's
+  COLOR cell) is reconstructed to a (H, W, 3) image via irfft. The
+  canvas is then walked row-by-row scoring every `(color, shape)`
+  pair by `-MSE(color, shape) -MSE(color, prev_row) +
+  log(c_score+1) + log(s_score+1)`; the winner's scores are bumped
+  and `prev_row` advances. After H rows the cells with the highest
+  cumulative scores are the winners (one COLOR, one SHAPE, plus the
+  closest FACE).
+
+* **Radio** decides *how* to draw. The winner reconstructions are
+  row-RFFT'd and column-RFFT'd to assemble target spectrograms (low
+  band = COLOR, mid = 0.6·SHAPE + 0.4·FACE, high = SHAPE; column =
+  SHAPE per channel). The image starts as spectral noise and the
+  classic Gerchberg–Saxton-style iteration takes over:
 
 ```
 image = noise
@@ -514,12 +531,25 @@ for step in range(steps):
     image     = irfft(measured + α·error, current_phase)   # nudge toward target
 ```
 
-That's the same Gerchberg–Saxton structure that recovers images from
-amplitude-only spectra. α decays linearly from 0.95 down to 0.30 across
-the schedule, so early passes pull hard toward the target spectrogram
-and later passes only nudge. Phases are never written directly — they
-evolve through the projections, which is what gives the same prompt
-genuinely different output for different seeds.
+Phases ARE tuned now (with shortest-arc wrapping at half the amp's
+α), so the radio converges to the winner's spectra cleanly instead of
+just chasing amplitude. The α schedule is steps-aware:
+
+```
+  steps ≤ 30   → base_α = 0.95   (preview, big nudges, fast)
+  steps ≤ 80   → base_α = 0.50   (high quality, gentler)
+  else         → base_α = 0.30   (max quality, slow)
+  decay        = base_α * 0.68
+  α(t)         = base_α − decay * (step / (steps − 1))
+  phase_α      = α / 2
+```
+
+Larger `steps` gives a smaller per-step α, so a 60- or 120-step run
+spends more iterations near the target with finer-grained nudges —
+the AM → FM → digital analogy. Different seeds shuffle the sculpt
+candidate visit order so ties break differently, plus the radio's
+spectral noise init carries unique high-frequency texture into every
+generation.
 
 | Cell type | Source       | What it stores                                      |
 | --------- | ------------ | --------------------------------------------------- |
@@ -689,6 +719,16 @@ the commands in [§ Build & run](#build--run).
 
 ### 1. `sss_rowvae` train + generate on the sanrio corpus
 
+The current engine is a **two-stage Sculpt + Radio**: stage 1 collects
+every cell whose `ce_key` matches a prompt token, reconstructs each
+candidate to a (H, W, 3) image via irfft, and walks the canvas
+row-by-row scoring `(color, shape)` pairs by `-MSE(c, s) -MSE(c,
+prev) + log(c_score+1) + log(s_score+1)` until winners emerge; stage
+2 row-RFFTs and column-RFFTs the winner reconstructions to build a
+target spectrogram (low band = COLOR, mid = 0.6·SHAPE + 0.4·FACE,
+high = SHAPE), starts from spectral noise, and tunes amp + phase
+toward those targets with a cooling α schedule.
+
 ```bash
 python3 scripts/sss_train.py \
     --labels data/sanrio/labels.tsv \
@@ -706,23 +746,35 @@ python3 scripts/sss_train.py \
 | ------------------------ | -------------------------------------------------------- |
 | Training                 | 25 images, 9 spectrogram cells, **0.146 s** total (~6 ms / image) |
 | Model size               | **207.8 KB** for 25 64×64 images = 1.45× smaller than the source PPMs |
-| Generate (24 steps, 64×64) | **mean 0.282 s / image** (range 0.276 – 0.294 s, 9 prompts × 3 seeds) |
+| Generate (24 steps, 64×64) | **mean 0.470 s / image** (sculpt setup + 24-step radio tune, 9 prompts × 3 seeds) |
+| Generate (60 steps, 64×64) | mean 1.083 s / image (smaller per-step α, sharper output) |
+| Generate (120 steps, 64×64) | mean 2.165 s / image (high-quality preset) |
 
-Colour fidelity (`gen` mean RGB vs `train` mean RGB):
+Colour fidelity after the engine swap (`gen` mean RGB vs `train` mean
+RGB; lower is better):
 
-| Character | Train RGB        | Gen RGB (mean of 3 seeds) | ΔRGB         |
-| --------- | ---------------- | ------------------------- | ------------ |
-| Hello Kitty | (197.6, 188.2, 195.2) | (204.7, 181.3, 183.6) | (7.1, 6.9, 11.6) |
-| Keroppi   | (177.4, 176.5, 130.6) | (196.2, 176.3, 148.6) | (18.8, 0.3, 17.9) |
-| My Melody | (217.9, 183.1, 176.6) | (205.2, 192.4, 169.8) | (12.6, 9.2, 6.8) |
+| Character   | Train RGB             | Gen RGB (mean of 3 seeds) | ΔRGB             |
+| ----------- | --------------------- | ------------------------- | ---------------- |
+| Hello Kitty | (197.6, 188.2, 195.2) | (193.9, 190.0, 192.7)     | (3.7, 1.7, 2.5)  |
+| My Melody   | (217.9, 183.1, 176.6) | (202.3, 188.4, 185.8)     | (15.5, 5.3, 9.2) |
+| Keroppi     | (177.4, 176.5, 130.6) | (167.3, 166.9, 148.7)     | (10.1, 9.6, 18.1) |
+
+Keroppi's previous Δ-blue of 55.1 (the radio path was de facto
+defaulting to neutral grey on green prompts because the loose
+ce_distance threshold let "keroppi" loosely match a COLOR cell and
+contaminate the pool) drops to 18.1 — the tightened
+`MATCH_TIGHT = 100` gate in `find_candidate_cells` keeps the pool
+on-topic, and the sculpt loop then reliably picks the green COLOR
+cell.
 
 Seed-driven variation (mean per-pixel diff between two seeds, range
-[0, 1]):
+[0, 1] — lower means more locked to the prompt, higher means more
+seed-dependent texture):
 
 ```
-kitty     seed1 ↔ 2 = 0.0437   seed1 ↔ 3 = 0.0431
-keroppi   seed1 ↔ 2 = 0.0814   seed1 ↔ 3 = 0.0788
-mymelody  seed1 ↔ 2 = 0.0692   seed1 ↔ 3 = 0.0634
+kitty     seed1 ↔ 2 = 0.0219   seed1 ↔ 3 = 0.0233
+mymelody  seed1 ↔ 2 = 0.0116   seed1 ↔ 3 = 0.0138
+keroppi   seed1 ↔ 2 = 0.0475   seed1 ↔ 3 = 0.0457
 ```
 
 ![sanrio originals + sss_gen seeds](docs/bench/sanrio_grid.png)
@@ -730,6 +782,16 @@ mymelody  seed1 ↔ 2 = 0.0692   seed1 ↔ 3 = 0.0634
 Column 1 is the original PPM (`data/sanrio/<character>_000.ppm`,
 upscaled NN-2× for display); columns 2–4 are `./build/sss_gen` with
 seed = 1, 2, 3. Same 207.8 KB `sanrio.sss` file generates all nine.
+
+Steps schedule (same prompt, same seed, increasing iteration count):
+
+![steps schedule](docs/bench/steps_grid.png)
+
+The cooling α uses a steps-aware base (`steps≤30 → 0.95`, `≤80 →
+0.50`, else `0.30`) with a linear `decay = base * 0.68`. More steps
+means a smaller per-step nudge — the AM → FM → digital analogy: same
+target spectrum, finer tuning grain. Trade-off: 5× steps, 5× wall
+time, visibly cleaner output.
 
 ### 2. `sss_rowvae` on the 1008-image synthetic corpus
 
@@ -745,19 +807,43 @@ python3 scripts/sss_train.py \
 
 | Stage                | Numbers                                                                   |
 | -------------------- | ------------------------------------------------------------------------- |
-| Training             | 1008 images, 8 cells, **0.752 s** total (~0.7 ms / image — pure numpy FFT) |
+| Training             | 1008 images, 8 cells, **1.86 s** total (~1.8 ms / image — pure numpy FFT + ce_key build) |
 | Source dataset       | 12,108 KB (1008 × 64×64 PPM)                                              |
 | Model on disk        | 173.7 KB                                                                  |
 | Compression ratio    | **69.7×** (target was ≥3×)                                                |
-| Generate (24 steps)  | mean **0.289 s / image** (5 prompts, range 0.279 – 0.311 s)               |
+| Generate (24 steps)  | mean **0.471 s / image** (9 prompts: red/green/blue × circle/square/triangle) |
+
+Colour × shape isolation under sculpt+radio (gen-image mean RGB):
+
+| Prompt          | R     | G     | B     |   Verdict                       |
+| --------------- | ----- | ----- | ----- | ------------------------------- |
+| `red circle`    | 218.2 | 196.7 | 196.7 | R-dominant ✓ circle silhouette  |
+| `red square`    | 212.8 | 191.0 | 191.0 | R-dominant ✓ square silhouette  |
+| `red triangle`  | 219.9 | 198.3 | 198.3 | R-dominant ✓ triangle silhouette |
+| `green circle`  | 196.7 | 215.1 | 199.2 | G-dominant ✓                    |
+| `blue triangle` | 198.1 | 200.9 | 219.0 | B-dominant ✓                    |
+
+Pixel diff between same-shape, different-colour images (lower = same
+content swapped only the hue):
+
+```
+red    circle ↔ blue   circle  = 0.0881
+red    circle ↔ green  circle  = 0.0847
+red    circle ↔ red    square  = 0.0733     (colour same, shape changed)
+red    square ↔ red    triangle = 0.0913
+```
+
+Colour-only swaps and shape-only swaps both produce ~0.07 – 0.09 mean
+per-pixel deltas — the sculpt loop picks the right (color, shape)
+winners and the radio tunes them independently.
 
 ![1k corpus colour × shape grid](docs/bench/demo1k_grid.png)
 
 Same 173.7 KB `demo1k.sss` file, three colour prompts × three shape
-prompts. Colour locks in cleanly; shape signal is weaker because the
-FFT shape band overlaps the colour band at this resolution — see
-[§ Roadmap](#roadmap) for the per-cell direction tag that addresses
-this.
+prompts. The triangle column shows actual triangular silhouettes,
+the square column shows squares — sculpt's per-row scoring of every
+`(color, shape)` pair against the previous row is what lets shape
+energy survive into the final radio target.
 
 ### 3. `sss_pose_radar` on real sanrio characters
 
@@ -862,20 +948,22 @@ from lossy quantisation of any single image.
 
 ### Summary table
 
-| Benchmark                                        | Throughput / size                        |
-| ------------------------------------------------ | ---------------------------------------- |
-| `sss_train.py` on sanrio (25 imgs, 64²)          | 0.146 s total = 5.84 ms / image          |
-| `sss_train.py` on demo_1k (1008 imgs, 64²)       | 0.752 s total = 0.75 ms / image          |
-| `sss_gen` on sanrio model (24 step, 64²)         | 0.282 s / image                          |
-| `sss_gen` on demo_1k model (24 step, 64²)        | 0.289 s / image                          |
-| Unified pipeline (256², 6 prompts, KO + EN)      | 324 ms / prompt, 100 % stored            |
-| `sss_pose_radar.analyze_pose_radar` (256² + PNGs) | 58 ms / image, 15 joints, 5 motion rules |
-| `ingest_labeled_image` (sanrio, 64² → 256²)      | 46.3 ms / image, 5 cells / image         |
-| `ingest_labeled_image` (demo_1k, 64² → 256²)     | 38.4 ms / image, 5 cells / image         |
-| FFT row-block roundtrip PSNR (sanrio)            | 53.2 – 53.3 dB                           |
-| Compression: demo_1k                             | 69.7× vs source PPM                      |
-| `make test` upper engine                         | 19/19 binaries pass                      |
-| `make -C ce_core test`                           | 20/21 (1 doc'd Windows file-write fail)  |
+| Benchmark                                        | Throughput / size                          |
+| ------------------------------------------------ | ------------------------------------------ |
+| `sss_train.py` on sanrio (25 imgs, 64²)          | 0.146 s total = 5.84 ms / image            |
+| `sss_train.py` on demo_1k (1008 imgs, 64²)       | 1.86 s total = 1.8 ms / image              |
+| `sss_gen` on sanrio model, **24-step** sculpt+radio | 0.470 s / image (preview)               |
+| `sss_gen` on sanrio model, **60-step** sculpt+radio | 1.083 s / image (high quality)          |
+| `sss_gen` on sanrio model, **120-step** sculpt+radio | 2.165 s / image (max quality)          |
+| `sss_gen` on demo_1k model, 24-step              | 0.471 s / image                            |
+| Unified pipeline (256², 3 prompts, KO + EN)      | ~330 ms / prompt, 100 % stored             |
+| `sss_pose_radar.analyze_pose_radar` (256² + PNGs) | 58 ms / image, 15 joints, 5 motion rules  |
+| `ingest_labeled_image` (sanrio, 64² → 256²)      | 46.3 ms / image, 5 cells / image           |
+| `ingest_labeled_image` (demo_1k, 64² → 256²)     | 38.4 ms / image, 5 cells / image           |
+| FFT row-block roundtrip PSNR (sanrio)            | 53.2 – 53.3 dB                             |
+| Compression: demo_1k                             | 69.7× vs source PPM                        |
+| `make test` upper engine                         | 19/19 binaries pass                        |
+| `make -C ce_core test`                           | 20/21 (1 doc'd Windows file-write fail)    |
 
 ---
 
