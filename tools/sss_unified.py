@@ -496,15 +496,20 @@ class CEMemory(_BridgedCEMemory):
     # ── primary API used by the pipeline ────────────────────────
 
     def add(self, block, canny, color_avg, quality, tags, source="",
-            *, amp=None, phase=None, fp=None):
+            *, amp=None, phase=None, fp=None, subbands=None):
         """Append a cell. Routes through bridge -> ce_storage_add_typed.
 
         Optional spectrogram fields (kept Python-side; CEStorage only
         sees the canny + color bytes via the bridge):
-            amp   — list of per-(row, channel) rfft amplitudes
-                    (length = block_height * 3, each entry shape (NF,))
-            phase — same shape as amp; per-(row, channel) phases
-            fp    — 256-bin sss-fingerprint of the label text (or None)
+            amp      — list of per-(row, channel) rfft amplitudes
+                       (length = block_height * 3, each entry shape (NF,))
+            phase    — same shape as amp; per-(row, channel) phases
+            fp       — 256-bin sss-fingerprint of the label text (or None)
+            subbands — dict {"LL", "LH", "HL", "HH"} of (bh/2, W/2, 3)
+                       float32 arrays from
+                       tools.sss_ingest._block_subband_25x4. Used by the
+                       restore pipeline (tools.sss_restore_infer) for
+                       row/column cross-attention scoring.
         """
         bridge_block = self._slot_for_block.get(block, "bot")
         cid = super().add_cell(bridge_block, canny, None, color_avg,
@@ -537,6 +542,7 @@ class CEMemory(_BridgedCEMemory):
             "amp": amp,
             "phase": phase,
             "fp": fp,
+            "subbands": subbands,
         }
         cells_for_block.append(cell)
         for t in tags:
@@ -705,6 +711,18 @@ class Planner:
 # ────────────────────────────────────────────────────────────
 # 3. SculptGenerator  (deterministic, no random noise)
 # ────────────────────────────────────────────────────────────
+def _resize_nn_3d(arr: np.ndarray, h: int, w: int) -> np.ndarray:
+    """Nearest-neighbour resize for (H, W, 3) float arrays. Used by the
+    subband attention path so cells trained at a different block height
+    can still contribute. Numpy-only — no cv2."""
+    src_h, src_w = arr.shape[:2]
+    if src_h == h and src_w == w:
+        return arr
+    yi = np.linspace(0, max(0, src_h - 1), h).round().astype(np.int64)
+    xi = np.linspace(0, max(0, src_w - 1), w).round().astype(np.int64)
+    return arr[yi[:, None], xi[None, :]]
+
+
 class SculptGenerator:
     COLOR_BGR = {
         "red":   (50, 50, 210),  "blue":   (210, 70, 50),
@@ -806,6 +824,145 @@ class SculptGenerator:
                 row_recon = np.fft.irfft(spec, n=W)
                 block[r, :, c] = np.clip(row_recon * 255.0, 0, 255)
         return block
+
+    def _block_from_subband_attention(self, damaged_block, mask, cells,
+                                       *, prompt_tags=None):
+        """Memory-driven row + column cross-attention reconstruction.
+
+        Inputs:
+            damaged_block — (bh, W, 3) uint8/float, the block to repair.
+                            Pixels under `mask` are unreliable.
+            mask          — (bh, W) float in [0, 1]. 1 = damaged. None
+                            or all-zero ⇒ the block is returned as-is.
+            cells         — list of memory cells from CEMemory (typically
+                            self.memory.get_by_tags(block_name, prompt_tags)
+                            or memory.cells[block_name]). Cells without a
+                            "subbands" entry are ignored.
+            prompt_tags   — optional list[str]; when provided, cells
+                            whose tags match earn an extra weight bonus.
+
+        Algorithm:
+            1. Decompose `damaged_block` into LL/LH/HL/HH (1-level Haar).
+               Pixels under `mask` are treated as background-grey before
+               decomposition so they don't poison the band statistics.
+            2. For every candidate cell with a `subbands` dict, compute
+                  row_score = mean -|cand.LL[:, c, :] - dmg.LL[:, c, :]|
+                  col_score = mean -|cand.LL[r, :, :] - dmg.LL[r, :, :]|
+                  band_score = -Σ_band  w_band * MSE(cand.band, dmg.band)
+                where w_band = (LL=0.5, LH=0.2, HL=0.2, HH=0.1) — LL
+                drives consistency, the high bands drive detail.
+            3. Compose: row + col attention weights pick how strongly
+               each candidate's subbands flow into the reconstruction.
+               The winning subbands are inverse-Haar'd back to spatial
+               and the result *only replaces masked pixels*.
+
+        No randomness, no diffusion. Pure numpy. Returns a (bh, W, 3)
+        uint8 array.
+        """
+        from tools.sss_ingest import _block_subband_25x4, _inverse_subband_25x4
+
+        damaged_block = np.asarray(damaged_block)
+        if damaged_block.dtype != np.uint8:
+            damaged_block = np.clip(damaged_block, 0, 255).astype(np.uint8)
+        bh, w, ch = damaged_block.shape
+        if mask is None:
+            mask = np.zeros((bh, w), np.float32)
+        mask = np.asarray(mask, dtype=np.float32)
+        if mask.shape != (bh, w):
+            # Caller-supplied mask shape mismatches the block — refuse
+            # silently rather than crash mid-pipeline.
+            return damaged_block.copy()
+        if mask.max() < 0.5:
+            return damaged_block.copy()
+
+        # ── Step 1: damaged-zone-neutralised decomposition ──────────
+        # Replace masked pixels with the local row mean (computed from
+        # *clean* pixels only) so the band statistics aren't dragged
+        # toward whatever the damage encoded (often pure black).
+        neutral = damaged_block.astype(np.float32)
+        for r in range(bh):
+            row_mask = mask[r] > 0.5
+            if not row_mask.any():
+                continue
+            clean = ~row_mask
+            if clean.any():
+                fill = neutral[r, clean].mean(axis=0)
+            else:
+                fill = neutral[r].mean(axis=0)   # whole row damaged
+            neutral[r, row_mask] = fill
+        dmg_sub = _block_subband_25x4(neutral.astype(np.uint8))
+
+        # ── Step 2: score every candidate with usable subbands ──────
+        scored = []
+        prompt_set = set(t.lower() for t in (prompt_tags or []))
+        for cell in cells:
+            sb = cell.get("subbands") if isinstance(cell, dict) else None
+            if not sb or "LL" not in sb:
+                continue
+            cand = {k: np.asarray(sb[k], dtype=np.float32)
+                    for k in ("LL", "LH", "HL", "HH")}
+            # Shape align: nearest-resize cand subbands to dmg subband
+            # shape so cells trained at a different block height still
+            # contribute. The candidate's subband is half-block height,
+            # so the alignment cost is at most ~half the source rows.
+            target = dmg_sub["LL"].shape
+            if cand["LL"].shape != target:
+                cand = {k: _resize_nn_3d(v, target[0], target[1])
+                        for k, v in cand.items()}
+
+            # Subband consistency (weighted MSE).
+            band_w = {"LL": 0.5, "LH": 0.2, "HL": 0.2, "HH": 0.1}
+            band_mse = sum(
+                band_w[k] * float(np.mean((cand[k] - dmg_sub[k]) ** 2))
+                for k in band_w)
+
+            # Row + column attention (per-axis L1 on LL — the structural
+            # band carries the colour/shape signature; high bands are
+            # noisy on their own at this resolution).
+            row_l1 = float(np.mean(np.abs(cand["LL"].mean(axis=1)
+                                         - dmg_sub["LL"].mean(axis=1))))
+            col_l1 = float(np.mean(np.abs(cand["LL"].mean(axis=0)
+                                         - dmg_sub["LL"].mean(axis=0))))
+
+            score = -(band_mse * 4.0 + row_l1 * 1.0 + col_l1 * 1.0)
+            # Tag bonus — small enough that subband fit still dominates
+            # but large enough to break ties on label-matched cells.
+            if prompt_set:
+                cell_tags = set(str(t).lower() for t in cell.get("tags", []))
+                hits = len(prompt_set & cell_tags)
+                score += hits * 0.005
+            score *= float(cell.get("quality", 0.5)) + 0.25
+            scored.append((score, cell, cand))
+
+        if not scored:
+            return damaged_block.copy()
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        # Top-3 weighted blend of subbands — softmax-like normalisation
+        # over the top scores so a single noisy winner can't dominate.
+        top = scored[:3]
+        scores = np.array([s for s, _, _ in top], np.float32)
+        # Shift to non-negative to avoid sign flips when both are
+        # negative; the relative gap is what matters.
+        weights = scores - scores.min() + 1e-6
+        weights = weights / weights.sum()
+
+        merged = {k: np.zeros_like(top[0][2]["LL"]) for k in ("LL", "LH", "HL", "HH")}
+        for w_, (_, _, cand) in zip(weights, top):
+            for k in merged:
+                merged[k] += w_ * cand[k]
+
+        # ── Step 3: inverse-Haar then mask-blend back into the block.
+        recon_f = _inverse_subband_25x4(merged)               # (bh, W, 3) in [0, 1]
+        recon_u8 = np.clip(recon_f * 255.0, 0, 255).astype(np.uint8)
+        # Final shape might be (bh-bh%2, w-w%2) when bh / w were odd —
+        # crop the mask to match before blending.
+        rh, rw, _ = recon_u8.shape
+        m_use = mask[:rh, :rw][..., None]
+        out = damaged_block.copy()
+        out[:rh, :rw] = (m_use * recon_u8 +
+                         (1.0 - m_use) * damaged_block[:rh, :rw]).astype(np.uint8)
+        return out
 
     def _recombine(self, block_name, bh, intent, hits):
         block = np.zeros((bh, W, 3), np.float32)

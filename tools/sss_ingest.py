@@ -212,6 +212,77 @@ def _block_fft(block: np.ndarray) -> tuple:
     return amp, phase
 
 
+def _block_subband_25x4(block: np.ndarray) -> dict:
+    """1-level 2D Haar wavelet decomposition of a (bh, W, 3) uint8
+    block into the four subbands
+
+        LL — average of (rows, cols)         "큰 구조"
+        LH — average row × diff col          "가로 디테일"
+        HL — diff row    × average col       "세로 디테일"
+        HH — diff (rows, cols)               "대각선 디테일"
+
+    Each subband is (bh//2, W//2, 3) float32 in roughly [-0.5, 0.5]
+    for the high bands and [0, 1] for LL (normalised the same way
+    `_block_fft` normalises). Together the four subbands cover 100 %
+    of the signal — the inverse `_inverse_subband_25x4` round-trips
+    bit-for-bit (within float32 precision).
+
+    Numpy-only; no pywt / cv2 / scipy. Memory is exactly one
+    intermediate (bh//2, W, 3) plus the four output arrays."""
+    block_f = block.astype(np.float32) / 255.0
+    bh, w, ch = block_f.shape
+    # Drop the trailing row / column when the dimension is odd so
+    # every subband has the same shape. Callers slicing the source
+    # image at ROW_BLOCKS already get even-height slabs in the
+    # default 256×256 layout, but the guard keeps arbitrary block
+    # sizes safe.
+    bh2 = bh - (bh & 1)
+    w2  = w  - (w  & 1)
+    if bh2 == 0 or w2 == 0:
+        empty = np.zeros((max(1, bh2 // 2), max(1, w2 // 2), ch), np.float32)
+        return {"LL": empty, "LH": empty.copy(),
+                "HL": empty.copy(), "HH": empty.copy()}
+    a = block_f[:bh2:2, :w2]            # even rows, even-width crop
+    b = block_f[1:bh2:2, :w2]           # odd rows
+    low_row  = (a + b) * 0.5            # (bh/2, w, 3)
+    high_row = (a - b) * 0.5
+    LL = (low_row[:, 0:w2:2]  + low_row[:, 1:w2:2])  * 0.5
+    LH = (low_row[:, 0:w2:2]  - low_row[:, 1:w2:2])  * 0.5
+    HL = (high_row[:, 0:w2:2] + high_row[:, 1:w2:2]) * 0.5
+    HH = (high_row[:, 0:w2:2] - high_row[:, 1:w2:2]) * 0.5
+    return {
+        "LL": np.ascontiguousarray(LL.astype(np.float32)),
+        "LH": np.ascontiguousarray(LH.astype(np.float32)),
+        "HL": np.ascontiguousarray(HL.astype(np.float32)),
+        "HH": np.ascontiguousarray(HH.astype(np.float32)),
+    }
+
+
+def _inverse_subband_25x4(subbands: dict) -> np.ndarray:
+    """Inverse of `_block_subband_25x4`. Returns a (2*bh, 2*w, 3)
+    float32 array in [0, 1] (un-clamped — caller maps to uint8 if
+    needed). Implements the symmetric Haar synthesis so a
+    decompose / synthesise round-trip is exact within float32
+    precision."""
+    LL = np.asarray(subbands["LL"], dtype=np.float32)
+    LH = np.asarray(subbands["LH"], dtype=np.float32)
+    HL = np.asarray(subbands["HL"], dtype=np.float32)
+    HH = np.asarray(subbands["HH"], dtype=np.float32)
+    bh, w, ch = LL.shape
+    # Synthesise the two row-half bands first.
+    low_row  = np.empty((bh, w * 2, ch), np.float32)
+    high_row = np.empty((bh, w * 2, ch), np.float32)
+    low_row[:,  0::2] = LL + LH
+    low_row[:,  1::2] = LL - LH
+    high_row[:, 0::2] = HL + HH
+    high_row[:, 1::2] = HL - HH
+    # Then the two column-half bands.
+    out = np.empty((bh * 2, w * 2, ch), np.float32)
+    out[0::2] = low_row + high_row
+    out[1::2] = low_row - high_row
+    return out
+
+
 def ingest_labeled_image(filepath, memory, label_text: str,
                          *, source: Optional[str] = None) -> dict:
     """Ingest one image with a required text label.
@@ -251,8 +322,13 @@ def ingest_labeled_image(filepath, memory, label_text: str,
         canny = _sobel_edges(gray, 80)
         color = np.mean(block, axis=(0, 1))
         amps, phases = _block_fft(block)
+        # Per-block 25%×4 subband decomposition. Lives alongside the
+        # FFT amp/phase pair on the same memory cell so the restore
+        # path can score row + column attention against LL/LH/HL/HH
+        # without re-decomposing every retrieval.
+        subbands = _block_subband_25x4(block)
         memory.add(bname, canny, color, 0.5, list(tags), src,
-                   amp=amps, phase=phases, fp=fp)
+                   amp=amps, phase=phases, fp=fp, subbands=subbands)
         per_block[bname] = per_block.get(bname, 0) + 1
         cells_added += 1
 
