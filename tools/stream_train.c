@@ -1,3 +1,8 @@
+/* CLOCK_REALTIME / clock_gettime live behind _POSIX_C_SOURCE on glibc
+ * — declare it before any system header is pulled in below. Termux's
+ * Bionic doesn't need this guard but it's cheap and harmless. */
+#define _POSIX_C_SOURCE 200809L
+
 /*
  * stream_train.c — streaming training for SPATIAL-PATTERN-AI
  *
@@ -48,6 +53,7 @@
 typedef struct {
     const char* input;
     const char* save;
+    const char* load;            /* --load <path>; NULL = fresh model */
     const char* event_log;       /* --log <path>; NULL = disabled */
     uint32_t    max_clauses;
     uint32_t    checkpoint;
@@ -60,12 +66,17 @@ typedef struct {
 
 static void usage(const char* prog) {
     fprintf(stderr,
-        "usage: %s --input <path> [--max N] [--save path] [--checkpoint N]\n"
+        "usage: %s --input <path> [--max N] [--save path] [--load path] [--checkpoint N]\n"
         "       [--log path] [--threshold F | --target-delta R] [--verbose] [--verify]\n"
         "\n"
         "  --input <path>        input text file, one clause per line (required)\n"
         "  --max <N>             max clauses to ingest (default %d)\n"
         "  --save <path>         final model path (default build/models/stream_auto.spai)\n"
+        "  --load <path>         load existing .spai and continue training. Without\n"
+        "                        this flag a fresh model is created. The trainer\n"
+        "                        appends keyframes/deltas to the loaded model so a\n"
+        "                        long corpus can be split across multiple invocations\n"
+        "                        (e.g., resumed after a Termux process kill).\n"
         "  --checkpoint <N>      save every N clauses (default %d, 0 disables)\n"
         "  --log <path>          emit a binary training-event log consumed by\n"
         "                        tools/animate_training.py (clause-level cell\n"
@@ -86,6 +97,7 @@ static void usage(const char* prog) {
 static int parse_args(int argc, char** argv, StreamArgs* a) {
     a->input             = NULL;
     a->save              = "build/models/stream_auto.spai";
+    a->load              = NULL;
     a->event_log         = NULL;
     a->max_clauses       = DEFAULT_MAX;
     a->checkpoint        = DEFAULT_CKPT;
@@ -105,6 +117,8 @@ static int parse_args(int argc, char** argv, StreamArgs* a) {
             a->max_clauses = (uint32_t)v;
         } else if (strcmp(k, "--save") == 0 && i + 1 < argc) {
             a->save = argv[++i];
+        } else if (strcmp(k, "--load") == 0 && i + 1 < argc) {
+            a->load = argv[++i];
         } else if (strcmp(k, "--checkpoint") == 0 && i + 1 < argc) {
             long v = strtol(argv[++i], NULL, 10);
             if (v < 0) v = 0;
@@ -138,7 +152,17 @@ static int parse_args(int argc, char** argv, StreamArgs* a) {
 
 static double now_sec(void) {
     struct timespec ts;
+    /* clock_gettime(CLOCK_REALTIME) is portable across glibc, musl,
+     * macOS, and Bionic (Termux). timespec_get(..., TIME_UTC) is C11
+     * and ships in MSVC's UCRT — Windows toolchains may not export
+     * `clock_gettime` at all, so route Windows back through C11.
+     * Older Bionic (< API 29) skipped C11 timespec_get, which is why
+     * we don't use it on POSIX. */
+#if defined(_WIN32)
     timespec_get(&ts, TIME_UTC);
+#else
+    clock_gettime(CLOCK_REALTIME, &ts);
+#endif
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
@@ -468,10 +492,35 @@ int main(int argc, char** argv) {
 
     morpheme_init();
 
-    SpatialAI* ai = spatial_ai_create();
-    if (!ai) {
-        fprintf(stderr, "[stream] spatial_ai_create failed\n");
-        return 1;
+    /* Resume vs fresh-start. With --load, we hydrate the in-memory
+     * SpatialAI from disk and append new keyframes/deltas on top — the
+     * delta chain stays valid because ai_load restores both KF and
+     * Delta tables. --load is an explicit opt-in: any ai_load() failure
+     * (missing file, bad magic, version skew) is fatal so the user
+     * doesn't accidentally continue training against a fresh model and
+     * silently lose the resume contract. Without --load we always
+     * start from spatial_ai_create() — same legacy behaviour as before. */
+    SpatialAI* ai = NULL;
+    if (args.load && args.load[0]) {
+        SpaiStatus ls = SPAI_OK;
+        ai = ai_load(args.load, &ls);
+        if (!ai || ls != SPAI_OK) {
+            /* spai_status_str names the failure mode (OPEN / MAGIC /
+             * VERSION / ...) which is far more actionable than a raw
+             * integer when the user has to debug why their resume
+             * didn't take. */
+            fprintf(stderr, "[stream] ai_load(%s) failed: %s (status=%d)\n",
+                    args.load, spai_status_str(ls), (int)ls);
+            return 1;
+        }
+        printf("[stream] loaded %s: KF=%u Delta=%u (continuing)\n",
+               args.load, ai->kf_count, ai->df_count);
+    } else {
+        ai = spatial_ai_create();
+        if (!ai) {
+            fprintf(stderr, "[stream] spatial_ai_create failed\n");
+            return 1;
+        }
     }
 
     /* Threshold precedence: explicit --threshold > --target-delta
