@@ -1,9 +1,9 @@
 CC      = gcc
 # -Ilegacy keeps the legacy ce_gen.h reachable for tests/test_gen_routed.c
-# (the only remaining default-test consumer of ce_gen). The deprecated
-# CLI tools (gen_image_ce, train_demo, train_images_ce) live in
-# legacy_deprecated/ and only build when the user explicitly asks for
-# the `legacy_demo` target — they're not in the default `all` or `test`.
+# (the only remaining default-test consumer of ce_gen). Phase 5 retired
+# the pre-Phase-1 .ces image generator (gen_image_ce) and the Phase 1
+# Atmos animator (sss_animate); train_demo / train_images_ce remain in
+# legacy_deprecated/ and build only via `make legacy_demo`.
 CFLAGS  = -Wall -Wextra -O2 -Iinclude -Ice_core -Ilegacy -std=c11
 LDFLAGS = -lm
 
@@ -73,8 +73,8 @@ OBJS = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS)) $(CE_CORE_OBJS) $(LEG
 TESTS = test_grid test_morpheme test_layers test_match test_keyframe test_context test_integration test_io test_cascade test_canvas test_adaptive test_subtitle test_recluster test_refine test_image_roundtrip test_image_gen test_tick_math test_material test_gen_routed test_scene_atmos
 
 .PHONY: all clean test bench_context bench_refine image_tools pybridge \
-        legacy_demo demo_tools train_images_ce gen_image_ce \
-        sss_animate sss_gen verify_hybrid wave_debug
+        legacy_demo demo_tools train_images_ce \
+        sss_gen verify_hybrid wave_debug
 
 all: $(BUILD_DIR) $(OBJS)
 	@echo "Build complete."
@@ -92,8 +92,9 @@ $(BUILD_DIR)/ce_core_%.o: $(CE_CORE_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Legacy objects (legacy_NAME.o). Same isolation pattern as ce_core_:
-# kept reachable for gen_image_ce and test_gen_routed but tagged so
-# nothing accidentally pulls ce_gen into the new sss_rowvae path.
+# kept reachable for test_gen_routed (the only default-test consumer
+# of ce_gen post-Phase 5) but tagged so nothing accidentally pulls
+# ce_gen into the new sss_rowvae path.
 $(BUILD_DIR)/legacy_%.o: $(LEGACY_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -195,8 +196,9 @@ $(BUILD_DIR)/grid2img: tools/grid2img.c $(OBJS) | $(BUILD_DIR)
 $(BUILD_DIR)/train_images_ce: $(LEGACY_DEPRECATED_DIR)/train_images_ce.c $(OBJS) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
 
-$(BUILD_DIR)/gen_image_ce: $(LEGACY_DEPRECATED_DIR)/gen_image_ce.c $(OBJS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
+# gen_image_ce was the Phase 0 .ces-driven generator. Phase 5
+# replaced it with the unified `sss_gen` + `scripts/sss_gen.py`
+# entry points; the .ces format is no longer the input path.
 
 # Spectrogram-based image generator (sss_rowvae engine). MAIN PATH.
 $(BUILD_DIR)/sss_gen: tools/sss_gen.c $(OBJS) | $(BUILD_DIR)
@@ -208,17 +210,9 @@ sss_gen: $(BUILD_DIR)/sss_gen
 	@echo "      --root data/sss_demo --out build/models/demo.sss --size 64"
 	@echo "  ./build/sss_gen build/models/demo.sss \"red circle draw\" out.ppm 1 1.0"
 
-# Atmos motion frame generator. Decomposes a PPM into scene-objects via
-# ce_scene_build_from_rgba, then renders N animated frames driven by
-# ce_scene_tick_with_profiles + ce_scene_render. This is the production
-# entry point for the Atmos engine — no Python ctypes round-trip needed.
-$(BUILD_DIR)/sss_animate: tools/sss_animate.c $(OBJS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $< $(OBJS) -o $@ $(LDFLAGS)
-
-sss_animate: $(BUILD_DIR)/sss_animate
-	@echo "Built sss_animate. Examples:"
-	@echo "  ./build/sss_animate input.ppm  build/atmos_anim 60"
-	@echo "  ./build/sss_animate input.ppm  build/atmos_anim 120 256 256"
+# sss_animate was the Phase 1–4 Atmos motion-frame generator. Phase 5
+# folded it into `sss_gen --frames N --atmos-from PPM` (Python entry).
+# Use that path going forward; see docs/migration_phase5.md.
 
 $(BUILD_DIR)/make_demo_dataset: tools/make_demo_dataset.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $< -o $@
@@ -248,11 +242,13 @@ wave_debug: $(BUILD_DIR)/wave_debug
 # demo_tools is the legacy SLIG/cell-stamp demo pipeline. It now lives
 # behind `make legacy_demo` so the default `make` and `make test` keep
 # clear of the deprecated paths. See legacy_deprecated/ for sources.
-legacy_demo: $(BUILD_DIR)/make_demo_dataset $(BUILD_DIR)/train_demo $(BUILD_DIR)/gen_image_ce $(BUILD_DIR)/verify_hybrid
-	@echo "Built legacy demo tools. Pipeline:"
+legacy_demo: $(BUILD_DIR)/make_demo_dataset $(BUILD_DIR)/train_demo $(BUILD_DIR)/verify_hybrid
+	@echo "Built legacy demo tools. Pipeline (no longer includes"
+	@echo "gen_image_ce — Phase 5 removed it; use:"
 	@echo "  ./build/make_demo_dataset data/demo"
 	@echo "  ./build/train_demo data/demo build/models/demo"
-	@echo "  ./build/gen_image_ce build/models/demo.ces \"red apple\" out.ppm 0 50 200"
+	@echo "  ./build/sss_gen build/models/demo.sss \"red apple\" out.ppm"
+	@echo "Or via the Python entry: python3 scripts/sss_gen.py ..."
 
 # Backward-compat alias — same as legacy_demo. Older docs reference
 # `make demo_tools`, so keep the spelling working.
@@ -261,10 +257,6 @@ demo_tools: legacy_demo
 train_images_ce: $(BUILD_DIR)/train_images_ce
 	@echo "Built train_images_ce (legacy). Example:"
 	@echo "  ./build/train_images_ce build/models/demo  data/img/*.ppm"
-
-gen_image_ce: $(BUILD_DIR)/gen_image_ce
-	@echo "Built gen_image_ce (legacy — sss_gen is the main path now)."
-	@echo "  ./build/gen_image_ce build/synth/demo.ces \"red apple\" out.ppm 0 50 200"
 
 image_tools: $(BUILD_DIR)/img2grid $(BUILD_DIR)/grid2img
 	@echo "Built image prototype tools. Examples:"

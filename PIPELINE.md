@@ -569,3 +569,80 @@ v2 마이그레이션 정책 (사전 정의):
 - record_size 변경은 항상 SFB_VERSION 증가와 함께
 - v1 reader는 알 수 없는 후행 record-내 바이트를 안전하게 스킵
 - 새 필드는 항상 record 끝에 append (기존 offset 보존)
+
+---
+
+## Phase 5: Pipeline Consolidation
+
+Phase 5 collapsed every generation entry into one. Before:
+
+```
+.ces input  ──▶ gen_image_ce      ─▶ PPM   (Phase 0, removed)
+.ppm input  ──▶ sss_animate       ─▶ PPM*  (Phase 1 Atmos, removed)
+.sss input  ──▶ sss_gen           ─▶ PPM   (Phase 1–3, kept + extended)
+```
+
+After:
+
+```
+.sss / .sfb ──▶ scripts/sss_gen.py ─▶ PPM (frames=1) or PPM* (frames>1)
+                       │
+                       │  routes by content sniff:
+                       │  - .sss + no Phase 4 flags → build/sss_gen
+                       │  - .sfb / --condition / --atmos-from
+                       │       → tools/sss_synthesizer.py
+                       ▼
+build/sss_gen (frames=1 fast path)   tools/sss_synthesizer.py (Phase 4)
+```
+
+The C binary `build/sss_gen` gained `--frames N` / `--out-dir DIR`
+flags. With `N > 1` it loops `sss_generate` per frame with
+`seed ^= t` (the Phase 1 per-seed diversity rule, applied per-frame).
+`--condition`, `--feature-bank` (.sfb), and `--atmos-from` are
+reserved for the Phase 4 features that live in
+`tools/sss_synthesizer.py` — the C binary refuses those flags with
+exit code 7 and a clean pointer to `scripts/sss_gen.py`.
+
+The HTTP layer follows the same shape:
+
+| Endpoint | Role |
+|---|---|
+| `POST /api/sss_gen`       | canonical entry (frames=1 image, frames>1 video) |
+| `POST /api/generate`      | alias of `/api/sss_gen` (back-compat) |
+| `POST /api/viz-generate`  | alias + per-pixel analysis on the response |
+| `POST /api/atmos`         | preserved (Atmos JSON decompose; not generation) |
+
+Request body adds the Phase 4 fields (`frames`, `conditions[]`,
+`atmos_reference`) on top of the historical `{model, prompt, seed,
+steps, detail}` schema. Multi-frame responses include
+`result.frames[]` (PNG data URIs) alongside `result.image` (first
+frame, for clients that only render one).
+
+What got deleted in this pass:
+
+- `tools/sss_animate.c` (Atmos motion-frame generator, Phase 1 era).
+- `legacy_deprecated/gen_image_ce.c` (.ces image generator, Phase 0 era).
+- The Makefile targets and aliases that built them.
+- The `.ces` / `gen_image_ce` branches in `ui/server.py` and
+  `ui/unified_server.py` and the engine-toggle UI in
+  `ui/index.html` (replaced by a single Frames slider).
+
+What was deliberately kept:
+
+- `ce_core/ce_hybrid_vae.{c,h}`, `ce_core/ce_residual_codebook.{c,h}`,
+  and the morpheme stack — still consumed by ce_core tests and
+  `tools/verify_hybrid.c`. The audit (`reports/phase5_audit.md`)
+  flagged these as having multiple non-legacy consumers.
+- `legacy_deprecated/train_demo.c` and `train_images_ce.c` — still
+  buildable via `make legacy_demo` for reproducing pre-Phase-1 runs.
+
+See `docs/migration_phase5.md` for the full old → new CLI / HTTP
+mapping table.
+
+### Phase 5 regression tests
+
+- `tools/test_sss_gen_video.py` (5 cases): C single-image, C
+  `--frames 4` loop, C rejection of Phase 4 flags, Python
+  `--condition` intensity (0.0 vs 0.5 L2 > 0.3), Python `--frames 8`
+  with condition (consecutive-frame diff > threshold).
+- Phase 1–4 regression suite (15 tests) continues to PASS.
