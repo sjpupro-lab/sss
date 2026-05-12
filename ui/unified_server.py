@@ -368,7 +368,7 @@ def _run_restore(src_path: str, mask_path: Optional[str], *,
 
 # ── Forge bridge (ported from ui/server.py) ──────────────────
 # The deprecated ui/server.py + ui/index.html UI ran a parallel HTTP
-# bridge for the C engine binaries (gen_image_ce, sss_gen, train_demo,
+# bridge for the C engine binaries (sss_gen, train_demo,
 # stream_train, chat). The unified server now hosts the same surface
 # under /api/generate /api/train* /api/chat /api/models /api/upload
 # /api/browse /api/job /api/stream — the UI drops the standalone Forge
@@ -1230,60 +1230,116 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 }, 500)
             return
 
-        # ── Forge: image generation (sss_gen / gen_image_ce) ──
-        if path == "/api/generate" or path == "/api/viz-generate":
+        # ── Forge: unified image / video generation ──
+        #
+        # The Phase 5 consolidation routes every generation request
+        # — image (frames=1) or video (frames>1), .sss or .sfb —
+        # through a single `/api/sss_gen` handler. `/api/generate`
+        # and `/api/viz-generate` remain as thin aliases that
+        # forward identical request bodies, so older clients (the
+        # current ui/index.html, scripts shelling out via cURL, the
+        # `/api/atmos` JSON path below) keep working unmodified.
+        if path in ("/api/sss_gen", "/api/generate", "/api/viz-generate"):
             try:
                 body = _read_json(self)
                 model = body.get("model", str(MODELS_DIR / "demo.sss"))
                 prompt = body.get("prompt", "red")
                 seed = str(body.get("seed", 1))
+                frames = int(body.get("frames", 1))
+                if frames < 1:
+                    _json(self, {"error": "frames must be >= 1"}, 400)
+                    return
                 if not Path(model).exists():
                     _json(self, {"error": f"model not found: {model}"}, 400)
                     return
 
-                out_name = f"gen_{uuid.uuid4().hex[:6]}.ppm"
-                out_path = BUILD_DIR / out_name
+                conditions = body.get("conditions") or []
+                atmos_from = body.get("atmos_reference")
+                is_sfb = (model.endswith(".sfb")
+                          or conditions or atmos_from is not None)
 
-                if model.endswith(".sss"):
+                out_name = f"gen_{uuid.uuid4().hex[:6]}"
+                out_path = BUILD_DIR / (out_name + ".ppm")
+                out_dir  = BUILD_DIR / out_name if frames > 1 else None
+
+                detail = f"{float(body.get('detail', 1.5)):.3f}"
+                steps  = str(int(body.get("steps", 120)))
+
+                if is_sfb or frames > 1 and not (BUILD_DIR / "sss_gen").exists():
+                    # Phase 4 path or no C binary: drive the Python
+                    # entry point. It internally shells back to the
+                    # C `sss_gen` for the .sss / single-frame fast
+                    # case, so this branch always covers the full
+                    # superset of features.
+                    cmd = [sys.executable,
+                           str(ROOT / "scripts" / "sss_gen.py"),
+                           model, prompt, str(out_path),
+                           seed, detail, steps]
+                else:
                     bin_path = BUILD_DIR / "sss_gen"
                     if not bin_path.exists():
                         _json(self, {"error": "sss_gen binary not found — "
                                               "run `make sss_gen`"}, 400)
                         return
-                    detail = f"{float(body.get('detail', 1.5)):.3f}"
-                    steps  = str(int(body.get("steps", 120)))
                     cmd = [str(bin_path), model, prompt, str(out_path),
                            seed, detail, steps]
-                    if body.get("atmos"):
-                        cmd.append("--atmos")
-                    if body.get("out_w"):
-                        cmd += ["--out-w", str(int(body["out_w"]))]
-                    if body.get("out_h"):
-                        cmd += ["--out-h", str(int(body["out_h"]))]
-                else:
-                    bin_path = BUILD_DIR / "gen_image_ce"
-                    if not bin_path.exists():
-                        _json(self, {"error": "gen_image_ce binary not "
-                                              "found — run `make legacy_demo` "
-                                              "(legacy .ces path)"}, 400)
+
+                if body.get("atmos"):
+                    cmd.append("--atmos")
+                if body.get("out_w"):
+                    cmd += ["--out-w", str(int(body["out_w"]))]
+                if body.get("out_h"):
+                    cmd += ["--out-h", str(int(body["out_h"]))]
+                if frames > 1:
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    cmd += ["--frames", str(frames),
+                            "--out-dir", str(out_dir)]
+                if atmos_from:
+                    cmd += ["--atmos-from", str(atmos_from)]
+                for c in conditions:
+                    lab = c.get("label"); intensity = c.get("intensity", 0.5)
+                    if not lab:
+                        _json(self, {"error":
+                                     "conditions[].label is required"}, 400)
                         return
-                    steps = str(int(body.get("steps", 50)))
-                    wave  = str(int(body.get("wave_iters", 200)))
-                    hybrid   = bool(body.get("hybrid", False))
-                    guidance = f"{float(body.get('guidance', 1.0)):.3f}"
-                    cmd = [str(bin_path), model, prompt, str(out_path),
-                           seed, steps, wave]
-                    if hybrid:
-                        cmd += ["--hybrid", "--guidance", guidance]
+                    cmd += ["--condition", str(lab), f"{float(intensity):.3f}"]
 
                 want_viz = (path == "/api/viz-generate")
 
-                def on_done(job, _out=out_path, _viz=want_viz):
-                    # Encode the PPM to PNG, run analysis if requested,
-                    # then delete the on-disk PPM. The Forge predecessor
-                    # left these in build/ forever — over a long-running
-                    # server those add up to gigabytes. The data URI we
-                    # already embedded is the durable artefact.
+                def on_done(job, _out=out_path, _viz=want_viz,
+                            _out_dir=out_dir, _frames=frames):
+                    # Single frame: encode PPM → PNG data URI, then
+                    # delete the PPM (the Forge predecessor left them
+                    # in build/ forever — over a long-running server
+                    # those add up to gigabytes).
+                    #
+                    # Multi-frame: encode each frame_NNNN.ppm to a
+                    # PNG data URI in `frames[]`, then remove the
+                    # directory. Same lifecycle invariant: the
+                    # response payload is the durable artefact.
+                    if _frames > 1 and _out_dir is not None and _out_dir.is_dir():
+                        frames_out: list[str] = []
+                        for fp in sorted(_out_dir.glob("frame_*.ppm")):
+                            try:
+                                frames_out.append(_ppm_to_png_uri(str(fp)))
+                            except Exception:
+                                pass
+                        job["result"]["frames"] = frames_out
+                        # Keep `image` populated with the first frame
+                        # so older clients that only render
+                        # job.result.image still see something.
+                        if frames_out:
+                            job["result"]["image"] = frames_out[0]
+                        try:
+                            for fp in _out_dir.glob("*"):
+                                fp.unlink()
+                            _out_dir.rmdir()
+                        except OSError:
+                            pass
+                        for line in list(job["log"]):
+                            if line.startswith("wrote ") or "frames to" in line:
+                                job["result"]["info"] = line
+                        return
                     if _out.exists():
                         try:
                             job["result"]["image"] = _ppm_to_png_uri(str(_out))

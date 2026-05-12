@@ -9,7 +9,7 @@ Routes:
   GET  /                  → UI (index.html)
   GET  /api/models        → 사용 가능한 모델 목록
   GET  /api/browse        → 서버 디렉토리 탐색 (ROOT 하위만)
-  POST /api/generate      → 이미지 생성 (.ces→gen_image_ce, .sss→sss_gen)
+  POST /api/generate      → 이미지/영상 생성 (scripts/sss_gen.py 위임)
   POST /api/viz-generate  → 시각화용 생성 (분석 데이터 포함)
   POST /api/train         → CE 엔진 학습 실행 (train_demo)
   POST /api/train-sss     → 스펙트로그램 학습 (scripts/sss_train.py)
@@ -465,58 +465,78 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
 
-        # ── Image generation ─────────────────────────────────
+        # ── Image / video generation (Phase 5 unified path) ──
+        # /api/generate is now a thin alias on top of the Python
+        # unified entry point. The .ces / gen_image_ce branch was
+        # removed when Phase 5 retired the legacy generator. The
+        # request body keeps the historical schema (model, prompt,
+        # seed, detail, steps); new fields (frames, conditions,
+        # atmos_reference, out_w/h, atmos) are forwarded straight
+        # through to scripts/sss_gen.py.
         if path == "/api/generate":
             body = self.read_body()
-            model = body.get("model", str(MODELS / "demo.ces"))
+            model = body.get("model", str(MODELS / "demo.sss"))
             prompt = body.get("prompt", "red")
             seed = str(body.get("seed", 0))
-
+            frames = int(body.get("frames", 1))
+            if frames < 1:
+                self.send_json({"error": "frames must be >= 1"}, 400); return
             if not Path(model).exists():
                 self.send_json({"error": f"model not found: {model}"}, 400)
                 return
 
-            out_name = f"gen_{uuid.uuid4().hex[:6]}.ppm"
-            out_path = BUILD / out_name
+            out_name = f"gen_{uuid.uuid4().hex[:6]}"
+            out_path = BUILD / (out_name + ".ppm")
+            out_dir  = BUILD / out_name if frames > 1 else None
 
-            if model.endswith(".sss"):
-                bin_path = BUILD / "sss_gen"
-                if not bin_path.exists():
-                    self.send_json({"error": "sss_gen binary not found — run `make sss_gen`"}, 400)
-                    return
-                detail = f"{float(body.get('detail', 1.0)):.3f}"
-                steps = str(int(body.get("steps", 24)))
-                cmd = [
-                    str(bin_path),
-                    model, prompt, str(out_path),
-                    seed, detail, steps,
-                ]
-            else:
-                bin_path = BUILD / "gen_image_ce"
-                if not bin_path.exists():
-                    self.send_json({"error": "gen_image_ce binary not found — run `make gen_image_ce`"}, 400)
-                    return
-                steps = str(int(body.get("steps", 50)))
-                wave = str(int(body.get("wave_iters", 200)))
-                hybrid = bool(body.get("hybrid", False))
-                guidance = f"{float(body.get('guidance', 1.0)):.3f}"
-                cmd = [
-                    str(bin_path),
-                    model, prompt, str(out_path),
-                    seed, steps, wave,
-                ]
-                if hybrid:
-                    cmd += ["--hybrid", "--guidance", guidance]
+            detail = f"{float(body.get('detail', 1.5)):.3f}"
+            steps  = str(int(body.get("steps", 120)))
+            cmd = [
+                sys.executable, str(ROOT / "scripts" / "sss_gen.py"),
+                model, prompt, str(out_path),
+                seed, detail, steps,
+            ]
+            if body.get("atmos"):       cmd.append("--atmos")
+            if body.get("out_w"):       cmd += ["--out-w", str(int(body["out_w"]))]
+            if body.get("out_h"):       cmd += ["--out-h", str(int(body["out_h"]))]
+            if frames > 1:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                cmd += ["--frames", str(frames), "--out-dir", str(out_dir)]
+            if body.get("atmos_reference"):
+                cmd += ["--atmos-from", str(body["atmos_reference"])]
+            for c in (body.get("conditions") or []):
+                lab = c.get("label"); intensity = c.get("intensity", 0.5)
+                if not lab:
+                    self.send_json({"error":
+                        "conditions[].label is required"}, 400); return
+                cmd += ["--condition", str(lab), f"{float(intensity):.3f}"]
 
-            def on_done(job):
-                if out_path.exists():
-                    data_uri = ppm_to_base64(str(out_path))
-                    job["result"]["image"] = data_uri
-                    job["result"]["ppm_path"] = str(out_path)
-                    # Parse summary line from log (gen_image_ce uses "mean RGB",
-                    # sss_gen uses "wrote ... (WxH, prompt=..., seed=..., detail=..., steps=...)")
+            def on_done(job, _out=out_path, _out_dir=out_dir, _frames=frames):
+                if _frames > 1 and _out_dir is not None and _out_dir.is_dir():
+                    frames_out = []
+                    for fp in sorted(_out_dir.glob("frame_*.ppm")):
+                        try:
+                            frames_out.append(ppm_to_base64(str(fp)))
+                        except Exception:
+                            pass
+                    job["result"]["frames"] = frames_out
+                    if frames_out:
+                        job["result"]["image"] = frames_out[0]
+                    try:
+                        for fp in _out_dir.glob("*"): fp.unlink()
+                        _out_dir.rmdir()
+                    except OSError:
+                        pass
                     for line in job["log"]:
-                        if "mean RGB" in line or line.startswith("wrote "):
+                        if line.startswith("wrote ") or "frames to" in line:
+                            job["result"]["info"] = line
+                    return
+                if _out.exists():
+                    data_uri = ppm_to_base64(str(_out))
+                    job["result"]["image"] = data_uri
+                    job["result"]["ppm_path"] = str(_out)
+                    for line in job["log"]:
+                        if line.startswith("wrote "):
                             job["result"]["info"] = line
 
             job_id = start_job(cmd, on_done=on_done)
@@ -606,43 +626,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json({"job_id": job_id})
             return
 
-        # ── Viz Generate (analysis-enriched) ──────────────
+        # ── Viz Generate (analysis-enriched, Phase 5 unified) ────
+        # Same unified path as /api/generate above; the only
+        # difference is that the on_done callback also runs the
+        # per-pixel analysis pass and surfaces the result-line
+        # parsing the old morpheme / canvas_id parser used to do.
+        # The legacy `.ces` branch and morpheme-FFT log parsing
+        # are gone with `gen_image_ce`.
         if path == "/api/viz-generate":
             body = self.read_body()
-            model = body.get("model", str(MODELS / "demo.ces"))
+            model = body.get("model", str(MODELS / "demo.sss"))
             prompt = body.get("prompt", "red")
             seed = str(body.get("seed", 0))
-
             if not Path(model).exists():
                 self.send_json({"error": f"model not found: {model}"}, 400)
                 return
 
             out_name = f"viz_{uuid.uuid4().hex[:6]}.ppm"
             out_path = BUILD / out_name
-
-            if model.endswith(".sss"):
-                bin_path = BUILD / "sss_gen"
-                if not bin_path.exists():
-                    self.send_json({"error": "sss_gen binary not found — run `make sss_gen`"}, 400)
-                    return
-                detail = f"{float(body.get('detail', 1.0)):.3f}"
-                steps = str(int(body.get("steps", 24)))
-                wave = "0"  # sss_gen has no wave param; report 0 to UI
-                cmd = [
-                    str(bin_path),
-                    model, prompt, str(out_path), seed, detail, steps,
-                ]
-            else:
-                bin_path = BUILD / "gen_image_ce"
-                if not bin_path.exists():
-                    self.send_json({"error": "gen_image_ce binary not found — run `make gen_image_ce`"}, 400)
-                    return
-                steps = str(int(body.get("steps", 50)))
-                wave = str(int(body.get("wave_iters", 200)))
-                cmd = [
-                    str(bin_path),
-                    model, prompt, str(out_path), seed, steps, wave,
-                ]
+            detail = f"{float(body.get('detail', 1.5)):.3f}"
+            steps  = str(int(body.get("steps", 120)))
+            cmd = [
+                sys.executable, str(ROOT / "scripts" / "sss_gen.py"),
+                model, prompt, str(out_path),
+                seed, detail, steps,
+            ]
+            if body.get("atmos"): cmd.append("--atmos")
 
             def on_done(job):
                 if out_path.exists():
@@ -650,33 +659,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     job["result"]["image"] = data_uri
                     analysis = analyze_ppm(str(out_path))
                     job["result"]["analysis"] = analysis
-
-                    # Parse morphemes and routing from log
-                    morphemes = []
-                    canvas_id = ""
-                    mean_rgb = [0, 0, 0]
-                    for line in job["log"]:
-                        if "morphemes=" in line:
-                            # Extract morpheme tokens
-                            parts = line.split("morphemes=")[1] if "morphemes=" in line else ""
-                            import re
-                            morph_matches = re.findall(r'(\S+)/(\S+)', parts)
-                            morphemes = [{"token": m[0], "pos": m[1]} for m in morph_matches]
-                        if "routed canvas_id=" in line:
-                            canvas_id = line.split("canvas_id=")[1].strip()
-                        if "mean RGB" in line:
-                            import re
-                            m = re.search(r'\(([^)]+)\)', line)
-                            if m:
-                                vals = m.group(1).split(",")
-                                mean_rgb = [float(v.strip()) for v in vals[:3]]
-
-                    job["result"]["morphemes"] = morphemes
-                    job["result"]["canvas_id"] = canvas_id
-                    job["result"]["mean_rgb"] = mean_rgb
                     job["result"]["steps"] = int(steps)
-                    job["result"]["wave_iters"] = int(wave)
                     job["result"]["seed"] = int(seed)
+                    for line in job["log"]:
+                        if line.startswith("wrote "):
+                            job["result"]["info"] = line
 
             job_id = start_job(cmd, on_done=on_done)
             self.send_json({"job_id": job_id})

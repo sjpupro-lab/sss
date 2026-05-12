@@ -2,9 +2,11 @@
 # SSS Unified UI — Termux 원커맨드 런처
 # Usage: ./ui/start.sh [port]
 #
-# Old binary-backed server (gen_image_ce / train_demo / chat) lives in
-# ui/server.py and is no longer the default. Launch it directly with
-# `python3 ui/server.py <port>` if you still need it.
+# Phase 5 retired the legacy gen_image_ce / sss_animate generators.
+# ui/server.py still exists for compatibility and now routes
+# /api/generate + /api/viz-generate through scripts/sss_gen.py. The
+# unified_server.py below is the default and adds the /api/sss_gen
+# endpoint described in docs/migration_phase5.md.
 
 set -e
 cd "$(dirname "$0")/.."  # cd to sss/ root

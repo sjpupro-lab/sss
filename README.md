@@ -1,5 +1,13 @@
 # SSS — Spatial Pattern AI + CE-Cell Image Engine
 
+> **Phase 5 (2026-05)**: image and video generation now run through a
+> single entry point — the C binary `build/sss_gen` for the Phase 1–3
+> spectrogram path and the Python wrapper `scripts/sss_gen.py` for the
+> Phase 4 condition-driven path. The legacy `sss_animate` and
+> `gen_image_ce` binaries are gone; see
+> [`docs/migration_phase5.md`](docs/migration_phase5.md) for the full
+> old → new CLI mapping.
+
 ![Main Hero](main_hero.png)
 
 > A two-engine codebase. **Text** is encoded as brightness patterns on a
@@ -403,8 +411,11 @@ the previous behaviour, so existing callers see no difference.
 ## End-to-end demo
 
 ```bash
-make demo_tools                            # builds make_demo_dataset, train_demo,
-                                           # gen_image_ce, verify_hybrid
+make legacy_demo                           # builds make_demo_dataset,
+                                           # train_demo, verify_hybrid
+                                           # (gen_image_ce was removed
+                                           # in Phase 5 — see
+                                           # docs/migration_phase5.md)
 
 ./build/make_demo_dataset data/demo        # 10 PPM images + labels.tsv
 
@@ -421,21 +432,19 @@ make demo_tools                            # builds make_demo_dataset, train_dem
 #   masked-train summary: stored_cells=253 residuals=96
 #   codebook=6–9 patterns (≈10× compression on correction cells)
 
-# Generate (canvas-routed default path)
-./build/gen_image_ce build/models/demo.ces "red apple" \
-    build/red_apple.ppm 0 50 200
-
-# Generate (hybrid VAE path)
-./build/gen_image_ce build/models/demo_cb.ces "red apple" \
-    build/red_apple_hybrid.ppm 0 50 200 --hybrid --guidance 1.5
+# Generate via the Phase 5 unified entry point (replaces gen_image_ce):
+make sss_gen
+./build/sss_gen build/models/demo.sss "red apple" \
+    build/red_apple.ppm 1 1.5 120
 
 # Roundtrip PSNR over a folder
 ./build/verify_hybrid data/demo/colors/*.ppm data/demo/fruits/*.ppm
 #   per-file dB output + average across the batch
 ```
 
-`gen_image_ce` morpheme-tokenises the prompt, votes a winning
-`canvas_id` via `ce_search_by_type(CE_TYPE_TEXT, ...)`, then either:
+Phase 5 retired the `gen_image_ce` binary. Before that, it
+morpheme-tokenised the prompt, voted a winning `canvas_id` via
+`ce_search_by_type(CE_TYPE_TEXT, ...)`, then either:
 
 - (default) `ce_generate_image_canvas_routed` — denoise + decode +
   16×16 atomic wave-refine on entries with the matching canvas_id, **or**

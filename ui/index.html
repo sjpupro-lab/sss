@@ -497,47 +497,29 @@
              value="red apple">
     </div>
 
-    <div class="section-title">Parameters <span id="gen-engine-label" style="color:#666;font-weight:400;letter-spacing:0">(.ces)</span></div>
+    <div class="section-title">Parameters <span id="gen-engine-label" style="color:#666;font-weight:400;letter-spacing:0">(sss_gen)</span></div>
 
-    <!-- .ces-only parameters (gen_image_ce) -->
-    <div id="gen-params-ces">
+    <!-- Unified parameters — every model (.sss or .sfb) and every
+         frame count (1 = image, N > 1 = video) goes through the
+         same `/api/generate` endpoint after Phase 5. -->
+    <div id="gen-params-sss">
       <div class="slider-row">
         <span class="slider-label">Steps</span>
-        <input type="range" id="gen-steps" min="4" max="100" value="50"
-               oninput="$('gen-steps-val').textContent=this.value">
-        <span class="slider-value" id="gen-steps-val">50</span>
-      </div>
-      <div class="slider-row">
-        <span class="slider-label">Wave</span>
-        <input type="range" id="gen-wave" min="0" max="500" value="200" step="10"
-               oninput="$('gen-wave-val').textContent=this.value">
-        <span class="slider-value" id="gen-wave-val">200</span>
-      </div>
-      <div class="slider-row">
-        <span class="slider-label">Guidance</span>
-        <input type="range" id="gen-guidance" min="0.5" max="4.0" value="1.0" step="0.1"
-               oninput="$('gen-guidance-val').textContent=parseFloat(this.value).toFixed(1)">
-        <span class="slider-value" id="gen-guidance-val">1.0</span>
-      </div>
-      <div class="toggle-row">
-        <span class="toggle-label">Hybrid VAE</span>
-        <div class="toggle" id="gen-hybrid" onclick="this.classList.toggle('on')"></div>
-      </div>
-    </div>
-
-    <!-- .sss-only parameters (sss_gen) -->
-    <div id="gen-params-sss" style="display:none">
-      <div class="slider-row">
-        <span class="slider-label">Steps</span>
-        <input type="range" id="gen-sss-steps" min="4" max="100" value="24"
+        <input type="range" id="gen-sss-steps" min="4" max="200" value="120"
                oninput="$('gen-sss-steps-val').textContent=this.value">
-        <span class="slider-value" id="gen-sss-steps-val">24</span>
+        <span class="slider-value" id="gen-sss-steps-val">120</span>
       </div>
       <div class="slider-row">
         <span class="slider-label">Detail</span>
-        <input type="range" id="gen-sss-detail" min="0.1" max="3.0" value="1.0" step="0.1"
+        <input type="range" id="gen-sss-detail" min="0.1" max="3.0" value="1.5" step="0.1"
                oninput="$('gen-sss-detail-val').textContent=parseFloat(this.value).toFixed(1)">
-        <span class="slider-value" id="gen-sss-detail-val">1.0</span>
+        <span class="slider-value" id="gen-sss-detail-val">1.5</span>
+      </div>
+      <div class="slider-row">
+        <span class="slider-label">Frames</span>
+        <input type="range" id="gen-frames" min="1" max="60" value="1"
+               oninput="$('gen-frames-val').textContent=this.value">
+        <span class="slider-value" id="gen-frames-val">1</span>
       </div>
     </div>
 
@@ -919,16 +901,16 @@ function streamJob(jobId, consoleId, onDone) {
   };
 }
 
-// ── Param UI switching by model type ───────
-function isSssModel(path) { return !!path && path.toLowerCase().endsWith('.sss'); }
+// ── Engine label (Phase 5: unified — every model goes through
+//    scripts/sss_gen.py via the /api/generate alias). ─────────
 function updateParamsUI() {
-  const sss = isSssModel(selectedModel);
-  $('gen-params-ces').style.display = sss ? 'none' : '';
-  $('gen-params-sss').style.display = sss ? '' : 'none';
-  $('gen-engine-label').textContent = sss ? '(.sss → sss_gen)' : '(.ces → gen_image_ce)';
+  $('gen-engine-label').textContent =
+    (selectedModel || '').toLowerCase().endsWith('.sfb')
+      ? '(.sfb → sss_gen)'
+      : '(sss_gen)';
 }
 
-// ── Image Generation ───────────────────────
+// ── Image / video generation (Phase 5 unified path) ────────
 async function doGenerate() {
   const btn = $('gen-btn');
   btn.disabled = true;
@@ -936,23 +918,18 @@ async function doGenerate() {
   clearConsole('gen-console');
 
   const prompt = $('gen-prompt').value || 'red';
-  const sss = isSssModel(selectedModel);
   const body = {
-    model: selectedModel || 'build/models/demo.ces',
+    model: selectedModel || 'build/models/demo.sss',
     prompt: prompt,
     seed: parseInt($('gen-seed').value),
+    steps: parseInt($('gen-sss-steps').value),
+    detail: parseFloat($('gen-sss-detail').value),
+    frames: parseInt($('gen-frames').value) || 1,
   };
-  if (sss) {
-    body.steps = parseInt($('gen-sss-steps').value);
-    body.detail = parseFloat($('gen-sss-detail').value);
-    log('gen-console', `$ sss_gen ${body.model} "${prompt}" out.ppm ${body.seed} ${body.detail.toFixed(3)} ${body.steps}`, 'info');
-  } else {
-    body.steps = parseInt($('gen-steps').value);
-    body.wave_iters = parseInt($('gen-wave').value);
-    body.guidance = parseFloat($('gen-guidance').value);
-    body.hybrid = $('gen-hybrid').classList.contains('on');
-    log('gen-console', `$ gen_image_ce ${body.model} "${prompt}" out.ppm ${body.seed} ${body.steps} ${body.wave_iters}` + (body.hybrid ? ` --hybrid --guidance ${body.guidance}` : ''), 'info');
-  }
+  const framesNote = body.frames > 1 ? ` --frames ${body.frames}` : '';
+  log('gen-console',
+      `$ sss_gen ${body.model} "${prompt}" out.ppm ${body.seed} ` +
+      `${body.detail.toFixed(3)} ${body.steps}${framesNote}`, 'info');
 
   try {
     const res = await fetch(API + '/api/generate', {
@@ -1187,7 +1164,7 @@ async function doVizGenerate() {
   try {
     const sss = isSssModel(selectedModel);
     const vizBody = {
-      model: selectedModel || 'build/models/demo.ces',
+      model: selectedModel || 'build/models/demo.sss',
       prompt,
       seed: parseInt($('gen-seed')?.value || '0'),
     };
