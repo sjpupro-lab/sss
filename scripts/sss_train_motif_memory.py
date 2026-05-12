@@ -25,9 +25,14 @@ Algorithm:
   (3) Run the patch through the SAME envelope pipeline used by
       `sss_train_primitive` (DC-killed, zero-mean L2-normalised
       row / col / color envelopes + Sobel heatmap).
-  (4) Weighted-cosine match against every motif. Above the
-      MATCH_THRESHOLD (default 0.85) the motif is considered
-      "activated" at this grid cell.
+  (4) Weighted-cosine match against every motif (final_sim below)
+      and pick the **single best-scoring** motif per grid cell. If
+      that winner's score clears MATCH_THRESHOLD (default 0.85),
+      record it as the activation for that cell — winner-take-all
+      per cell, not every-motif-above-threshold. The downstream
+      relation / heatmap / identity statistics therefore reflect
+      the cell's most-likely motif assignment rather than
+      overlapping multi-label firings.
 
       final_sim = 0.35 × row + 0.35 × col + 0.20 × color + 0.10 × heat
 
@@ -56,10 +61,19 @@ Algorithm:
       spatial statistics (the primitive folder gave coarse Sobel
       density, this gives "where did the motif actually fire").
 
-  (8) Identity extraction: every labelled image becomes an identity
-      record whose `motif_ids` are the union of motifs that fired
-      at any grid cell. The identity's label is the image's label
-      (caller supplied) or its filename stem when no label map is
+  (8) Identity extraction: every labelled image **that activates at
+      least one motif** becomes an identity record. The identity's
+      `motif_ids` are the motifs that fired at any grid cell in
+      that image. The Phase 2 .sfb format requires every identity's
+      `motif_count ∈ [1, 32]`, so:
+        - images with zero activations produce NO identity (the
+          format rejects motif_count = 0); identity_count can
+          therefore be less than scanned_images.
+        - images that fire more than 32 distinct motifs keep the
+          top 32 by within-image cell-activation count (a "what
+          fired most in *this* scene" ranking, not a global one).
+      The identity's label is the caller-supplied label_map entry
+      keyed by basename, or the filename stem when no label map is
       present.
 
 CLI:
@@ -105,7 +119,10 @@ RELATION_RIGHT  = 3
 RELATION_NEAR   = 4
 RELATION_AROUND = 5
 
-IMAGE_EXTS = (".png", ".ppm", ".jpg", ".jpeg", ".bmp")
+# PNG / PPM only — `_read_image()` raises on anything else and we
+# don't want a folder scan to crash mid-way through a long run.
+# Convert upstream via ffmpeg if you need other formats.
+IMAGE_EXTS = (".png", ".ppm")
 
 
 # ── Patch envelope ─────────────────────────────────────────────────
@@ -242,14 +259,21 @@ def _classify_relation(dx: float, dy: float) -> int:
 
 def scan_image(img_u8_rgb: np.ndarray, motif_views: list,
                threshold: float = DEFAULT_THRESHOLD) -> dict:
-    """Return everything one image contributes to the memory:
+    """Per-cell winner-take-all scan. For each of the 32×32 grid
+    cells we compute the weighted-cosine similarity against every
+    motif and keep **only the best-scoring motif** if its score
+    clears `threshold`. The cell is therefore assigned to its
+    single most-likely motif; we do not collect every motif that
+    happens to score above threshold (see the module docstring).
+
+    Returns:
 
         {
           "activations": list of (motif_id, grid_y, grid_x, score),
           "fired_motifs": set of motif_id (any-cell activation),
-          "heatmap_32": (32, 32) uint16 per-motif activation count …
-            actually a dict {motif_id: (32, 32) np.uint16}, mostly
-            sparse, keyed only by motifs that fired.
+          "heat_per_motif": dict {motif_id: (32, 32) np.uint16} of
+            per-motif activation counts, mostly sparse — keyed only
+            by motifs that fired in this image.
         }
 
     `motif_views` is the list produced by `_motif_envelope_view`."""
@@ -429,6 +453,13 @@ def build_memory(motifs_path: Path, labeled_dir: Path,
     identities_motifs: list[list[int]] = []
     activation_count = np.zeros(motif_count, np.uint32)
 
+    # Per-image cell-firing counts per motif. Used to cap each
+    # identity at the Phase 2 .sfb limit of SFB_MAX_IDENTITY_MOTIFS
+    # = 32 ids; when a labelled scene activates more, we keep the
+    # 32 motifs that fired the most cells in that image (top-K by
+    # within-image activation count).
+    SFB_MAX_IDENTITY_MOTIFS = 32
+
     t_start = time.perf_counter()
     for ipath in image_paths:
         rgb = _read_image(str(ipath))
@@ -437,14 +468,29 @@ def build_memory(motifs_path: Path, labeled_dir: Path,
         for mid in sample["fired_motifs"]:
             activation_count[mid] += 1
         if sample["fired_motifs"]:
+            # Top-K by *in-this-image* cell count, not by global
+            # activation_count — the identity should describe what
+            # this scene contains, not what's hot across the dataset.
+            per_image_hits: dict[int, int] = {}
+            for mid, _, _, _ in sample["activations"]:
+                per_image_hits[mid] = per_image_hits.get(mid, 0) + 1
+            ordered = sorted(per_image_hits.items(),
+                             key=lambda kv: (-kv[1], kv[0]))
+            kept = [mid for mid, _ in ordered[:SFB_MAX_IDENTITY_MOTIFS]]
             ident_label = label_map.get(ipath.name, ipath.stem)
             identities_labels.append(ident_label)
-            identities_motifs.append(sorted(int(m) for m in sample["fired_motifs"]))
+            identities_motifs.append(sorted(int(m) for m in kept))
+        # Images that fired no motifs at all DO NOT produce an
+        # identity record — the .sfb format requires motif_count
+        # ≥ 1 per identity. This is documented in build_memory()'s
+        # docstring above; identity_count can therefore be less
+        # than scanned_images.
         if verbose:
             n_act = len(sample["activations"])
             n_fired = len(sample["fired_motifs"])
+            note = "" if sample["fired_motifs"] else "  (no identity emitted)"
             print(f"  {ipath.name:<48s} activations={n_act:>4d}  "
-                  f"fired={n_fired:>3d}")
+                  f"fired={n_fired:>3d}{note}")
 
     relations, heatmap_32 = _aggregate_relations(
         per_image_samples, motif_count, weight_floor)

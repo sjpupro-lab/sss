@@ -77,7 +77,11 @@ FREQ_BINS    = 128
 HEATMAP_DIM  = 16
 PATCH_SIZE   = 64
 
-IMAGE_EXTS = (".png", ".ppm", ".jpg", ".jpeg", ".bmp")
+# PNG / PPM only — that's what `_read_image_rgb` supports. Listing
+# .jpg / .bmp here would invite folder scans that crash on the
+# first non-PNG/PPM hit. Convert upstream via ffmpeg if you need
+# the other formats.
+IMAGE_EXTS = (".png", ".ppm")
 
 
 # ── Image normalisation ───────────────────────────────────────────

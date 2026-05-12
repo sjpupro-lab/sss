@@ -45,15 +45,15 @@ produced by the scripts in this repo on the bundled `data/sanrio`
    ai_save *.spai                       ce_storage_save *.ces
                                              │
                                        Phase 3 motif training pipeline:
-                                       ┌────────────────────────────────┐
-                                       │ dataset/primitive/<label>/*.   │
-                                       │         ↓ sss_train_primitive   │
-                                       │ primitive_motifs.npz            │
-                                       │         ↓ sss_train_motif_      │
-                                       │           memory (+ labelled)   │
-                                       │ motif_memory.npz                │
-                                       │         ↓ sss_build_feature_bank│
-                                       └────────────────────────────────┘
+                                       ┌─────────────────────────────────────────┐
+                                       │ dataset/primitive/<label>/*.{png,ppm}   │
+                                       │         ↓ sss_train_primitive            │
+                                       │ primitive_motifs.npz                     │
+                                       │         ↓ sss_train_motif_memory         │
+                                       │           (+ dataset/labeled/*.{png,ppm})│
+                                       │ motif_memory.npz                         │
+                                       │         ↓ sss_build_feature_bank         │
+                                       └─────────────────────────────────────────┘
                                              │
                                        feature_bank.sfb
                                        (motif dictionary —
