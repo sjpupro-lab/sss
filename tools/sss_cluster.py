@@ -3,9 +3,10 @@
 
 The .sss file holds one cell per (image, word) pair: a COLOR cell, a
 SHAPE cell, and a FACE cell, each carrying a Korean/English label
-(e.g. ``red_0``, ``circle_3``, ``mymelody_2``) plus an FFT amp/phase
+(e.g. ``red_0``, ``circle_3``, ``mymelody_2``) plus an FFT amplitude
 block. The trainer doesn't try to *understand* the labels — it just
-stores them.
+stores them. (Phase data was removed in Phase 1; clustering operates
+on amplitudes only.)
 
 This tool runs the post-training discovery step the integration spec
 calls for:

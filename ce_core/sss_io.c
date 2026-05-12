@@ -17,8 +17,24 @@
  *     float  fp[256]
  *     uint32 amp_len    (in floats)
  *     float  amp[amp_len]
- *     uint32 phase_len  (in floats)
+ *     uint32 phase_len  (in floats)  <-- DEPRECATED, see below
  *     float  phase[phase_len]
+ *
+ * Phase deprecation (Phase 1, 2026-05):
+ *   The trainer no longer writes phase data — `scripts/sss_train.py`
+ *   emits phase_len == 0 for every cell, and the generator
+ *   (`ce_core/sss_rowvae.c`) samples a per-seed random phase at
+ *   noise-init time. To stay backward-compatible with v9 files
+ *   produced before the change, this reader still consumes the
+ *   `phase_len` u32 and `phase[]` floats when they are present:
+ *   they land in `SSSCell.phase` so the legacy gentle low-band phase
+ *   relaxation in `sss_rowvae.c` can still run. Cells with
+ *   `phase_len == 0` leave `cell->phase = NULL`, which the generator
+ *   treats as "no relaxation, free-evolve from random init".
+ *
+ *   Phase 2 (planned) will introduce a `.sfb` (SSS Feature Bank)
+ *   format that drops the phase field entirely. Until then the on-
+ *   disk layout above stays stable.
  */
 #include "sss_rowvae.h"
 #include "ce_core.h"

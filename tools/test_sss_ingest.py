@@ -65,21 +65,39 @@ def main() -> int:
         assert pipe.memory.total_cells() == before
         print(f"OK  no-label  : refused with '{s['error']}' (no cells added)")
 
-        # ── PNG image WITH label adds 5 cells with amp/phase ─
+        # ── PNG image WITH label adds 5 amp-only cells (no phase) ─
         s = ingest_file(png_path, pipe.memory, label="red green stripe")
         assert s["type"] == "image"
         assert s["cells_added"] == 5
         assert s["tags"] == ["red", "green", "stripe"]
         assert set(s["blocks"]) == {"hair", "face", "upper", "lower", "bg"}
         assert pipe.memory.total_cells() == before + 5
-        # Spot-check a cell carries amp + phase as a contiguous ndarray.
+        # Phase 1 amp-only: the cell carries amp but not phase.
         sample = pipe.memory.cells["face"][-1]
-        assert sample["amp"] is not None and sample["phase"] is not None
-        assert sample["amp"].shape == sample["phase"].shape
+        assert sample["amp"] is not None
         assert sample["amp"].ndim == 3 and sample["amp"].shape[1] == 3
         assert sample["amp"].dtype == np.float32
+        assert sample.get("phase") is None, (
+            "Phase 1 cells must not carry phase; "
+            f"got {type(sample['phase']).__name__}")
         print(f"OK  png+label : +{s['cells_added']} cells, "
-              f"amp shape={sample['amp'].shape} ({sample['amp'].dtype})")
+              f"amp shape={sample['amp'].shape} ({sample['amp'].dtype}), "
+              "phase=None")
+
+        # ── Re-ingest the same image: amplitudes must be byte-identical.
+        # The trainer is purely a function of the pixel input (no random
+        # phase, no random scaling), so two passes over the same PNG
+        # should produce the same amp arrays. Phase, by design, is not
+        # stored at all and so isn't part of this comparison.
+        before2 = pipe.memory.total_cells()
+        s2 = ingest_file(png_path, pipe.memory, label="red green stripe")
+        assert s2["cells_added"] == 5
+        assert pipe.memory.total_cells() == before2 + 5
+        sample_a = pipe.memory.cells["face"][-2]   # first ingest
+        sample_b = pipe.memory.cells["face"][-1]   # second ingest
+        assert np.array_equal(sample_a["amp"], sample_b["amp"]), (
+            "amp must be deterministic across re-ingest")
+        print("OK  amp determ: re-ingest produces byte-identical amp")
 
         # ── PPM image with label ─────────────────────────
         ppm_path = os.path.join(tmp, "img.ppm"); write_ppm(ppm_path, img)

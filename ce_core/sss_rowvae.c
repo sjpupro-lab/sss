@@ -1,6 +1,15 @@
 /* sss_rowvae.c — Sculpt-then-Radio image generation engine.
  *
- * Two stages, sharing the same per-cell amplitude+phase storage:
+ * Two stages, sharing the same per-cell amplitude storage. Phase 1
+ * (amp-only radio tuning) drops per-cell phase from the trained model:
+ * the writer no longer emits phase bytes. This reader is more lenient
+ * for backward compatibility — when a legacy SSS_VERSION-9 .sss still
+ * ships non-empty `cell->phase`, the reconstruction helpers
+ * (`reconstruct_*_cell`) and the Stage-2 radio loop will consume it
+ * for a strongly-attenuated, low-band-only phase relaxation
+ * (`phase_alpha = alpha * 0.05`, k ≤ NF/8). New cells (`phase_len = 0`,
+ * `cell->phase == NULL`) skip that relaxation entirely so the phase
+ * free-evolves from the per-seed random init.
  *
  *   ── Sculpt (PR #19) ──────────────────────────────────────────
  *   Decides *what* to draw. Collects every candidate cell whose
@@ -22,20 +31,29 @@
  *   different seeds break ties differently → genuinely different
  *   outputs from the same prompt.
  *
- *   ── Radio (existing spectrogram tuner) ───────────────────────
+ *   ── Radio (Phase 1 amp-only tuner) ───────────────────────────
  *   Decides *how* to draw. The winners' reconstructed images are
  *   row-rfft'd and column-rfft'd to build a target spectrogram
  *   (low band = COLOR, mid band = 0.6·SHAPE + 0.4·FACE, high band
  *   = SHAPE; column tune = SHAPE). The image starts as spectral
- *   noise (random amp+phase per row), then a steps-iteration loop
- *   blends amp + phase toward the target with a cooling α schedule
- *   (steps≤30 → α=0.95→0.30; steps≤80 → 0.50→0.16; else 0.30→0.10).
- *   Phase tunes at half rate (phase_alpha = alpha/2) and uses
- *   shortest-arc wrapping so it never spins the wrong way around π.
+ *   noise (random amp + random phase per row, seeded from the
+ *   caller's `seed`), then a steps-iteration loop blends amp toward
+ *   the target with a cooling α schedule (steps≤30 → α=0.95→0.30;
+ *   steps≤80 → 0.50→0.16; else 0.30→0.10). Phase tuning is the
+ *   key Phase 1 change:
+ *       - if the winner cell carries no stored phase: phase_alpha = 0
+ *         everywhere → phase stays at its per-seed random init →
+ *         per-seed output diversity is guaranteed.
+ *       - if the winner cell carries stored phase (legacy v9):
+ *         phase_alpha = alpha * 0.05 (5 %, 1/10th the old half-rate),
+ *         AND only the low band (bin index k ≤ NF/8) relaxes; all
+ *         higher bins keep phase_alpha = 0.
+ *   Wraparound is shortest-arc ± π just as before.
  *
  * Net effect: Sculpt converges on the right cells (the *content*
  * decision), Radio converges on a clean rendering of those cells'
- * spectra (the *execution*). Same .sss file, no format change.
+ * amplitudes (the *execution*) while leaving the phase free to
+ * vary per-seed. Same .sss file format, no breaking changes.
  *
  * No external FFT library — sss_rfft / sss_irfft are direct DFT
  * pairs, fast enough for the 64×64 / 128×128 sizes this engine
@@ -865,27 +883,50 @@ int sss_generate(const SSSModel *m,
      * tgt_*_has[idx] == 0 means "no source contributed to this bin" —
      * the radio loop must skip the blend instead of pulling the
      * measured amp toward 0 (which would slowly collapse the image
-     * to flat black). */
-    float   *tgt_row_amp   = (float   *)malloc((size_t)H * 3 * NF * sizeof(float));
-    float   *tgt_row_phase = (float   *)malloc((size_t)H * 3 * NF * sizeof(float));
-    uint8_t *tgt_row_has   = (uint8_t *)calloc((size_t)H * 3 * NF, sizeof(uint8_t));
-    float   *tgt_col_amp   = (float   *)malloc((size_t)W * 3 * NF * sizeof(float));
-    float   *tgt_col_phase = (float   *)malloc((size_t)W * 3 * NF * sizeof(float));
-    uint8_t *tgt_col_has   = (uint8_t *)calloc((size_t)W * 3 * NF, sizeof(uint8_t));
+     * to flat black).
+     *
+     * Phase 1: which winner cell contributed the phase for each bin
+     * matters too — when the source cell carried no stored phase the
+     * target phase is meaningless (it'd just be the RFFT of a
+     * zero-phase reconstruction), so the radio loop must keep
+     * phase_alpha = 0 for that bin. tgt_*_phase_valid records that
+     * per-bin gate. */
+    float   *tgt_row_amp         = (float   *)malloc((size_t)H * 3 * NF * sizeof(float));
+    float   *tgt_row_phase       = (float   *)malloc((size_t)H * 3 * NF * sizeof(float));
+    uint8_t *tgt_row_has         = (uint8_t *)calloc((size_t)H * 3 * NF, sizeof(uint8_t));
+    uint8_t *tgt_row_phase_valid = (uint8_t *)calloc((size_t)H * 3 * NF, sizeof(uint8_t));
+    float   *tgt_col_amp         = (float   *)malloc((size_t)W * 3 * NF * sizeof(float));
+    float   *tgt_col_phase       = (float   *)malloc((size_t)W * 3 * NF * sizeof(float));
+    uint8_t *tgt_col_has         = (uint8_t *)calloc((size_t)W * 3 * NF, sizeof(uint8_t));
+    uint8_t *tgt_col_phase_valid = (uint8_t *)calloc((size_t)W * 3 * NF, sizeof(uint8_t));
 
     if (!row_in || !row_amp || !row_phase || !row_out
      || !col_in || !col_amp || !col_phase || !col_out
-     || !tgt_row_amp || !tgt_row_phase || !tgt_row_has
-     || !tgt_col_amp || !tgt_col_phase || !tgt_col_has) {
+     || !tgt_row_amp || !tgt_row_phase || !tgt_row_has || !tgt_row_phase_valid
+     || !tgt_col_amp || !tgt_col_phase || !tgt_col_has || !tgt_col_phase_valid) {
         free(row_in); free(row_amp); free(row_phase); free(row_out);
         free(col_in); free(col_amp); free(col_phase); free(col_out);
-        free(tgt_row_amp); free(tgt_row_phase); free(tgt_row_has);
-        free(tgt_col_amp); free(tgt_col_phase); free(tgt_col_has);
+        free(tgt_row_amp); free(tgt_row_phase); free(tgt_row_has); free(tgt_row_phase_valid);
+        free(tgt_col_amp); free(tgt_col_phase); free(tgt_col_has); free(tgt_col_phase_valid);
         free(pool_color); free(pool_shape); free(pool_face);
         sss_image_free(out);
         for (int i = 0; i < ntok; ++i) free(tokens[i]);
         return -7;
     }
+
+    /* Per-winner phase availability gate. Phase 1 trains amp-only so
+     * this is almost always 0; the flag exists so legacy v9 .sss files
+     * (whose cells still ship phase floats) keep their gentle low-band
+     * relaxation. */
+    int winner_c_has_phase = (winner_c >= 0
+        && m->cells[color_idx[winner_c]].phase != NULL
+        && m->cells[color_idx[winner_c]].phase_len > 0);
+    int winner_s_has_phase = (winner_s >= 0
+        && m->cells[shape_idx[winner_s]].phase != NULL
+        && m->cells[shape_idx[winner_s]].phase_len > 0);
+    int winner_f_has_phase = (winner_f >= 0
+        && m->cells[face_idx [winner_f]].phase != NULL
+        && m->cells[face_idx [winner_f]].phase_len > 0);
 
     /* Build row targets per (r, c, k) from winner reconstructions:
      *   k < NF_LOW                      → COLOR amp + phase
@@ -912,8 +953,8 @@ int sss_generate(const SSSModel *m,
                 free(ha); free(hp); free(hsa); free(hsp); free(hfa); free(hfp);
                 free(row_in); free(row_amp); free(row_phase); free(row_out);
                 free(col_in); free(col_amp); free(col_phase); free(col_out);
-                free(tgt_row_amp); free(tgt_row_phase); free(tgt_row_has);
-                free(tgt_col_amp); free(tgt_col_phase); free(tgt_col_has);
+                free(tgt_row_amp); free(tgt_row_phase); free(tgt_row_has); free(tgt_row_phase_valid);
+                free(tgt_col_amp); free(tgt_col_phase); free(tgt_col_has); free(tgt_col_phase_valid);
                 free(pool_color); free(pool_shape); free(pool_face);
                 sss_image_free(out);
                 for (int i = 0; i < ntok; ++i) free(tokens[i]);
@@ -956,25 +997,31 @@ int sss_generate(const SSSModel *m,
                 for (int k = 0; k < NF; ++k) {
                     float ta = 0.0f, tp = 0.0f;
                     int   has = 0;
+                    int   phase_src = 0;  /* 0=none, 1=COLOR, 2=SHAPE, 3=FACE */
                     if (k < NF_LOW && cimg) {
-                        ta = bca[k]; tp = bcp[k]; has = 1;
+                        ta = bca[k]; tp = bcp[k]; has = 1; phase_src = 1;
                     } else if (k < NF_LOW * 2 && fimg && simg) {
                         ta = bsa[k] * 0.6f + bfa[k] * 0.4f * detail;
-                        tp = bfp[k]; has = 1;
+                        tp = bfp[k]; has = 1; phase_src = 3;
                     } else if (simg) {
-                        ta = bsa[k]; tp = bsp[k]; has = 1;
+                        ta = bsa[k]; tp = bsp[k]; has = 1; phase_src = 2;
                     } else if (fimg && k >= NF_LOW) {
-                        ta = bfa[k] * detail; tp = bfp[k]; has = 1;
+                        ta = bfa[k] * detail; tp = bfp[k]; has = 1; phase_src = 3;
                     } else if (cimg) {
-                        ta = bca[k]; tp = bcp[k]; has = 1;
+                        ta = bca[k]; tp = bcp[k]; has = 1; phase_src = 1;
                     }
                     /* No source for this bin → leave has=0 so the
                      * radio loop skips the blend (don't pull the
                      * measured amp toward 0). */
+                    int pvalid =
+                        (phase_src == 1 && winner_c_has_phase) ||
+                        (phase_src == 2 && winner_s_has_phase) ||
+                        (phase_src == 3 && winner_f_has_phase);
                     size_t idx = ((size_t)r * 3 + (size_t)c) * (size_t)NF + (size_t)k;
-                    tgt_row_amp[idx]   = ta;
-                    tgt_row_phase[idx] = tp;
-                    tgt_row_has[idx]   = (uint8_t)has;
+                    tgt_row_amp[idx]         = ta;
+                    tgt_row_phase[idx]       = tp;
+                    tgt_row_has[idx]         = (uint8_t)has;
+                    tgt_row_phase_valid[idx] = (uint8_t)(pvalid ? 1 : 0);
                 }
             }
         }
@@ -993,9 +1040,10 @@ int sss_generate(const SSSModel *m,
                 for (int k = 0; k < NF; ++k) {
                     size_t idx = ((size_t)x * 3 + (size_t)c) * (size_t)NF + (size_t)k;
                     if (simg) {
-                        tgt_col_amp[idx]   = bsa[k];
-                        tgt_col_phase[idx] = bsp[k];
-                        tgt_col_has[idx]   = 1u;
+                        tgt_col_amp[idx]         = bsa[k];
+                        tgt_col_phase[idx]       = bsp[k];
+                        tgt_col_has[idx]         = 1u;
+                        tgt_col_phase_valid[idx] = (uint8_t)(winner_s_has_phase ? 1 : 0);
                     }
                     /* else: tgt_col_has is calloc-zeroed, so the loop
                      * leaves the measured spectrum untouched. */
@@ -1010,11 +1058,15 @@ int sss_generate(const SSSModel *m,
 
     /* Spectral noise init — radio static. Build each row of each
      * channel as the inverse-FFT of random amp + random phase. The
-     * tuning loop then nudges this toward the target spectra one
-     * α-step at a time, the way you tune a radio dial.
+     * tuning loop then nudges the amp toward the target one α-step at
+     * a time, the way you tune a radio dial; phase mostly stays at
+     * this init (see phase_alpha logic below).
      *
      * rng_uniform returns [-1, 1); map into [0, 0.3) for amp and
-     * [-π, π) for phase to match the natural FFT ranges. */
+     * [-π, π) for phase to match the natural FFT ranges. Each call
+     * with a distinct seed picks a distinct row_phase[k] sequence,
+     * which is the dominant source of per-seed output diversity in
+     * the Phase 1 amp-only regime. */
     for (int r = 0; r < H; ++r) {
         for (int c = 0; c < 3; ++c) {
             for (int k = 0; k < NF; ++k) {
@@ -1046,11 +1098,22 @@ int sss_generate(const SSSModel *m,
                      :                 0.30f;
     float decay = base_alpha * 0.68f;
 
+    /* Phase 1 phase-relaxation rule (see file header):
+     *   - phase_alpha_base = alpha * 0.05f (1/10th the legacy half-rate)
+     *   - applied only when the source winner cell carried stored
+     *     phase (i.e. legacy v9 file). New amp-only trainings leave
+     *     tgt_*_phase_valid[idx] == 0 and the phase stays at noise init.
+     *   - even when valid, only the low band (bin index k ≤ NF/8)
+     *     relaxes; higher bins keep phase_alpha = 0 so the per-seed
+     *     random phase texture stays intact at high frequencies. */
+    int phase_band_max = NF / 8;
+    if (phase_band_max < 0) phase_band_max = 0;
+
     for (int step = 0; have_any_target && step < steps; ++step) {
         float t = (steps > 1) ? (float)step / (float)(steps - 1) : 0.0f;
-        float alpha       = base_alpha - decay * t;
+        float alpha            = base_alpha - decay * t;
         if (alpha < 0.05f) alpha = 0.05f;
-        float phase_alpha = alpha * 0.5f;
+        float phase_alpha_base = alpha * 0.05f;
 
         /* ── Row tune: pull each row toward the assembled row target. ── */
         for (int r = 0; r < H; ++r) {
@@ -1063,12 +1126,17 @@ int sss_generate(const SSSModel *m,
                     size_t idx = ((size_t)r * 3 + (size_t)c) * (size_t)NF + (size_t)k;
                     if (!tgt_row_has[idx]) continue;
                     float ta = tgt_row_amp[idx];
-                    float tp = tgt_row_phase[idx];
                     row_amp[k] = alpha * ta + (1.0f - alpha) * row_amp[k];
-                    float dph = tp - row_phase[k];
-                    while (dph >  (float)M_PI) dph -= 2.0f * (float)M_PI;
-                    while (dph < -(float)M_PI) dph += 2.0f * (float)M_PI;
-                    row_phase[k] += phase_alpha * dph;
+                    float phase_alpha =
+                        (tgt_row_phase_valid[idx] && k <= phase_band_max)
+                        ? phase_alpha_base : 0.0f;
+                    if (phase_alpha > 0.0f) {
+                        float tp = tgt_row_phase[idx];
+                        float dph = tp - row_phase[k];
+                        while (dph >  (float)M_PI) dph -= 2.0f * (float)M_PI;
+                        while (dph < -(float)M_PI) dph += 2.0f * (float)M_PI;
+                        row_phase[k] += phase_alpha * dph;
+                    }
                 }
                 sss_irfft(row_amp, row_phase, NF, W, row_out);
                 for (int x = 0; x < W; ++x) {
@@ -1095,12 +1163,17 @@ int sss_generate(const SSSModel *m,
                     size_t idx = ((size_t)x * 3 + (size_t)c) * (size_t)NF + (size_t)k;
                     if (!tgt_col_has[idx]) continue;
                     float ta = tgt_col_amp[idx];
-                    float tp = tgt_col_phase[idx];
                     col_amp[k] = alpha * ta + (1.0f - alpha) * col_amp[k];
-                    float dph = tp - col_phase[k];
-                    while (dph >  (float)M_PI) dph -= 2.0f * (float)M_PI;
-                    while (dph < -(float)M_PI) dph += 2.0f * (float)M_PI;
-                    col_phase[k] += phase_alpha * dph;
+                    float phase_alpha =
+                        (tgt_col_phase_valid[idx] && k <= phase_band_max)
+                        ? phase_alpha_base : 0.0f;
+                    if (phase_alpha > 0.0f) {
+                        float tp = tgt_col_phase[idx];
+                        float dph = tp - col_phase[k];
+                        while (dph >  (float)M_PI) dph -= 2.0f * (float)M_PI;
+                        while (dph < -(float)M_PI) dph += 2.0f * (float)M_PI;
+                        col_phase[k] += phase_alpha * dph;
+                    }
                 }
                 sss_irfft(col_amp, col_phase, NF, H, col_out);
                 for (int y = 0; y < H; ++y) {
@@ -1116,8 +1189,8 @@ int sss_generate(const SSSModel *m,
 
     free(row_in); free(row_amp); free(row_phase); free(row_out);
     free(col_in); free(col_amp); free(col_phase); free(col_out);
-    free(tgt_row_amp); free(tgt_row_phase); free(tgt_row_has);
-    free(tgt_col_amp); free(tgt_col_phase); free(tgt_col_has);
+    free(tgt_row_amp); free(tgt_row_phase); free(tgt_row_has); free(tgt_row_phase_valid);
+    free(tgt_col_amp); free(tgt_col_phase); free(tgt_col_has); free(tgt_col_phase_valid);
     free(pool_color); free(pool_shape); free(pool_face);
     for (int i = 0; i < ntok; ++i) free(tokens[i]);
 
