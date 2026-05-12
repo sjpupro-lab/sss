@@ -65,14 +65,17 @@ def _train(out_path: str) -> int:
 
 
 def _load_training_originals() -> list[np.ndarray]:
-    """Return the kitty PPMs as (SIZE, SIZE, 3) float32 RGB in [0, 1]."""
+    """Return the kitty PPMs as (SIZE, SIZE, 3) float32 BGR in [0, 1].
+
+    BGR — both `read_ppm()` and `sss_generate()` return BGR uint8 in
+    this repo, so the PSNR/MSE comparison stays in the same colour
+    order on both sides without an extra conversion."""
     out = []
     sanrio_dir = os.path.join(REPO, "data", "sanrio")
     for fname in sorted(os.listdir(sanrio_dir)):
         if not (fname.startswith(LABEL_PREFIX) and fname.endswith(".ppm")):
             continue
-        # read_ppm returns BGR uint8; sss_generate also returns BGR uint8,
-        # so leave the channel order alone.
+        # Keep BGR (channel order matches sss_generate's output).
         img = read_ppm(os.path.join(sanrio_dir, fname))
         h, w = img.shape[:2]
         yi = np.linspace(0, h - 1, SIZE).round().astype(int)

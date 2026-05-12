@@ -20,14 +20,21 @@ then::
     python3 tools/test_sss_unified.py       # smoke test
 
 SSS .sss format compat (Phase 1):
-    * Reader still accepts SSS_VERSION 9 files that ship a non-empty
-      `phase` field per cell — the bytes are loaded but immediately
-      dropped (see CEMemory.add and `_block_from_amp_phase`). The
-      C-side `sss_io.c` does the same; the field is treated as
-      reserved padding pending Phase 2's .sfb format.
+    * Python paths drop phase: `CEMemory.add(phase=...)` warns and
+      discards the value, and `_block_from_amp_phase` reconstructs
+      from amp + zero-phase. Cells produced through this module
+      carry `phase = None`.
+    * The C generator (`ce_core/sss_rowvae.c`) is more lenient: when
+      a legacy v9 .sss ships non-empty per-cell `phase[]` bytes, it
+      keeps them and runs a strongly-attenuated, low-band-only phase
+      relaxation (`phase_alpha = alpha * 0.05`, k ≤ NF/8). That path
+      is purely a backward-compat affordance for older files — the
+      writer side now emits `phase_len = 0`.
     * Writer paths (`scripts/sss_train.py`, `ingest_labeled_image`)
       no longer emit phase data. New files are byte-compatible with
       v9 readers because `phase_len = 0` is a legal v9 value.
+    * Phase 2 introduces a `.sfb` format that drops the `phase_len`
+      field entirely.
 """
 from __future__ import annotations
 
@@ -559,8 +566,12 @@ class CEMemory(_BridgedCEMemory):
 
         Optional spectrogram fields (kept Python-side; CEStorage only
         sees the canny + color bytes via the bridge):
-            amp      — list of per-(row, channel) rfft amplitudes
-                       (length = block_height * 3, each entry shape (NF,))
+            amp      — contiguous float32 ndarray of shape
+                       `(block_height, 3, NF)` (per-(row, channel) rfft
+                       amplitudes; see `tools.sss_ingest._block_fft`).
+                       Older callers that passed a list of per-row
+                       arrays are no longer supported by the
+                       reconstruction helpers.
             phase    — DEPRECATED in Phase 1 amp-only radio tuning.
                        The signature is retained for backward compat
                        with older callers that still pass `phase=...`;
@@ -900,9 +911,12 @@ class SculptGenerator:
             sr = min(int(r * cell_bh / max(1, bh)), cell_bh - 1)
             # phase may exist on legacy in-memory cells but is treated
             # as absent on the storage layer (see add(phase=...) note).
-            phases = cell.get("phase")
-            phases = np.asarray(phases) if (phases is not None
-                                            and np.asarray(phases).shape == amps.shape) else None
+            raw_phase = cell.get("phase")
+            if raw_phase is not None:
+                ph = np.asarray(raw_phase)
+                phases = ph if ph.shape == amps.shape else None
+            else:
+                phases = None
             for c in range(3):
                 if phases is not None:
                     spec = amps[sr, c] * np.exp(1j * phases[sr, c])

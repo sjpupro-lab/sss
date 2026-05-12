@@ -86,7 +86,7 @@ def main() -> int:
 
         # ── Re-ingest the same image: amplitudes must be byte-identical.
         # The trainer is purely a function of the pixel input (no random
-        # phase, no random scaling), so two passes over the same PPM
+        # phase, no random scaling), so two passes over the same PNG
         # should produce the same amp arrays. Phase, by design, is not
         # stored at all and so isn't part of this comparison.
         before2 = pipe.memory.total_cells()

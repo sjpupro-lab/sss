@@ -2,8 +2,14 @@
  *
  * Two stages, sharing the same per-cell amplitude storage. Phase 1
  * (amp-only radio tuning) drops per-cell phase from the trained model:
- * the writer no longer emits phase bytes and this reader treats any
- * legacy SSS_VERSION-9 phase data as reserved padding.
+ * the writer no longer emits phase bytes. This reader is more lenient
+ * for backward compatibility — when a legacy SSS_VERSION-9 .sss still
+ * ships non-empty `cell->phase`, the reconstruction helpers
+ * (`reconstruct_*_cell`) and the Stage-2 radio loop will consume it
+ * for a strongly-attenuated, low-band-only phase relaxation
+ * (`phase_alpha = alpha * 0.05`, k ≤ NF/8). New cells (`phase_len = 0`,
+ * `cell->phase == NULL`) skip that relaxation entirely so the phase
+ * free-evolves from the per-seed random init.
  *
  *   ── Sculpt (PR #19) ──────────────────────────────────────────
  *   Decides *what* to draw. Collects every candidate cell whose

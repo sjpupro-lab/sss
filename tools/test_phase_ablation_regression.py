@@ -42,9 +42,12 @@ MSE_THRESH  = 0.05  # 60 % of GPT-measured 0.0852
 
 
 def _load_reference() -> np.ndarray:
-    """Pick the first kitty PPM as a reference and resize to 64×64
-    BGR uint8 → float32 in [0, 1]. Bgr/rgb doesn't matter for the
-    MSE — both sides go through the same pipeline."""
+    """Pick the first PPM under `data/sanrio` (sorted lexicographically
+    — currently a keroppi sample) and resize to 64×64 as float32 in
+    [0, 1]. The identity of the image doesn't matter for the FFT-level
+    ablation: any non-trivial reference produces the same amp-only
+    diversity claim. BGR/RGB also doesn't matter — both sides of every
+    MSE go through the same channel order."""
     candidates = []
     sanrio_dir = os.path.join(REPO, "data", "sanrio")
     for fname in sorted(os.listdir(sanrio_dir)):
