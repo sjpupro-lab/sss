@@ -18,10 +18,13 @@
  *
  * Consequence at generate time: the generator synthesises **a new
  * signal** that follows the motif's envelope. No row, pixel, or
- * fragment of a training image is ever directly invoked. The same
- * (motif, seed) pair produces a fresh waveform each call by design —
- * the diversity that Phase 1's per-seed random phase added at the
- * spectrogram level continues to hold here at the motif level.
+ * fragment of a training image is ever directly invoked. Generation
+ * is deterministic per seed — a fixed seed reproduces the same
+ * output bit-for-bit — but varying the seed varies the waveform
+ * (the per-seed random phase init from Phase 1's spectrogram
+ * generator continues to hold at the motif level). Reproducibility
+ * for a fixed seed is an engine guarantee; nondeterminism is not
+ * introduced.
  *
  * This is enforced by the on-disk schema below: there is simply no
  * field in which a writer could smuggle phase, row order, or pixel

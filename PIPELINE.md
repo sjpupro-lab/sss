@@ -235,10 +235,11 @@ verify_hybrid <img1.ppm> [<img2.ppm> ...]
 
 - 생성기는 motif의 envelope를 따르는 **새 신호**를 합성한다.
   학습 이미지의 어떤 행이나 픽셀도 직접 호출되지 않는다.
-- 같은 `(motif, seed)` 조합에서도 매 호출마다 다른 파형이
-  나오도록 설계되어 있다 — Phase 1의 per-seed random phase가
-  스펙트로그램 레벨에서 보장하던 다양성이 motif 레벨에서도
-  그대로 유지된다.
+- 생성은 seed에 대해 결정론적이다 — 같은 seed는 같은 출력을
+  비트 단위로 재현한다. seed를 바꾸면 파형이 바뀐다. Phase 1의
+  per-seed random phase가 스펙트로그램 레벨에서 보장하던
+  다양성이 motif 레벨에서도 그대로 유지되며, 의도되지 않은
+  nondeterminism은 추가되지 않는다.
 
 이 설계 철학은 다음 위치에 기재되어 있다:
 

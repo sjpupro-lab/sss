@@ -16,8 +16,11 @@ tendency" — and absolutely nothing else:
 
 Consequence at generate time: the generator synthesises a **new
 signal** following the motif's envelope. No row, pixel, or fragment
-of a training image is ever directly invoked. The same (motif, seed)
-pair produces a fresh waveform each call by design.
+of a training image is ever directly invoked. Generation is
+deterministic per seed — a fixed seed reproduces the same output —
+but varying the seed varies the waveform (the per-seed random phase
+init from Phase 1's spectrogram generator continues to hold at the
+motif level).
 
 Where .sss stored raw per-cell FFT amplitudes inside the model,
 .sfb stores higher-level *motif* records (token-scoped amplitude
