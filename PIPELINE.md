@@ -212,6 +212,44 @@ verify_hybrid <img1.ppm> [<img2.ppm> ...]
 
 ---
 
+## Feature Spectral Dictionary (`.sfb` 설계 철학)
+
+`.sfb`는 **이미지 원본 저장소가 아니라 모티프(motif) 단위의
+주파수 사전(feature spectral dictionary)** 이다. 이 원칙은
+파일 포맷 자체에 의해 강제된다 — 위반하려면 SFB_VERSION을
+올려야 한다.
+
+확립된 규칙 (모두 `ce_core/sss_feature_bank.h` 헤더 주석에 명시):
+
+- **위상은 어떤 형태로도 저장되지 않는다.** Phase 1에서
+  스펙트로그램 생성기에 대해 확립한 amp-only 원칙을
+  motif/relation/identity 모든 레코드 레벨로 확장.
+- **행(row) 단위 FFT 저장을 폐기한다.** 레거시 .sss v9의
+  per-(row, channel) FFT 진폭 `(H × NF × 3)` 레이아웃은 motif당
+  128-bin row_freq envelope 하나로 축약된다. 행 인덱스도, 행
+  순서도, 행별 스펙트럼도 sfb에 존재하지 않는다.
+- **원본 픽셀 좌표는 저장되지 않는다.** `position_heatmap`은
+  16×16 거친 확률 분포일 뿐, 픽셀 주소 지정 가능한 맵이 아니다.
+
+이로 인한 생성 시 동작:
+
+- 생성기는 motif의 envelope를 따르는 **새 신호**를 합성한다.
+  학습 이미지의 어떤 행이나 픽셀도 직접 호출되지 않는다.
+- 같은 `(motif, seed)` 조합에서도 매 호출마다 다른 파형이
+  나오도록 설계되어 있다 — Phase 1의 per-seed random phase가
+  스펙트로그램 레벨에서 보장하던 다양성이 motif 레벨에서도
+  그대로 유지된다.
+
+이 설계 철학은 다음 위치에 기재되어 있다:
+
+- `ce_core/sss_feature_bank.h` — 파일 상단 "Design philosophy" 블록
+- `tools/sss_feature_bank.py` — 모듈 docstring 첫 블록
+- 본 PIPELINE.md 섹션
+- README "feature bank" 섹션의 한 줄 요약 ("이미지 복원 모델이
+  아닌 특징 사전 모델")
+
+---
+
 ## `.sfb` Feature Bank (Phase 2 산출물)
 
 `ce_core/sss_feature_bank.{h,c}` + `tools/sss_feature_bank.py` 추가로

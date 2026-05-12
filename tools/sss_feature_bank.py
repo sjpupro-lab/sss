@@ -1,7 +1,25 @@
 """sss_feature_bank — Python I/O for the .sfb (SSS Feature Bank) format.
 
-The .sfb format is the Phase 2 successor to the legacy .sss v9 model
-file. Where .sss stored raw per-cell FFT amplitudes inside the model,
+The .sfb file is a **feature spectral dictionary**, not an image
+repository. The unit of storage is a *motif*, never a pixel or a row.
+A motif represents "an abstract feature with a particular frequency
+tendency" — and absolutely nothing else:
+
+  * No phase is ever written to disk (Phase 1 established this for
+    the spectrogram generator; .sfb extends the rule to every higher
+    feature).
+  * No row indices, no row order, no per-row spectra. The legacy
+    .sss v9 (H × NF × 3) per-row layout collapses into a single
+    128-bin row_freq envelope per motif.
+  * No original pixel coordinates. position_heatmap is a coarse
+    16×16 probability surface, not a pixel-addressable map.
+
+Consequence at generate time: the generator synthesises a **new
+signal** following the motif's envelope. No row, pixel, or fragment
+of a training image is ever directly invoked. The same (motif, seed)
+pair produces a fresh waveform each call by design.
+
+Where .sss stored raw per-cell FFT amplitudes inside the model,
 .sfb stores higher-level *motif* records (token-scoped amplitude
 envelopes + spatial heatmap), directed *relations* between motifs, and
 *identity* clusters that bundle motifs into named concepts.

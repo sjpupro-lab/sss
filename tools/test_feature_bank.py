@@ -369,6 +369,69 @@ def test_benchmark(tmp: str) -> None:
               f"load={t_load*1000:.0f}ms)")
 
 
+def test_header_record_size_matches_sizeof(tmp: str) -> None:
+    """The header's `*_record_size` fields must equal the actual on-disk
+    stride. A mismatch would silently shift every record and corrupt
+    the load (or, with the v2 stride loop, drop into the unintended
+    "v2 extended" path). This pins both writers — Python and C — to
+    the documented record sizes.
+
+    Strategy: save a small bank, parse the header back, then verify
+    that the stride implied by `*_record_size × *_count` lines up
+    exactly with the actual byte count between the header end and the
+    next record block boundary."""
+    bank = _build_bank(3, 4, 2, seed=123)
+    path = os.path.join(tmp, "header_check.sfb")
+    bank.save(path)
+    with open(path, "rb") as f:
+        blob = f.read()
+
+    # Pull the documented widths straight out of the header.
+    (magic, version,
+     n_motifs, n_relations, n_identities,
+     motif_rs, relation_rs, identity_rs,
+     _flags, _reserved, _reserved2) = struct.unpack_from(
+        "<4sI III HHHHQI", blob, 0)
+
+    assert magic == SFB_MAGIC, f"magic {magic!r}"
+    assert version == SFB_VERSION
+
+    # The header's record sizes must equal the canonical Python record
+    # sizes — same constants the C statics assert on.
+    assert motif_rs    == MOTIF_RECORD_SIZE, \
+        f"header motif_record_size={motif_rs} != {MOTIF_RECORD_SIZE}"
+    assert relation_rs == RELATION_RECORD_SIZE, \
+        f"header relation_record_size={relation_rs} != {RELATION_RECORD_SIZE}"
+    assert identity_rs == IDENTITY_RECORD_SIZE, \
+        f"header identity_record_size={identity_rs} != {IDENTITY_RECORD_SIZE}"
+
+    # And the file's overall byte count must equal header + the three
+    # record-size × count strides, with no padding between arrays.
+    expected = 40 + motif_rs * n_motifs + relation_rs * n_relations \
+                  + identity_rs * n_identities
+    assert len(blob) == expected, \
+        f"file size {len(blob)} != header(40) + strides {expected}"
+
+    # Cross-implementation check: build the same bank through the C
+    # writer and confirm its header reports identical record sizes.
+    c_path = os.path.join(tmp, "header_check_c.sfb")
+    save_via_c(bank, c_path)
+    with open(c_path, "rb") as f:
+        c_blob = f.read()
+    (_c_magic, _c_version,
+     _c_nm, _c_nr, _c_ni,
+     c_motif_rs, c_relation_rs, c_identity_rs,
+     _c_flags, _c_reserved, _c_reserved2) = struct.unpack_from(
+        "<4sI III HHHHQI", c_blob, 0)
+    assert (c_motif_rs, c_relation_rs, c_identity_rs) \
+        == (motif_rs, relation_rs, identity_rs), \
+        "C and Python writers disagree on header record_size fields"
+
+    print(f"OK  header rs   : motif={motif_rs} relation={relation_rs} "
+          f"identity={identity_rs} (C & Python agree, file size matches "
+          f"header strides)")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         test_roundtrip(tmp)
@@ -380,6 +443,7 @@ def main() -> int:
         test_bad_magic_and_version(tmp)
         test_python_save_c_load(tmp)
         test_c_save_python_load(tmp)
+        test_header_record_size_matches_sizeof(tmp)
         test_benchmark(tmp)
     print("PASS")
     return 0

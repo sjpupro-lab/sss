@@ -1,5 +1,34 @@
 /* sss_feature_bank.h — Phase 2 .sfb (SSS Feature Bank) on-disk format.
  *
+ * ── Design philosophy ─────────────────────────────────────────────
+ *
+ * The .sfb file is a **feature spectral dictionary**, not an image
+ * repository. The unit of storage is a *motif*, never a pixel or a
+ * row. A motif represents "an abstract feature with a particular
+ * frequency tendency" and absolutely nothing else:
+ *
+ *   - No phase information is ever written to disk. Phase 1 already
+ *     established this for the spectrogram generator; .sfb extends
+ *     the same rule to every higher-level feature.
+ *   - No row indices, no row order, no per-row spectra. The legacy
+ *     .sss v9 layout's (H × NF × 3) per-row FFT amplitudes are
+ *     collapsed into a single 128-bin row_freq envelope per motif.
+ *   - No original pixel coordinates. position_heatmap is a coarse
+ *     16×16 probability surface, not a pixel-addressable map.
+ *
+ * Consequence at generate time: the generator synthesises **a new
+ * signal** that follows the motif's envelope. No row, pixel, or
+ * fragment of a training image is ever directly invoked. The same
+ * (motif, seed) pair produces a fresh waveform each call by design —
+ * the diversity that Phase 1's per-seed random phase added at the
+ * spectrogram level continues to hold here at the motif level.
+ *
+ * This is enforced by the on-disk schema below: there is simply no
+ * field in which a writer could smuggle phase, row order, or pixel
+ * data without bumping the file version.
+ *
+ * ── Layout overview ──────────────────────────────────────────────
+ *
  * A feature bank is a flat, self-describing collection of three
  * record arrays:
  *   - Motifs:     per-token amplitude envelopes (row/col/colour

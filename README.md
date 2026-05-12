@@ -43,7 +43,24 @@ produced by the scripts in this repo on the bundled `data/sanrio`
    keyframe / Δ                         block + SLIG entries (CEStorage)
         │                                    │
    ai_save *.spai                       ce_storage_save *.ces
+                                             │
+                                       motif aggregation (Phase 3)
+                                             │
+                                       feature_bank.sfb
+                                       (motif dictionary —
+                                        amp envelopes + relations
+                                        + identities, no pixels,
+                                        no rows, no phase)
+                                             │
+                                       sss_generate (synthesises
+                                       new signal per seed)
 ```
+
+The `.sfb` node is a **feature dictionary, not an image-restore
+model**. Generation reads motif envelopes and synthesises fresh
+signals — no row or pixel of a training image is ever directly
+invoked. See ["Feature bank — `.sfb` format"](#feature-bank---sfb-format-phase-2)
+below.
 
 ---
 
@@ -636,6 +653,15 @@ phases give every seed a different texture (~0.11 mean pixel diff).
 ---
 
 ## Feature bank — `.sfb` format (Phase 2)
+
+> **`.sfb` is a feature dictionary, not an image-restore model.**
+> The unit of storage is a *motif*, never a pixel or a row. No phase,
+> no row order, no per-row spectra, no original pixel coordinates are
+> ever written. Generation synthesises a new signal that follows the
+> motif's envelope — no row or pixel of a training image is directly
+> invoked. The on-disk schema enforces this: there is no field in
+> which a writer could smuggle phase or pixel data without bumping
+> the file version.
 
 The `.sfb` (SSS Feature Bank) file is the Phase 2 successor to the
 `.sss` v9 model file. Where `.sss` stored raw per-cell FFT amplitudes
