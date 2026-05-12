@@ -635,6 +635,53 @@ phases give every seed a different texture (~0.11 mean pixel diff).
 
 ---
 
+## Feature bank — `.sfb` format (Phase 2)
+
+The `.sfb` (SSS Feature Bank) file is the Phase 2 successor to the
+`.sss` v9 model file. Where `.sss` stored raw per-cell FFT amplitudes
+for a single spectrogram-based generator, `.sfb` stores **higher-level
+features**:
+
+  | Record   | Size (B) | What it holds                                                                                             |
+  | -------- | -------- | --------------------------------------------------------------------------------------------------------- |
+  | Motif    |   2 864  | per-token row + column + RGB-colour amplitude envelopes (128 bins each) + 16×16 position heatmap + scalar coherence / confidence / activation_count / variation_cluster_id |
+  | Relation |      20  | directed (src → dst) edge with a typed spatial hint (`above / below / left / right / near / around / inside`) + learned weight |
+  | Identity |     104  | named cluster of up to 32 motif ids forming a single concept (e.g. `kitty = ear + eye + bow`) + confidence |
+
+The format is `pack(1)` little-endian. A 40-byte header records every
+count and every record size so v2 can grow records (e.g. Phase 4
+motion fields) by bumping `*_record_size` without breaking v1 readers
+— readers stride by the header-supplied record size and ignore unknown
+trailing bytes.
+
+Both writers (`ce_core/sss_feature_bank.c` and `tools/sss_feature_bank.py`)
+produce **byte-identical** files for the same content. The Python side
+exposes `SSSFeatureBank.save(path)` / `SSSFeatureBank.load(path)`; the
+C side exposes `sss_feature_bank_save` / `sss_feature_bank_load` and a
+ctypes-friendly bridge in `sss_pybridge`.
+
+`tools/test_feature_bank.py` locks in:
+
+  - Bit-exact round-trips at 100 × 200 × 5 records
+  - Second-save byte-determinism
+  - Korean label codepoint-aware truncation at the 32-byte boundary
+  - Empty bank → 40-byte header only
+  - Invalid relation ids / relation_type / identity motif_count rejection
+  - Bad magic / version rejection with the correct `SFB_ERR_*` code
+  - Python-save ↔ C-load and C-save ↔ Python-load round-trips
+  - **1000 motif × 5000 relation × 50 identity benchmark in under 100 ms** each way
+  - `position_heatmap` uint8 quantisation round-trip error ≤ 1/255
+
+The `position_heatmap` is float32 [0, 1] in memory but `uint8` on disk
+(quantise with `* 255` + round, dequantise with `/ 255`). This drops
+the per-motif heatmap from 1 024 B to 256 B without visible loss.
+
+Phase 3 will write the new SSS trainer's output through this format
+instead of `.sss`; Phase 4 will grow the motif record with motion
+fields.
+
+---
+
 ## Python perception / orchestration layer
 
 The new modules wrap the C engine in a single deterministic Python

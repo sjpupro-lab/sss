@@ -152,6 +152,43 @@ uint16_t sss_atmos_scene_persist(sss_memory *mem,
                                  uint32_t canvas_id,
                                  uint16_t scene_id);
 
+/* ── Phase 2 feature bank pybridge ──────────────────────────────────
+ *
+ * Thin ctypes-friendly wrappers around sss_feature_bank_save / load.
+ * The caller hands us tightly-packed motif/relation/identity buffers
+ * (one record-size block per record, no padding) — exactly the bytes
+ * tools/sss_feature_bank.py already produces. We slot those into an
+ * SSSFeatureBank and delegate to the C save / load.
+ *
+ * Both functions return SFB_OK (0) on success or a negative SFB_ERR_*. */
+int sss_pybridge_feature_bank_save(const char    *path,
+                                   const uint8_t *motifs_buf,
+                                   uint32_t       motif_count,
+                                   const uint8_t *relations_buf,
+                                   uint32_t       relation_count,
+                                   const uint8_t *identities_buf,
+                                   uint32_t       identity_count);
+
+/* Load into caller-provided buffers. Caller passes the buffer sizes
+ * in *out_*_count (capacity); on success they're overwritten with the
+ * actual count read. If the file holds more records than capacity,
+ * returns SFB_ERR_ALLOC and writes the required counts. */
+int sss_pybridge_feature_bank_load(const char *path,
+                                   uint8_t   *motifs_buf,
+                                   uint32_t  *out_motif_count,
+                                   uint8_t   *relations_buf,
+                                   uint32_t  *out_relation_count,
+                                   uint8_t   *identities_buf,
+                                   uint32_t  *out_identity_count);
+
+/* Header-only probe for callers that need to size the buffers before
+ * the full load. Fills *out_*_count from the header and returns
+ * SFB_OK; the file is closed before returning. */
+int sss_pybridge_feature_bank_probe(const char *path,
+                                    uint32_t   *out_motif_count,
+                                    uint32_t   *out_relation_count,
+                                    uint32_t   *out_identity_count);
+
 #ifdef __cplusplus
 }
 #endif

@@ -126,6 +126,34 @@ def _load_lib():
         ]
         lib.sss_pybridge_ce_distance.restype = ctypes.c_uint32
 
+    # Phase 2 .sfb feature-bank bridge. Gate via hasattr so callers on
+    # older .so builds keep working — they just lose the C round-trip
+    # test surface.
+    if hasattr(lib, "sss_pybridge_feature_bank_save"):
+        lib.sss_pybridge_feature_bank_save.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32,
+        ]
+        lib.sss_pybridge_feature_bank_save.restype = ctypes.c_int
+    if hasattr(lib, "sss_pybridge_feature_bank_probe"):
+        lib.sss_pybridge_feature_bank_probe.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        lib.sss_pybridge_feature_bank_probe.restype = ctypes.c_int
+    if hasattr(lib, "sss_pybridge_feature_bank_load"):
+        lib.sss_pybridge_feature_bank_load.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint32),
+        ]
+        lib.sss_pybridge_feature_bank_load.restype = ctypes.c_int
+
     return lib
 
 
