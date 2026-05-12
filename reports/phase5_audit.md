@@ -209,32 +209,16 @@ Lines in `ui/`, `scripts/`, `tools/test_*.py`, `docs/`, `README.md`, `PIPELINE.m
 ### Makefile target lines (raw)
 
 **`sss_gen`:**
-  - Makefile:66: # it linkable inside the default OBJS list. sss_rowvae (sss_gen +
-  - Makefile:77: sss_animate sss_gen verify_hybrid wave_debug
-  - Makefile:202: $(BUILD_DIR)/sss_gen: tools/sss_gen.c $(OBJS) | $(BUILD_DIR)
-  - Makefile:205: sss_gen: $(BUILD_DIR)/sss_gen
-  - Makefile:206: @echo "Built sss_gen. Pipeline:"
-  - Makefile:209: @echo "  ./build/sss_gen build/models/demo.sss \"red circle draw\" out.ppm 1 1.0"
-  - Makefile:266: @echo "Built gen_image_ce (legacy — sss_gen is the main path now)."
+  - Makefile:202 [rule]: $(BUILD_DIR)/sss_gen: tools/sss_gen.c $(OBJS) | $(BUILD_DIR)
+  - Makefile:205 [alias]: sss_gen: $(BUILD_DIR)/sss_gen
 
 **`sss_animate`:**
-  - Makefile:77: sss_animate sss_gen verify_hybrid wave_debug
-  - Makefile:215: $(BUILD_DIR)/sss_animate: tools/sss_animate.c $(OBJS) | $(BUILD_DIR)
-  - Makefile:218: sss_animate: $(BUILD_DIR)/sss_animate
-  - Makefile:219: @echo "Built sss_animate. Examples:"
-  - Makefile:220: @echo "  ./build/sss_animate input.ppm  build/atmos_anim 60"
-  - Makefile:221: @echo "  ./build/sss_animate input.ppm  build/atmos_anim 120 256 256"
+  - Makefile:215 [rule]: $(BUILD_DIR)/sss_animate: tools/sss_animate.c $(OBJS) | $(BUILD_DIR)
+  - Makefile:218 [alias]: sss_animate: $(BUILD_DIR)/sss_animate
 
 **`gen_image_ce`:**
-  - Makefile:4: # CLI tools (gen_image_ce, train_demo, train_images_ce) live in
-  - Makefile:76: legacy_demo demo_tools train_images_ce gen_image_ce \
-  - Makefile:95: # kept reachable for gen_image_ce and test_gen_routed but tagged so
-  - Makefile:198: $(BUILD_DIR)/gen_image_ce: $(LEGACY_DEPRECATED_DIR)/gen_image_ce.c $(OBJS) | $(BUILD_DIR)
-  - Makefile:251: legacy_demo: $(BUILD_DIR)/make_demo_dataset $(BUILD_DIR)/train_demo $(BUILD_DIR)/gen_image_ce $(BUILD_DIR)/verify_hybrid
-  - Makefile:255: @echo "  ./build/gen_image_ce build/models/demo.ces \"red apple\" out.ppm 0 50 200"
-  - Makefile:265: gen_image_ce: $(BUILD_DIR)/gen_image_ce
-  - Makefile:266: @echo "Built gen_image_ce (legacy — sss_gen is the main path now)."
-  - Makefile:267: @echo "  ./build/gen_image_ce build/synth/demo.ces \"red apple\" out.ppm 0 50 200"
+  - Makefile:198 [rule]: $(BUILD_DIR)/gen_image_ce: $(LEGACY_DEPRECATED_DIR)/gen_image_ce.c $(OBJS) | $(BUILD_DIR)
+  - Makefile:265 [alias]: gen_image_ce: $(BUILD_DIR)/gen_image_ce
 
 ## 3. CLI option mapping
 
@@ -369,7 +353,7 @@ After Phase 5 removal: 38 binaries (drops `sss_animate` and `gen_image_ce`).
 
 Observed integration footprint outside Makefile: 17 UI line(s), 0 script line(s), 0 test line(s). All callers are in-repo and reachable in a single PR.
 
-**Scenario A (immediate removal) is the recommended path.** Repo-wide grep shows no external integrators, and the test suite already exercises `sss_gen` end-to-end via `tools/test_synthesizer.py` + the Phase 4 trainers. Migrating the two UI handlers (`ui/server.py`, `ui/unified_server.py`) and the one helper script (`scripts/make_anim_frames.py`) atomically with the Makefile cleanup is the smallest total diff.
+**Scenario A (immediate removal) is the recommended path.** Repo-wide grep shows no external integrators, and the test suite already exercises `sss_gen` end-to-end via `tools/test_synthesizer.py` + the Phase 4 trainers. Migrating the UI handlers (`ui/index.html`, `ui/server.py`, `ui/start.sh`, `ui/unified_server.py`) and no helper scripts (scripts/ scan = 0) atomically with the Makefile cleanup is the smallest total diff.
 
 **Fallback to Scenario C (deprecation warning)** is acceptable if Phase 5 wants to split the work into a small "warn and doc" PR followed by a removal PR — useful if reviewers want to land the UI rewrite and the C cleanup separately.
 
@@ -415,8 +399,8 @@ this phase is supposed to remove.
 
 ### build
 
-- sss_animate: 6 Makefile mention(s); 9 integration line(s) outside Makefile.
-- gen_image_ce: 9 Makefile mention(s); 45 integration line(s) outside Makefile.
+- sss_animate: 2 Makefile target line(s); 1 integration line(s) outside Makefile.
+- gen_image_ce: 2 Makefile target line(s); 34 integration line(s) outside Makefile.
 
 ### runtime
 

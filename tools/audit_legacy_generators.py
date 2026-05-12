@@ -172,7 +172,11 @@ def _walk_files(root: Path, exts: Iterable[str] | None = None
             continue
         if exts and p.suffix not in exts:
             continue
-        if any(part.startswith(".git") for part in p.parts):
+        # Skip the `.git` working tree but NOT `.github` workflows /
+        # docs — startswith(".git") would catch both. Match the
+        # path segment exactly (and `.git/` for safety on rare
+        # implementations that yield the trailing slash).
+        if any(part == ".git" for part in p.parts):
             continue
         out.append(p)
     return out
@@ -218,13 +222,34 @@ def _scan_integration() -> dict[str, dict[str, list[tuple[str, int, str]]]]:
 # ── Build target / Makefile analysis ────────────────────────────
 
 def _scan_makefile() -> dict[str, list[str]]:
-    """Find Makefile targets that produce each generator's binary."""
+    """Find Makefile lines that actually define a target / alias /
+    phony for each generator binary. Specifically matches:
+
+        $(BUILD_DIR)/<bin>:    rule that builds the binary
+        <bin>:                 alias / phony entry
+        .PHONY: … <bin> …      .PHONY declarations
+
+    Substring grep would over-count (e.g. an `@echo` line for one
+    binary mentioning another's name). The label below names each
+    captured line by *kind* so the report stays readable."""
     text = _read(REPO / "Makefile")
     out = {g: [] for g in GENERATORS}
+    rule_re   = {g: re.compile(rf"^\$\(BUILD_DIR\)/{re.escape(g)}\s*:")
+                 for g in GENERATORS}
+    alias_re  = {g: re.compile(rf"^{re.escape(g)}\s*:")
+                 for g in GENERATORS}
+    phony_re  = {g: re.compile(rf"^\.PHONY:.*\b{re.escape(g)}\b")
+                 for g in GENERATORS}
     for i, line in enumerate(text.splitlines(), 1):
+        s = line.rstrip()
         for g in GENERATORS:
-            if g in line:
-                out[g].append(f"Makefile:{i}: {line.strip()[:140]}")
+            kind = None
+            if rule_re[g].match(s):    kind = "rule"
+            elif alias_re[g].match(s): kind = "alias"
+            elif phony_re[g].match(s): kind = "phony"
+            if kind:
+                out[g].append(f"Makefile:{i} [{kind}]: "
+                              f"{line.strip()[:140]}")
     return out
 
 
@@ -456,9 +481,12 @@ def _build_risks(integ: dict, makefile_hits: dict) -> dict[str, list[str]]:
     risks: dict[str, list[str]] = defaultdict(list)
     for g, hits in makefile_hits.items():
         if g == "sss_gen": continue
-        n_caller_lines = sum(len(integ[c][g]) for c in integ)
+        # "Outside Makefile" must exclude the `make` category — that
+        # category re-grep's the Makefile and would double-count.
+        n_caller_lines = sum(
+            len(integ[c][g]) for c in integ if c != "make")
         risks["build"].append(
-            f"{g}: {len(hits)} Makefile mention(s); "
+            f"{g}: {len(hits)} Makefile target line(s); "
             f"{n_caller_lines} integration line(s) outside Makefile.")
     for g in ("sss_animate", "gen_image_ce"):
         ui_hits = integ["ui"][g]
@@ -487,7 +515,11 @@ def _build_risks(integ: dict, makefile_hits: dict) -> dict[str, list[str]]:
 # ── Report rendering ────────────────────────────────────────────
 
 def _table(rows: list[tuple[str, ...]], header: tuple[str, ...]) -> str:
-    cols = list(zip(*([header] + rows))) if rows else [header]
+    # Build cols uniformly from `[header] + rows` so the helper
+    # produces one column per header entry even when `rows` is
+    # empty. (Earlier `rows else [header]` path treated the header
+    # tuple as a single column on empty input.)
+    cols = list(zip(*([header] + rows)))
     widths = [max(len(str(x)) for x in col) for col in cols]
     def line(items): return ("| " + " | ".join(
         str(it).ljust(w) for it, w in zip(items, widths)) + " |")
@@ -644,20 +676,46 @@ def render_report(info: dict[str, GeneratorInfo],
                              for g in ("sss_animate", "gen_image_ce"))
     test_hits_total = sum(len(integ["tests"][g])
                           for g in ("sss_animate", "gen_image_ce"))
+    # Resolve the specific UI and script files that actually hit a
+    # legacy generator name, so the recommendation cites real paths
+    # instead of a hand-coded guess.
+    ui_paths = sorted({
+        p for g in ("sss_animate", "gen_image_ce")
+        for (p, _ln, _txt) in integ["ui"][g]
+    })
+    script_paths = sorted({
+        p for g in ("sss_animate", "gen_image_ce")
+        for (p, _ln, _txt) in integ["scripts"][g]
+    })
+
     L.append("### Recommendation\n")
     L.append(
         f"Observed integration footprint outside Makefile: "
         f"{ui_hits_total} UI line(s), {scripts_hits_total} script "
         f"line(s), {test_hits_total} test line(s). "
         "All callers are in-repo and reachable in a single PR.\n")
+
+    if ui_paths:
+        ui_str = ", ".join(f"`{p}`" for p in ui_paths)
+        ui_clause = f"the UI handlers ({ui_str})"
+    else:
+        ui_clause = "no UI handlers"
+    if script_paths:
+        script_str = ", ".join(f"`{p}`" for p in script_paths)
+        script_clause = (
+            f" and the helper script(s) ({script_str})")
+    else:
+        # The scan found zero script hits — say so explicitly rather
+        # than hard-coding a path that turned out not to reference
+        # either legacy binary.
+        script_clause = " and no helper scripts (scripts/ scan = 0)"
+
     L.append(
         "**Scenario A (immediate removal) is the recommended path.** "
         "Repo-wide grep shows no external integrators, and the test "
         "suite already exercises `sss_gen` end-to-end via "
         "`tools/test_synthesizer.py` + the Phase 4 trainers. "
-        "Migrating the two UI handlers (`ui/server.py`, "
-        "`ui/unified_server.py`) and the one helper script "
-        "(`scripts/make_anim_frames.py`) atomically with the "
+        f"Migrating {ui_clause}{script_clause} atomically with the "
         "Makefile cleanup is the smallest total diff.\n")
     L.append(
         "**Fallback to Scenario C (deprecation warning)** is acceptable "
