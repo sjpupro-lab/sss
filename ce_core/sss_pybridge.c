@@ -361,6 +361,10 @@ uint16_t sss_atmos_scene_persist(sss_memory *mem,
  * struct.pack, we can reinterpret the buffer as an array of structs
  * with a single cast — no per-record copy. */
 
+/* Phase 4 v2 extension to the pybridge save path. The buffers are
+ * optional — Phase 2 callers can pass NULL/0 for conditions_buf and
+ * responses_buf and behaviour is identical to the old v2-with-no-
+ * conditions case (v2 file with condition_count == 0). */
 int sss_pybridge_feature_bank_save(const char    *path,
                                    const uint8_t *motifs_buf,
                                    uint32_t       motif_count,
@@ -380,6 +384,29 @@ int sss_pybridge_feature_bank_save(const char    *path,
     return sss_feature_bank_save(path, &bank);
 }
 
+int sss_pybridge_feature_bank_save_v2(
+        const char    *path,
+        const uint8_t *motifs_buf,     uint32_t motif_count,
+        const uint8_t *relations_buf,  uint32_t relation_count,
+        const uint8_t *identities_buf, uint32_t identity_count,
+        const uint8_t *conditions_buf, uint32_t condition_count,
+        const uint8_t *responses_buf,  uint32_t response_count) {
+    if (!path) return SFB_ERR_IO;
+    SSSFeatureBank bank;
+    memset(&bank, 0, sizeof(bank));
+    bank.motif_count     = motif_count;
+    bank.motifs          = (SSSMotif *)(uintptr_t)motifs_buf;
+    bank.relation_count  = relation_count;
+    bank.relations       = (SSSRelation *)(uintptr_t)relations_buf;
+    bank.identity_count  = identity_count;
+    bank.identities      = (SSSIdentity *)(uintptr_t)identities_buf;
+    bank.condition_count = condition_count;
+    bank.conditions      = (SSSCondition *)(uintptr_t)conditions_buf;
+    bank.response_count  = response_count;
+    bank.responses       = (SSSInteractionResponse *)(uintptr_t)responses_buf;
+    return sss_feature_bank_save(path, &bank);
+}
+
 int sss_pybridge_feature_bank_probe(const char *path,
                                     uint32_t   *out_motif_count,
                                     uint32_t   *out_relation_count,
@@ -393,7 +420,12 @@ int sss_pybridge_feature_bank_probe(const char *path,
     }
     fclose(f);
     if (memcmp(hdr.magic, SFB_MAGIC, 4) != 0) return SFB_ERR_MAGIC;
-    if (hdr.version != SFB_VERSION)            return SFB_ERR_VERSION;
+    /* Accept both v1 and v2 here so the Python load helper works on
+     * legacy files. The loader proper handles the per-record lifting.
+     */
+    if (hdr.version != 1u && hdr.version != SFB_VERSION) {
+        return SFB_ERR_VERSION;
+    }
     if (out_motif_count)    *out_motif_count    = hdr.motif_count;
     if (out_relation_count) *out_relation_count = hdr.relation_count;
     if (out_identity_count) *out_identity_count = hdr.identity_count;
@@ -446,6 +478,106 @@ int sss_pybridge_feature_bank_load(const char *path,
     *out_motif_count    = need_m;
     *out_relation_count = need_r;
     *out_identity_count = need_i;
+    sss_feature_bank_free(&bank);
+    return SFB_OK;
+}
+
+/* Phase 4 v2 probe: includes condition + response counts on top of
+ * the Phase 2 motif / relation / identity counts. NULL out_* pointers
+ * are tolerated (caller may not need every count). */
+int sss_pybridge_feature_bank_probe_v2(const char *path,
+                                       uint32_t   *out_motif_count,
+                                       uint32_t   *out_relation_count,
+                                       uint32_t   *out_identity_count,
+                                       uint32_t   *out_condition_count,
+                                       uint32_t   *out_response_count) {
+    if (!path) return SFB_ERR_IO;
+    FILE *f = fopen(path, "rb");
+    if (!f) return SFB_ERR_IO;
+    SSSFeatureBankHeader hdr;
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1) {
+        fclose(f); return SFB_ERR_IO;
+    }
+    fclose(f);
+    if (memcmp(hdr.magic, SFB_MAGIC, 4) != 0) return SFB_ERR_MAGIC;
+    if (hdr.version != 1u && hdr.version != SFB_VERSION) {
+        return SFB_ERR_VERSION;
+    }
+    if (out_motif_count)     *out_motif_count     = hdr.motif_count;
+    if (out_relation_count)  *out_relation_count  = hdr.relation_count;
+    if (out_identity_count)  *out_identity_count  = hdr.identity_count;
+    if (out_condition_count) *out_condition_count =
+        (hdr.version == 1u) ? 0u : (uint32_t)hdr.condition_count;
+    if (out_response_count)  *out_response_count  =
+        (hdr.version == 1u) ? 0u : hdr.response_count;
+    return SFB_OK;
+}
+
+/* Phase 4 v2 load: fills the five record arrays and reports counts.
+ * Same short-buffer convention as the v1 load (returns SFB_ERR_ALLOC
+ * with the required counts written into *out_*_count). Condition /
+ * response buffers may be NULL/0 when the caller doesn't care; the
+ * relevant arrays just aren't copied. */
+int sss_pybridge_feature_bank_load_v2(
+        const char *path,
+        uint8_t *motifs_buf,     uint32_t *out_motif_count,
+        uint8_t *relations_buf,  uint32_t *out_relation_count,
+        uint8_t *identities_buf, uint32_t *out_identity_count,
+        uint8_t *conditions_buf, uint32_t *out_condition_count,
+        uint8_t *responses_buf,  uint32_t *out_response_count) {
+    if (!path || !out_motif_count || !out_relation_count
+        || !out_identity_count || !out_condition_count
+        || !out_response_count) {
+        return SFB_ERR_IO;
+    }
+    SSSFeatureBank bank;
+    int rc = sss_feature_bank_load(path, &bank);
+    if (rc != SFB_OK) return rc;
+
+    uint32_t need_m = bank.motif_count;
+    uint32_t need_r = bank.relation_count;
+    uint32_t need_i = bank.identity_count;
+    uint32_t need_c = bank.condition_count;
+    uint32_t need_p = bank.response_count;
+
+    int short_buf = (need_m > *out_motif_count)
+                 || (need_r > *out_relation_count)
+                 || (need_i > *out_identity_count)
+                 || (need_c > *out_condition_count)
+                 || (need_p > *out_response_count);
+    if (short_buf) {
+        *out_motif_count     = need_m;
+        *out_relation_count  = need_r;
+        *out_identity_count  = need_i;
+        *out_condition_count = need_c;
+        *out_response_count  = need_p;
+        sss_feature_bank_free(&bank);
+        return SFB_ERR_ALLOC;
+    }
+    if (need_m > 0 && motifs_buf) {
+        memcpy(motifs_buf, bank.motifs, (size_t)need_m * sizeof(SSSMotif));
+    }
+    if (need_r > 0 && relations_buf) {
+        memcpy(relations_buf, bank.relations,
+               (size_t)need_r * sizeof(SSSRelation));
+    }
+    if (need_i > 0 && identities_buf) {
+        memcpy(identities_buf, bank.identities,
+               (size_t)need_i * sizeof(SSSIdentity));
+    }
+    if (need_c > 0 && conditions_buf) {
+        memcpy(conditions_buf, bank.conditions,
+               (size_t)need_c * sizeof(SSSCondition));
+    }
+    if (need_p > 0 && responses_buf) {
+        memcpy(responses_buf, bank.responses,
+               (size_t)need_p * sizeof(SSSInteractionResponse));
+    }
+    *out_motif_count     = need_m;
+    *out_relation_count  = need_r;
+    *out_identity_count  = need_i;
+    *out_condition_count = need_c;
+    *out_response_count  = need_p;
     sss_feature_bank_free(&bank);
     return SFB_OK;
 }

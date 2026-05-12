@@ -742,9 +742,76 @@ The `position_heatmap` is float32 [0, 1] in memory but `uint8` on disk
 (quantise with `* 255` + round, dequantise with `/ 255`). This drops
 the per-motif heatmap from 1 024 B to 256 B without visible loss.
 
-Phase 3 will write the new SSS trainer's output through this format
-instead of `.sss`; Phase 4 will grow the motif record with motion
-fields.
+Phase 3 writes the SSS trainer's output through this format
+(`scripts/sss_train_primitive.py` → `sss_train_motif_memory.py` →
+`sss_build_feature_bank.py`). Phase 4 grows the motif record with
+motion-related fields and adds two new record types
+(`SSSCondition`, `SSSInteractionResponse`) — see below.
+
+---
+
+## Condition-Interaction synthesis — `.sfb` v2 (Phase 4)
+
+> The sss engine is a **resonance-based visual-signal synthesiser**:
+> images and videos run through the same motif dictionary, with the
+> condition signal's time axis being the only thing that
+> distinguishes them. A motif learns by *accumulating responses
+> from similar motifs* (coherence-weighted average), never by
+> stochastic weight updates. No phase, no per-row FFT, no raw
+> pixel / frame data — Phase 1's amp-only rule extends all the
+> way through.
+
+`.sfb` v2 adds two record types to the Phase 2 container:
+
+| Record               | Size (B) | Holds                                                                                                                                |
+|----------------------|---------:|--------------------------------------------------------------------------------------------------------------------------------------|
+| Condition            |  1 332   | label + condition_type (continuous / impulse / oscillatory) + row/col/temporal amplitude envelopes + direction + intensity + decay_rate |
+| InteractionResponse  |  1 808   | (motif_id, condition_id) + row/col/cross response envelopes + 16×16 warp_x / warp_y fields + response_strength + accumulated_samples  |
+
+The motif record grows from 2 864 B to 3 744 B with `temporal_length`,
+`response_count_in_motif`, `response_offset`, `cross_resonance[64]`,
+and `warp_self_x/_y[16][16]`. The header bytes that used to hold
+`flags + reserved` are reinterpreted as `condition_count +
+response_count + reserved1` so the on-disk byte offsets stay
+identical between v1 and v2 — v1 readers see meaningless values
+where the v2 writer placed counts, exactly as the Phase 2
+forward-compat contract specifies.
+
+Phase 4 training pipeline:
+
+```
+dataset/conditions/<label>/seq_NN/frame_NNN.{png,ppm}
+        │  scripts/sss_train_condition.py
+        ▼
+build/conditions.npz
+                                       dataset/interactions/<motif>_<condition>/
+                                         static/ + active/
+        ┌──────────────────────────────────│
+        │     scripts/sss_train_interaction.py
+        ▼
+build/interactions.npz
+        │
+        │  scripts/sss_build_feature_bank.py
+        │       --conditions  --interactions
+        ▼
+build/feature_bank.sfb       (v2 — motifs + relations + identities +
+                                    conditions + responses)
+```
+
+The synthesiser (`tools/sss_synthesizer.py`) wraps everything into:
+
+```python
+out = synth_frame(bank, motif, condition,
+                  intensity=0.5, t=0.25, seed=42)
+# out.envelope_row, out.envelope_col, out.cross,
+# out.warp_x (16×16), out.warp_y (16×16)
+warped = apply_warp(image_64x64x3, out.warp_x, out.warp_y,
+                    strength=8.0)
+```
+
+Each frame regenerates from the on-disk envelope tables; no raw
+training frame is ever invoked, and the per-seed random init
+preserves Phase 1's diversity guarantee.
 
 ---
 

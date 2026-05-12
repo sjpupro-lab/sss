@@ -46,6 +46,7 @@ if str(REPO) not in sys.path:
 
 from tools.sss_feature_bank import (                       # noqa: E402
     SSSFeatureBank, SSSMotif, SSSRelation, SSSIdentity,
+    SSSCondition, SSSInteractionResponse,
 )
 
 
@@ -128,10 +129,59 @@ def _identities_from_memory(mem_npz: np.lib.npyio.NpzFile,
     return out
 
 
+def _conditions_from_npz(cond_npz: np.lib.npyio.NpzFile) -> list[SSSCondition]:
+    n = int(cond_npz["labels"].shape[0])
+    out = []
+    for i in range(n):
+        out.append(SSSCondition(
+            label=str(cond_npz["labels"][i]),
+            condition_type=int(cond_npz["condition_type"][i]),
+            row_freq=cond_npz["row_freq"][i].astype(np.float32),
+            col_freq=cond_npz["col_freq"][i].astype(np.float32),
+            temporal_freq=cond_npz["temporal_freq"][i].astype(np.float32),
+            direction=float(cond_npz["direction"][i]),
+            default_intensity=float(cond_npz["default_intensity"][i]),
+            decay_rate=float(cond_npz["decay_rate"][i]),
+        ))
+    return out
+
+
+def _responses_from_npz(resp_npz: np.lib.npyio.NpzFile,
+                        motif_count: int,
+                        condition_count: int) -> list[SSSInteractionResponse]:
+    n = int(resp_npz["motif_id"].shape[0])
+    out = []
+    for i in range(n):
+        m = int(resp_npz["motif_id"][i])
+        c = int(resp_npz["condition_id"][i])
+        if m >= motif_count or c >= condition_count:
+            # Stale reference — skip rather than crash the build.
+            continue
+        out.append(SSSInteractionResponse(
+            motif_id=m,
+            condition_id=c,
+            row_response=resp_npz["row_response"][i].astype(np.float32),
+            col_response=resp_npz["col_response"][i].astype(np.float32),
+            cross_response=resp_npz["cross_response"][i].astype(np.float32),
+            warp_x_response=resp_npz["warp_x_response"][i].astype(np.float32),
+            warp_y_response=resp_npz["warp_y_response"][i].astype(np.float32),
+            response_strength=float(resp_npz["response_strength"][i]),
+            response_delay=float(resp_npz["response_delay"][i]),
+            accumulated_samples=int(resp_npz["accumulated_samples"][i]),
+        ))
+    return out
+
+
 def build(motifs_path: Path, memory_path: Path | None,
-          out_path: Path) -> SSSFeatureBank:
+          out_path: Path,
+          conditions_path: Path | None = None,
+          interactions_path: Path | None = None) -> SSSFeatureBank:
     """Top-level build. Returns the built bank for inspection by
-    callers (e.g. the test) before/after the save."""
+    callers (e.g. the test) before/after the save.
+
+    Phase 4 v2 additions: `conditions_path` and `interactions_path`
+    are optional. When omitted, the bank ships with `conditions == []`
+    and `responses == []` and behaves like a Phase 3 build."""
     motifs_npz = np.load(motifs_path, allow_pickle=False)
     motif_count = int(motifs_npz["row_freq"].shape[0])
 
@@ -140,9 +190,6 @@ def build(motifs_path: Path, memory_path: Path | None,
     heatmap_update: np.ndarray | None = None
     if memory_path is not None:
         mem_npz = np.load(memory_path, allow_pickle=False)
-        # When memory and motif counts disagree, prefer the motif file
-        # (the .sfb stores those records); a mismatch usually means
-        # someone re-ran primitives without rebuilding memory.
         mem_motif_count = int(mem_npz["motif_count"][0])
         if mem_motif_count != motif_count:
             print(f"WARN: memory has {mem_motif_count} motifs but "
@@ -153,8 +200,23 @@ def build(motifs_path: Path, memory_path: Path | None,
 
     motifs = _motifs_from_npz(motifs_npz, heatmap_update)
 
+    conditions: list[SSSCondition] = []
+    responses:  list[SSSInteractionResponse] = []
+    if conditions_path is not None:
+        cond_npz = np.load(conditions_path, allow_pickle=False)
+        conditions = _conditions_from_npz(cond_npz)
+    if interactions_path is not None:
+        if not conditions:
+            print("WARN: --interactions requires --conditions; skipping "
+                  "responses", file=sys.stderr)
+        else:
+            resp_npz = np.load(interactions_path, allow_pickle=False)
+            responses = _responses_from_npz(resp_npz, motif_count,
+                                            len(conditions))
+
     bank = SSSFeatureBank(motifs=motifs, relations=relations,
-                          identities=identities)
+                          identities=identities,
+                          conditions=conditions, responses=responses)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     bank.save(str(out_path))
     return bank
@@ -168,6 +230,10 @@ def main() -> int:
                     help="primitive_motifs.npz from sss_train_primitive")
     ap.add_argument("--memory", type=Path, default=None,
                     help="optional motif_memory.npz from sss_train_motif_memory")
+    ap.add_argument("--conditions", type=Path, default=None,
+                    help="optional conditions.npz from sss_train_condition (v2)")
+    ap.add_argument("--interactions", type=Path, default=None,
+                    help="optional interactions.npz from sss_train_interaction (v2)")
     ap.add_argument("--out", required=True, type=Path,
                     help="output .sfb path")
     args = ap.parse_args()
@@ -178,12 +244,22 @@ def main() -> int:
     if args.memory is not None and not args.memory.is_file():
         print(f"error: --memory {args.memory} not found", file=sys.stderr)
         return 2
+    if args.conditions is not None and not args.conditions.is_file():
+        print(f"error: --conditions {args.conditions} not found",
+              file=sys.stderr); return 2
+    if args.interactions is not None and not args.interactions.is_file():
+        print(f"error: --interactions {args.interactions} not found",
+              file=sys.stderr); return 2
 
-    bank = build(args.motifs, args.memory, args.out)
+    bank = build(args.motifs, args.memory, args.out,
+                 conditions_path=args.conditions,
+                 interactions_path=args.interactions)
     size = args.out.stat().st_size
     print(f"wrote {args.out}  "
           f"({len(bank.motifs)} motifs, {len(bank.relations)} relations, "
-          f"{len(bank.identities)} identities, {size} bytes)")
+          f"{len(bank.identities)} identities, "
+          f"{len(bank.conditions)} conditions, "
+          f"{len(bank.responses)} responses, {size} bytes)")
     return 0
 
 
