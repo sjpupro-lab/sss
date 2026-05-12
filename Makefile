@@ -53,6 +53,7 @@ CE_CORE_SRCS = $(CE_CORE_DIR)/ce_core.c \
                $(CE_CORE_DIR)/ce_residual_codebook.c \
                $(CE_CORE_DIR)/sss_rowvae.c \
                $(CE_CORE_DIR)/sss_io.c \
+               $(CE_CORE_DIR)/sss_feature_bank.c \
                $(CE_CORE_DIR)/sss_pybridge.c \
                $(CE_CORE_DIR)/ce_scene_object.c \
                $(CE_CORE_DIR)/ce_move_profile.c \

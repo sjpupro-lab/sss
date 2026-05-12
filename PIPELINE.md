@@ -209,3 +209,45 @@ verify_hybrid <img1.ppm> [<img2.ppm> ...]
 | 100,000 | 60 ms (1.69M b/s) | 1.5 ms | 100 ms | 130 ms | 90 ms |
 
 → 10K 학습 최소요건은 압도적으로 만족. 1M 엔트리(∼1000 이미지 × 1024 블록) 까지도 generate 0.1s 수준.
+
+---
+
+## `.sfb` Feature Bank (Phase 2 산출물)
+
+`ce_core/sss_feature_bank.{h,c}` + `tools/sss_feature_bank.py` 추가로
+**`.sfb`** (SSS Feature Bank) 포맷을 도입. Phase 3에서 학습 산출물을
+이 포맷으로 통합하기 위한 사전 작업이다.
+
+| Record | Size (B) | Description |
+|--------|---------:|-------------|
+| Motif    | 2 864 | label[32] + row/col freq (128 bins f32) + RGB color_freq (3×128 f32) + 16×16 position heatmap (uint8 quantised, 0..255) + coherence/confidence/activation/variation_cluster_id |
+| Relation |    20 | src/dst motif_id + (dx, dy) + relation_type (above/below/left/right/near/around/inside) + weight |
+| Identity |   104 | label[32] + up to 32 motif_ids + motif_count + confidence |
+
+핵심 설계 결정:
+- **pack(1) + little-endian**: 호스트 LE 정적 assert로 검증. byte-swap 코드 0줄.
+- **Header에 record_size 포함**: v2 motion 필드 확장 시 version 유지하면서
+  record를 키울 수 있도록 `motif_record_size / relation_record_size /
+  identity_record_size`를 헤더에 저장 → loader가 stride 단위로 읽음.
+- **C ↔ Python byte-identical**: `tools/sss_feature_bank.py`와
+  `ce_core/sss_feature_bank.c`는 동일 데이터에 대해 바이트 단위 동일한
+  파일을 생성 (test_feature_bank.py가 lock).
+- **position_heatmap uint8 양자화**: float[0,1] → uint8 [0,255] (save 시
+  `*255` round, load 시 `/255`). 모티프당 1024B → 256B (75% ↓).
+  라운드트립 오차 ≤ 1/255.
+
+검증 (`tools/test_feature_bank.py`):
+- 100×200×5 라운드트립 + 두 번째 save 바이트 결정성
+- 한글 32B label 코드포인트 경계 잘림
+- empty bank
+- invalid relation src/dst, invalid relation_type, identity motif_count > 32
+- bad magic / bad version 거부 (`SFB_ERR_MAGIC` / `SFB_ERR_VERSION`)
+- Python save ↔ C save 바이트 동일성
+- Python save → C load / C save → Python load 양방향 라운드트립
+- **1000 motif × 5000 relation × 50 identity 벤치마크**:
+  save 85 ms, load 34 ms, 파일 크기 ~2.83 MB (목표 < 100 ms 통과)
+
+v2 마이그레이션 정책 (사전 정의):
+- record_size 변경은 항상 SFB_VERSION 증가와 함께
+- v1 reader는 알 수 없는 후행 record-내 바이트를 안전하게 스킵
+- 새 필드는 항상 record 끝에 append (기존 offset 보존)

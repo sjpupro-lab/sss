@@ -8,7 +8,9 @@
 #include "ce_scene_object.h"
 #include "ce_scene_bridge.h"
 #include "ce_move_profile.h"
+#include "sss_feature_bank.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -349,4 +351,101 @@ uint16_t sss_atmos_scene_persist(sss_memory *mem,
     if (!mem || !s) return 0;
     return ce_scene_persist_to_storage(&mem->storage, canvas_id,
                                        scene_id, &s->scene);
+}
+
+/* ── Phase 2 feature bank pybridge ─────────────────────────────────
+ *
+ * Python passes tightly-packed record buffers (one record_size block
+ * per record, no padding). Because SSSMotif / SSSRelation / SSSIdentity
+ * are pack(1) on the C side and Python lays the same bytes out via
+ * struct.pack, we can reinterpret the buffer as an array of structs
+ * with a single cast — no per-record copy. */
+
+int sss_pybridge_feature_bank_save(const char    *path,
+                                   const uint8_t *motifs_buf,
+                                   uint32_t       motif_count,
+                                   const uint8_t *relations_buf,
+                                   uint32_t       relation_count,
+                                   const uint8_t *identities_buf,
+                                   uint32_t       identity_count) {
+    if (!path) return SFB_ERR_IO;
+    SSSFeatureBank bank;
+    memset(&bank, 0, sizeof(bank));
+    bank.motif_count    = motif_count;
+    bank.motifs         = (SSSMotif *)(uintptr_t)motifs_buf;
+    bank.relation_count = relation_count;
+    bank.relations      = (SSSRelation *)(uintptr_t)relations_buf;
+    bank.identity_count = identity_count;
+    bank.identities     = (SSSIdentity *)(uintptr_t)identities_buf;
+    return sss_feature_bank_save(path, &bank);
+}
+
+int sss_pybridge_feature_bank_probe(const char *path,
+                                    uint32_t   *out_motif_count,
+                                    uint32_t   *out_relation_count,
+                                    uint32_t   *out_identity_count) {
+    if (!path) return SFB_ERR_IO;
+    FILE *f = fopen(path, "rb");
+    if (!f) return SFB_ERR_IO;
+    SSSFeatureBankHeader hdr;
+    if (fread(&hdr, sizeof(hdr), 1, f) != 1) {
+        fclose(f); return SFB_ERR_IO;
+    }
+    fclose(f);
+    if (memcmp(hdr.magic, SFB_MAGIC, 4) != 0) return SFB_ERR_MAGIC;
+    if (hdr.version != SFB_VERSION)            return SFB_ERR_VERSION;
+    if (out_motif_count)    *out_motif_count    = hdr.motif_count;
+    if (out_relation_count) *out_relation_count = hdr.relation_count;
+    if (out_identity_count) *out_identity_count = hdr.identity_count;
+    return SFB_OK;
+}
+
+int sss_pybridge_feature_bank_load(const char *path,
+                                   uint8_t   *motifs_buf,
+                                   uint32_t  *out_motif_count,
+                                   uint8_t   *relations_buf,
+                                   uint32_t  *out_relation_count,
+                                   uint8_t   *identities_buf,
+                                   uint32_t  *out_identity_count) {
+    if (!path || !out_motif_count || !out_relation_count
+        || !out_identity_count) {
+        return SFB_ERR_IO;
+    }
+    SSSFeatureBank bank;
+    int rc = sss_feature_bank_load(path, &bank);
+    if (rc != SFB_OK) return rc;
+
+    uint32_t need_m = bank.motif_count;
+    uint32_t need_r = bank.relation_count;
+    uint32_t need_i = bank.identity_count;
+
+    int short_buf = (need_m > *out_motif_count)
+                 || (need_r > *out_relation_count)
+                 || (need_i > *out_identity_count);
+    if (short_buf) {
+        /* Tell the caller the required capacity, then bail with
+         * SFB_ERR_ALLOC — Python can re-allocate and call again. */
+        *out_motif_count    = need_m;
+        *out_relation_count = need_r;
+        *out_identity_count = need_i;
+        sss_feature_bank_free(&bank);
+        return SFB_ERR_ALLOC;
+    }
+
+    if (need_m > 0 && motifs_buf) {
+        memcpy(motifs_buf, bank.motifs, (size_t)need_m * sizeof(SSSMotif));
+    }
+    if (need_r > 0 && relations_buf) {
+        memcpy(relations_buf, bank.relations,
+               (size_t)need_r * sizeof(SSSRelation));
+    }
+    if (need_i > 0 && identities_buf) {
+        memcpy(identities_buf, bank.identities,
+               (size_t)need_i * sizeof(SSSIdentity));
+    }
+    *out_motif_count    = need_m;
+    *out_relation_count = need_r;
+    *out_identity_count = need_i;
+    sss_feature_bank_free(&bank);
+    return SFB_OK;
 }
