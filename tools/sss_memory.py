@@ -154,6 +154,40 @@ def _load_lib():
         ]
         lib.sss_pybridge_feature_bank_load.restype = ctypes.c_int
 
+    # Phase 4 v2 variants — these include condition + response
+    # buffers and are guard-gated on `hasattr` so older .so builds
+    # still load the module without crashing.
+    if hasattr(lib, "sss_pybridge_feature_bank_save_v2"):
+        lib.sss_pybridge_feature_bank_save_v2.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32,
+        ]
+        lib.sss_pybridge_feature_bank_save_v2.restype = ctypes.c_int
+    if hasattr(lib, "sss_pybridge_feature_bank_probe_v2"):
+        lib.sss_pybridge_feature_bank_probe_v2.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        lib.sss_pybridge_feature_bank_probe_v2.restype = ctypes.c_int
+    if hasattr(lib, "sss_pybridge_feature_bank_load_v2"):
+        lib.sss_pybridge_feature_bank_load_v2.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint32),
+        ]
+        lib.sss_pybridge_feature_bank_load_v2.restype = ctypes.c_int
+
     return lib
 
 

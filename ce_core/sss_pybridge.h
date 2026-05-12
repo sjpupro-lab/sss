@@ -183,11 +183,39 @@ int sss_pybridge_feature_bank_load(const char *path,
 
 /* Header-only probe for callers that need to size the buffers before
  * the full load. Fills *out_*_count from the header and returns
- * SFB_OK; the file is closed before returning. */
+ * SFB_OK; the file is closed before returning. Accepts both v1 and
+ * v2 files (the loader handles the per-record lifting). */
 int sss_pybridge_feature_bank_probe(const char *path,
                                     uint32_t   *out_motif_count,
                                     uint32_t   *out_relation_count,
                                     uint32_t   *out_identity_count);
+
+/* Phase 4 v2 variants. Save / probe / load that include condition
+ * and response arrays. The v2 probe is a strict superset of the v1
+ * probe (sets the extra out_* and returns the same SFB_OK on both
+ * v1 and v2 files). */
+int sss_pybridge_feature_bank_save_v2(
+        const char    *path,
+        const uint8_t *motifs_buf,     uint32_t motif_count,
+        const uint8_t *relations_buf,  uint32_t relation_count,
+        const uint8_t *identities_buf, uint32_t identity_count,
+        const uint8_t *conditions_buf, uint32_t condition_count,
+        const uint8_t *responses_buf,  uint32_t response_count);
+
+int sss_pybridge_feature_bank_probe_v2(const char *path,
+                                       uint32_t   *out_motif_count,
+                                       uint32_t   *out_relation_count,
+                                       uint32_t   *out_identity_count,
+                                       uint32_t   *out_condition_count,
+                                       uint32_t   *out_response_count);
+
+int sss_pybridge_feature_bank_load_v2(
+        const char *path,
+        uint8_t *motifs_buf,     uint32_t *out_motif_count,
+        uint8_t *relations_buf,  uint32_t *out_relation_count,
+        uint8_t *identities_buf, uint32_t *out_identity_count,
+        uint8_t *conditions_buf, uint32_t *out_condition_count,
+        uint8_t *responses_buf,  uint32_t *out_response_count);
 
 #ifdef __cplusplus
 }

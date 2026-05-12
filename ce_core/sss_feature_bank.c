@@ -31,14 +31,23 @@
     typedef char sfb_static_assert_##__LINE__[(cond) ? 1 : -1]
 #endif
 
+/* v1 motif size — kept as a named constant so the load path can
+ * accept legacy v1 files (motif_record_size = 2864 on disk) and
+ * zero-pad them into the v2 SSSMotif struct in memory. */
+#define SFB_V1_MOTIF_SIZE 2864
+
 SFB_STATIC_ASSERT(sizeof(SSSFeatureBankHeader) == 40,
                   "SSSFeatureBankHeader must be 40 bytes");
-SFB_STATIC_ASSERT(sizeof(SSSMotif)    == 2864,
-                  "SSSMotif must be 2864 bytes");
+SFB_STATIC_ASSERT(sizeof(SSSMotif)    == 3744,
+                  "SSSMotif v2 must be 3744 bytes");
 SFB_STATIC_ASSERT(sizeof(SSSRelation) == 20,
                   "SSSRelation must be 20 bytes");
 SFB_STATIC_ASSERT(sizeof(SSSIdentity) == 104,
                   "SSSIdentity must be 104 bytes");
+SFB_STATIC_ASSERT(sizeof(SSSCondition) == 1332,
+                  "SSSCondition must be 1332 bytes");
+SFB_STATIC_ASSERT(sizeof(SSSInteractionResponse) == 1808,
+                  "SSSInteractionResponse must be 1808 bytes");
 
 /* Little-endian host check. The .sfb format is fixed LE so callers
  * on a hypothetical big-endian host would read garbage; we'd rather
@@ -70,20 +79,48 @@ static int validate_identity(const SSSIdentity *id, uint32_t motif_count)
     return SFB_OK;
 }
 
+static int validate_condition(const SSSCondition *c)
+{
+    if (c->condition_type > SFB_CONDITION_TYPE_MAX) {
+        return SFB_ERR_INVALID_COND;
+    }
+    return SFB_OK;
+}
+
+static int validate_response(const SSSInteractionResponse *r,
+                             uint32_t motif_count,
+                             uint32_t condition_count)
+{
+    if (r->motif_id     >= motif_count)     return SFB_ERR_INVALID_RESP;
+    if (r->condition_id >= condition_count) return SFB_ERR_INVALID_RESP;
+    return SFB_OK;
+}
+
 /* ── Save ──────────────────────────────────────────────────────── */
 
 int sss_feature_bank_save(const char *path, const SSSFeatureBank *bank)
 {
     if (!path || !bank) return SFB_ERR_IO;
 
-    /* Validate every relation / identity up-front so we don't write
-     * a partially-corrupt file on the way to a late failure. */
+    /* Validate every relation / identity / condition / response
+     * up-front so we don't write a partially-corrupt file on the
+     * way to a late failure. */
     for (uint32_t i = 0; i < bank->relation_count; ++i) {
         int rc = validate_relation(&bank->relations[i], bank->motif_count);
         if (rc != SFB_OK) return rc;
     }
     for (uint32_t i = 0; i < bank->identity_count; ++i) {
         int rc = validate_identity(&bank->identities[i], bank->motif_count);
+        if (rc != SFB_OK) return rc;
+    }
+    for (uint32_t i = 0; i < bank->condition_count; ++i) {
+        int rc = validate_condition(&bank->conditions[i]);
+        if (rc != SFB_OK) return rc;
+    }
+    for (uint32_t i = 0; i < bank->response_count; ++i) {
+        int rc = validate_response(&bank->responses[i],
+                                   bank->motif_count,
+                                   bank->condition_count);
         if (rc != SFB_OK) return rc;
     }
 
@@ -100,7 +137,9 @@ int sss_feature_bank_save(const char *path, const SSSFeatureBank *bank)
     hdr.motif_record_size    = (uint16_t)sizeof(SSSMotif);
     hdr.relation_record_size = (uint16_t)sizeof(SSSRelation);
     hdr.identity_record_size = (uint16_t)sizeof(SSSIdentity);
-    /* flags / reserved / reserved2 stay zero by memset above. */
+    hdr.condition_count      = (uint16_t)bank->condition_count;
+    hdr.response_count       = bank->response_count;
+    /* reserved1 / reserved2 stay zero by memset above. */
 
     if (fwrite(&hdr, sizeof(hdr), 1, f) != 1) {
         fclose(f); return SFB_ERR_IO;
@@ -118,6 +157,19 @@ int sss_feature_bank_save(const char *path, const SSSFeatureBank *bank)
     if (bank->identity_count > 0
         && fwrite(bank->identities, sizeof(SSSIdentity),
                   bank->identity_count, f) != bank->identity_count) {
+        fclose(f); return SFB_ERR_IO;
+    }
+    /* v2: conditions follow identities, responses follow conditions.
+     * Both arrays are pack(1) structs of fixed sizes, so a single
+     * fwrite per array is byte-exact with the Python writer. */
+    if (bank->condition_count > 0
+        && fwrite(bank->conditions, sizeof(SSSCondition),
+                  bank->condition_count, f) != bank->condition_count) {
+        fclose(f); return SFB_ERR_IO;
+    }
+    if (bank->response_count > 0
+        && fwrite(bank->responses, sizeof(SSSInteractionResponse),
+                  bank->response_count, f) != bank->response_count) {
         fclose(f); return SFB_ERR_IO;
     }
     if (fclose(f) != 0) return SFB_ERR_IO;
@@ -156,6 +208,26 @@ static int read_records(FILE *f, void *dst, size_t record_size,
     return SFB_OK;
 }
 
+/* Helper: zero-pad load helper for v1 motifs. The on-disk record is
+ * 2864 B (v1) but the in-memory struct is 3744 B (v2). For each
+ * record we read 2864 B and leave the v2 extension at zero — which
+ * means `temporal_length = 0`, `response_count_in_motif = 0`, and
+ * empty cross_resonance / warp_self fields. This matches "treat
+ * the v1 motif as a static motif with no learned interactions". */
+static int read_motifs_v1_into_v2(FILE *f, SSSMotif *dst, uint32_t count)
+{
+    if (count == 0) return SFB_OK;
+    /* Per-record read of SFB_V1_MOTIF_SIZE bytes into the head of
+     * the v2 struct; the rest stays zero (caller calloc'd). */
+    for (uint32_t i = 0; i < count; ++i) {
+        if (fread((uint8_t *)(dst + i), 1, SFB_V1_MOTIF_SIZE, f)
+                != SFB_V1_MOTIF_SIZE) {
+            return SFB_ERR_IO;
+        }
+    }
+    return SFB_OK;
+}
+
 int sss_feature_bank_load(const char *path, SSSFeatureBank *out)
 {
     if (!path || !out) return SFB_ERR_IO;
@@ -171,21 +243,43 @@ int sss_feature_bank_load(const char *path, SSSFeatureBank *out)
     if (memcmp(hdr.magic, SFB_MAGIC, 4) != 0) {
         fclose(f); return SFB_ERR_MAGIC;
     }
-    if (hdr.version != SFB_VERSION) {
+    /* v2 loader accepts both v2 and v1 (motif backward-compat path).
+     * v1 → v2 lifting is handled per-record below; v2-or-bust is
+     * the rule. */
+    int is_v1 = 0;
+    if (hdr.version == 1u) {
+        is_v1 = 1;
+        /* v1 files report flags / reserved / reserved2 where v2
+         * has condition_count / response_count / reserved1 /
+         * reserved2. The byte layout is identical, so the field
+         * values are simply meaningless to v2 — clear them so the
+         * load path doesn't try to consume condition / response
+         * arrays that don't exist on disk. */
+        hdr.condition_count = 0;
+        hdr.response_count  = 0;
+    } else if (hdr.version != SFB_VERSION) {
         fclose(f); return SFB_ERR_VERSION;
     }
-    /* v1 record-size sanity: the writer must have used the canonical
-     * sizes (or larger — see read_records). Smaller-than-current is
-     * rejected as a version mismatch. */
-    if (hdr.motif_record_size < sizeof(SSSMotif)
-     || hdr.relation_record_size < sizeof(SSSRelation)
+
+    /* Record-size sanity. v1 motifs are SFB_V1_MOTIF_SIZE on disk;
+     * everything else must match the current struct size or be
+     * larger (the read_records helper handles "larger" by trimming).
+     */
+    int v1_motif_layout =
+        (is_v1 && hdr.motif_record_size == SFB_V1_MOTIF_SIZE);
+    if (!v1_motif_layout && hdr.motif_record_size < sizeof(SSSMotif)) {
+        fclose(f); return SFB_ERR_VERSION;
+    }
+    if (hdr.relation_record_size < sizeof(SSSRelation)
      || hdr.identity_record_size < sizeof(SSSIdentity)) {
         fclose(f); return SFB_ERR_VERSION;
     }
 
-    SSSMotif    *motifs     = NULL;
-    SSSRelation *relations  = NULL;
-    SSSIdentity *identities = NULL;
+    SSSMotif               *motifs     = NULL;
+    SSSRelation            *relations  = NULL;
+    SSSIdentity            *identities = NULL;
+    SSSCondition           *conditions = NULL;
+    SSSInteractionResponse *responses  = NULL;
 
     if (hdr.motif_count > 0) {
         motifs = (SSSMotif *)calloc(hdr.motif_count, sizeof(SSSMotif));
@@ -201,9 +295,30 @@ int sss_feature_bank_load(const char *path, SSSFeatureBank *out)
             free(motifs); free(relations); fclose(f); return SFB_ERR_ALLOC;
         }
     }
+    if (hdr.condition_count > 0) {
+        conditions = (SSSCondition *)calloc(hdr.condition_count,
+                                            sizeof(SSSCondition));
+        if (!conditions) {
+            free(motifs); free(relations); free(identities);
+            fclose(f); return SFB_ERR_ALLOC;
+        }
+    }
+    if (hdr.response_count > 0) {
+        responses = (SSSInteractionResponse *)calloc(
+            hdr.response_count, sizeof(SSSInteractionResponse));
+        if (!responses) {
+            free(motifs); free(relations); free(identities); free(conditions);
+            fclose(f); return SFB_ERR_ALLOC;
+        }
+    }
 
-    int rc = read_records(f, motifs, hdr.motif_record_size,
+    int rc;
+    if (v1_motif_layout) {
+        rc = read_motifs_v1_into_v2(f, motifs, hdr.motif_count);
+    } else {
+        rc = read_records(f, motifs, hdr.motif_record_size,
                           sizeof(SSSMotif), hdr.motif_count);
+    }
     if (rc == SFB_OK) {
         rc = read_records(f, relations, hdr.relation_record_size,
                           sizeof(SSSRelation), hdr.relation_count);
@@ -212,35 +327,71 @@ int sss_feature_bank_load(const char *path, SSSFeatureBank *out)
         rc = read_records(f, identities, hdr.identity_record_size,
                           sizeof(SSSIdentity), hdr.identity_count);
     }
+    /* v2-only: conditions + responses sit at the tail. v1 readers
+     * stop after identities; v2 readers continue. */
+    if (rc == SFB_OK && hdr.condition_count > 0) {
+        if (fread(conditions, sizeof(SSSCondition),
+                  hdr.condition_count, f) != hdr.condition_count) {
+            rc = SFB_ERR_IO;
+        }
+    }
+    if (rc == SFB_OK && hdr.response_count > 0) {
+        if (fread(responses, sizeof(SSSInteractionResponse),
+                  hdr.response_count, f) != hdr.response_count) {
+            rc = SFB_ERR_IO;
+        }
+    }
     fclose(f);
     if (rc != SFB_OK) {
         free(motifs); free(relations); free(identities);
+        free(conditions); free(responses);
         return rc;
     }
 
-    /* Post-load validation: identity / relation indices must point
-     * inside the motif array. Catches both stale .sfb files (older
-     * writer produced inconsistent indices) and outright corruption.
-     */
+    /* Post-load validation: relation / identity indices must point
+     * inside the motif array, conditions / responses must validate.
+     * Catches stale .sfb files (older writer produced inconsistent
+     * indices) and outright corruption. */
     for (uint32_t i = 0; i < hdr.relation_count; ++i) {
         if (validate_relation(&relations[i], hdr.motif_count) != SFB_OK) {
             free(motifs); free(relations); free(identities);
+            free(conditions); free(responses);
             return SFB_ERR_INVALID_REL;
         }
     }
     for (uint32_t i = 0; i < hdr.identity_count; ++i) {
         if (validate_identity(&identities[i], hdr.motif_count) != SFB_OK) {
             free(motifs); free(relations); free(identities);
+            free(conditions); free(responses);
             return SFB_ERR_INVALID_IDENT;
         }
     }
+    for (uint32_t i = 0; i < hdr.condition_count; ++i) {
+        if (validate_condition(&conditions[i]) != SFB_OK) {
+            free(motifs); free(relations); free(identities);
+            free(conditions); free(responses);
+            return SFB_ERR_INVALID_COND;
+        }
+    }
+    for (uint32_t i = 0; i < hdr.response_count; ++i) {
+        if (validate_response(&responses[i], hdr.motif_count,
+                              hdr.condition_count) != SFB_OK) {
+            free(motifs); free(relations); free(identities);
+            free(conditions); free(responses);
+            return SFB_ERR_INVALID_RESP;
+        }
+    }
 
-    out->motif_count    = hdr.motif_count;
-    out->motifs         = motifs;
-    out->relation_count = hdr.relation_count;
-    out->relations      = relations;
-    out->identity_count = hdr.identity_count;
-    out->identities     = identities;
+    out->motif_count     = hdr.motif_count;
+    out->motifs          = motifs;
+    out->relation_count  = hdr.relation_count;
+    out->relations       = relations;
+    out->identity_count  = hdr.identity_count;
+    out->identities      = identities;
+    out->condition_count = hdr.condition_count;
+    out->conditions      = conditions;
+    out->response_count  = hdr.response_count;
+    out->responses       = responses;
     return SFB_OK;
 }
 
@@ -250,6 +401,8 @@ void sss_feature_bank_free(SSSFeatureBank *bank)
     free(bank->motifs);
     free(bank->relations);
     free(bank->identities);
+    free(bank->conditions);
+    free(bank->responses);
     memset(bank, 0, sizeof(*bank));
 }
 

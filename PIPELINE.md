@@ -382,6 +382,154 @@ relations / identities / 갱신된 heatmap을 채우고, 없으면 primitive
 
 ---
 
+## Phase 4: Condition-Interaction Paradigm
+
+sss 엔진의 정체성 (코드 헤더와 본 섹션에 명시):
+
+> "시간이 가둬진 신호와 시간이 흐르는 신호를 동일한 motif 사전으로
+> 다루는 공명 기반 시각 신호 합성 엔진이며, motif는 자신과 유사한
+> motif의 조건 응답을 누적하여 학습한다."
+
+핵심 원칙:
+- 이미지는 `temporal_length = 0` 인 영상의 특수 케이스.
+- 영상은 정적 motif에 condition signal이 시간을 따라 입력될 때
+  자동으로 합성된다.
+- motif 학습은 가중치 업데이트가 아니라 **유사 motif의 응답 누적**
+  (coherence 가중 평균).
+- 시간은 condition signal의 시간축에서만 존재한다.
+- **위상 / 행 단위 FFT / 원본 픽셀·프레임은 저장하지 않는다.**
+
+### 1) Condition 학습 (`sss_train_condition.py`)
+
+각 condition 폴더의 16-프레임 시퀀스를 모아 1 개의 condition 레코드
+산출.
+
+분류기 (GPT 사전 검증 결과 반영):
+
+```
+Step 1: 인접 프레임 L2 차이 평균 = mean_t || frame_t − frame_{t-1} ||₂
+        < 0.01 → CONTINUOUS  (FFT 스킵, 'gravity 오분류' 방지)
+        ≥ 0.01 → Step 2
+Step 2: 첫 프레임 에너지 ≥ 1.8 × median 프레임 에너지 → IMPULSE
+Step 3: 픽셀별 temporal FFT를 픽셀에 대해 합산한 1-D 스펙트럼에서
+        선형 추세 제거 후 잔차 에너지 비율 > 20 % 이고
+        peak/total ≥ 0.1 → OSCILLATORY
+        그 외 → CONTINUOUS
+```
+
+선형 추세 제거 단계가 핵심이다 — 픽셀별 평균 빼기만으로는 "stripe drift"
+같은 공간-쉬프트 신호의 전역 평균이 일정하기 때문에 분류기가 통과되지
+않는다. Per-pixel FFT + 선형 추세 잔차 검사가 GPT 사전 검증에서 도출된
+fix이다.
+
+per-condition 산출물:
+- `row_freq[128]` / `col_freq[128]`: 시퀀스 평균 envelope, DC 제거 +
+  zero-mean L2 정규화.
+- `temporal_freq[64]`: 픽셀별 temporal rfft 진폭을 픽셀에 대해 합산 →
+  64-bin linear 리샘플, L2 정규화.
+- `direction` (radians): 인접 프레임 절대 차분 영상의 무게중심 방향.
+- `default_intensity`: 시퀀스의 평균 픽셀 표준편차 (∈ [0, 1] 정규화).
+- `decay_rate`: IMPULSE 일 때만 per-frame 에너지 지수 감쇠 fit.
+
+### 2) Interaction 학습 (`sss_train_interaction.py`)
+
+`<motif_label>_<condition_label>/{static,active}` 폴더 짝으로부터
+InteractionResponse 산출.
+
+알고리즘:
+
+1. static 시퀀스에서 motif envelope 추출 (Phase 3 envelope 파이프라인).
+2. active 시퀀스의 프레임별 envelope.
+3. delta_envelope[t] = active[t] − static.
+4. condition.temporal_freq → `_temporal_envelope_at(t)` 로 frame-별
+   intensity 재구성 (zero-phase irfft, Phase 1 amp-only rule).
+5. **에너지 상관관계** `corrcoef(intensity², |delta|²)` ≥ 0.5 일 때만
+   학습 진행. 제곱 비교는 phase-invariant — condition 의 zero-phase
+   irfft 재구성과 active 시퀀스의 실제 위상이 misalign 되어도 부호
+   대신 에너지 패턴이 살아 있어 매칭이 된다.
+6. `row_response = mean_t(delta_row[t] / max(|intensity[t]|, ε))`,
+   col_response / cross_response 동일 방식.
+7. **warp_x / warp_y**: 4×4 패치 블록매칭 (search ±3 px) 으로
+   인접 프레임 간 변위 → 16×16 격자 평균. `[-1, +1]` 로
+   정규화 (uint8 [0, 255] 로 disk 저장 시 quantise).
+8. `response_strength = max_t |delta|`.
+9. **유사 motif 누적**: 새 motif 의 envelope 와 weighted-cosine ≥ 0.85
+   인 기존 motif 가 같은 condition 에 대해 갖고 있는 response 와
+   coherence 가중 평균. accumulated_samples 가 contributor 수만큼 증가.
+
+### 3) `.sfb` 합성 (`sss_synthesizer.py`)
+
+`SynthOutput = synth_frame(bank, motif, condition, intensity, t,
+seed)`:
+
+1. motif 의 baseline (row / col / cross / warp_self).
+2. `_find_response(bank, motif_id, condition_id)` → 매칭되는
+   InteractionResponse.
+3. condition.temporal_freq 에서 frame `t` 의 effective intensity
+   계산 (linear 리샘플 + zero-phase irfft + IMPULSE 의 경우
+   exp(-decay_rate · t)).
+4. baseline + response_strength × intensity × response 누적.
+5. seed-기반 미세 jitter (±0.02) 를 warp 에 가산 — Phase 1 의
+   seed 다양성 원칙을 motif level 까지 확장.
+
+`apply_warp(image, warp_x, warp_y, strength=8)`:
+- 16×16 warp → 64×64 bilinear 업샘플.
+- `output[y, x] = input[y − dy, x − dx]` — 즉 warp_y > 0 는
+  "픽셀이 아래로 이동" 의 표준 displacement-field 컨벤션.
+
+### 4) v2 파일 포맷
+
+| Record   | Size (B) | Notes |
+|----------|---------:|-------|
+| Header   |     40   | magic `SFB1`, version 2, 5 counts (motif / relation / identity / **condition** / **response**), 3 record sizes, reserved |
+| Motif v2 |  3 744   | v1 motif (2 864 B) + temporal_length + response_count + response_offset + cross_resonance[64] + warp_self_x[16][16] + warp_self_y[16][16] + _pad[104] |
+| Relation |     20   | unchanged from v2 |
+| Identity |    104   | unchanged from v2 |
+| Condition|  1 332   | label + condition_type + row_freq[128] + col_freq[128] + temporal_freq[64] + direction + default_intensity + decay_rate |
+| Response |  1 808   | motif_id + condition_id + row_response[128] + col_response[128] + cross_response[64] + warp_x[16][16] + warp_y[16][16] + response_strength + response_delay + accumulated_samples |
+
+v1 ↔ v2 호환성:
+- v2 loader가 v1 파일을 읽으면 motif 의 v2 확장 (880 B) 은 zero-pad
+  → `temporal_length = 0`, 빈 cross_resonance / warp_self. conditions /
+  responses 는 비어 있다.
+- v1 loader는 magic + version 검사에서 v2 파일을 `SFB_ERR_VERSION`
+  으로 거부한다 (forward-compat 컨트랙트).
+- Header byte 오프셋이 v1 ↔ v2 동일 (40 B) — v1 의 flags + reserved
+  바이트가 v2 에서 condition_count + response_count + reserved1 로
+  재해석된다.
+
+### 5) Phase 4 회귀 테스트
+
+- `tools/test_sfb_v2.py`:
+  * v2 round-trip + 두 번 save byte-identical (v2 필드 포함).
+  * v1 → v2 loader 호환성 (motif v2 확장은 zero-pad).
+  * Python ↔ C save bytewise 일치 (v2 records).
+
+- `tools/test_train_condition.py`:
+  * 5 종 합성 condition (wind / pulse / static / **gravity** /
+    vibration) 모두 정확히 분류.
+  * gravity 는 frame-delta 0.002 → CONTINUOUS 로 early-out 분류
+    (GPT 사전 검증 fix).
+
+- `tools/test_train_interaction.py`:
+  * `flag_vibration`, `fur_vibration` 모두 응답으로 등록.
+  * `rock_gravity` 는 응답 신호 부재 → 상관관계 < 0.5 → reject.
+  * 유사 motif 누적: fur 의 accumulated_samples ≥ 2 (flag 의 응답이
+    fur 의 유사도 ≥ 0.85 로 누적 기여).
+  * 빌더 통합 → v2 .sfb round-trip clean.
+
+- `tools/test_synthesizer.py` (GPT 4 시나리오 + warp):
+  * gravity → CONTINUOUS 분류 (scenario 1).
+  * `synth_frame` 이 (flag, vibration) response 의 row 밴드를
+    제대로 적용 (scenario 2).
+  * intensity 0 / 0.5 / 1.0 에 따른 envelope L2 변화 monotone +
+    0 → 1 차이 > 0.1 (scenario 3).
+  * `cross_resonance` on/off → 렌더된 frame L2 차이 > 0.5
+    (scenario 4 — 변조 측대역 시각화).
+  * `apply_warp` 의 픽셀 변위 검증 (scenario 5).
+
+---
+
 ## `.sfb` Feature Bank (Phase 2 산출물)
 
 `ce_core/sss_feature_bank.{h,c}` + `tools/sss_feature_bank.py` 추가로
