@@ -251,6 +251,137 @@ verify_hybrid <img1.ppm> [<img2.ppm> ...]
 
 ---
 
+## Phase 3: Motif Training & Memory Building
+
+Phase 2가 정의한 `.sfb` 컨테이너를 채우는 학습 파이프라인. 세 개의
+스크립트가 한 줄로 이어진다:
+
+```
+dataset/primitive/<label>/*.{png,ppm}
+        │
+        │  scripts/sss_train_primitive.py
+        ▼
+build/primitive_motifs.npz
+        │
+        │  scripts/sss_train_motif_memory.py
+        │  (+ dataset/labeled/*.{png,ppm})
+        ▼
+build/motif_memory.npz
+        │
+        │  scripts/sss_build_feature_bank.py
+        ▼
+build/feature_bank.sfb
+```
+
+설계 철학의 일관성 (Phase 2의 sfb 설계 철학을 그대로 유지):
+
+- **위상은 어떤 형태로도 저장하지 않는다.** Phase 1의 amp-only
+  원칙을 학습 산출물 전반으로 확장.
+- **행(row) 단위 FFT 결과를 그대로 저장하지 않는다.** 각 모티프는
+  폴더 전체 통계로 응축된 128-bin row_freq / col_freq envelope만
+  보관한다.
+- **원본 픽셀 좌표는 저장되지 않는다.** position_heatmap은 16×16
+  거친 확률 분포로 양자화된다 (uint8, [0, 255]).
+- **에너지 총량이 아닌 주파수 모양을 저장한다.** 모든 envelope는
+  channel-wise 평균 제거 + FFT bin 0 제거를 거친 뒤 zero-mean L2
+  정규화로 저장된다 (Pearson 형식 cosine을 가능하게 함).
+
+### 1) Primitive motif 학습 (`sss_train_primitive.py`)
+
+폴더당 하나의 motif를 합성한다. 폴더 안의 모든 이미지를 64×64로
+정규화 (aspect 보존 + zero-pad) 한 뒤, 채널별 평균을 빼고
+다음 envelope를 계산한다:
+
+- `row_freq[128]`: 행별 rfft 진폭의 평균. bin 0 = 0 강제. 33 → 128
+  bin linear 리샘플링. 폴더 평균 → zero-mean L2 정규화.
+- `col_freq[128]`: 열 축에 대한 대칭 처리.
+- `color_freq[3][128]`: RGB 채널을 4096 길이 1D로 펼친 후 rfft.
+  bin 0 제거, 리샘플링, 폴더 평균, 채널별 zero-mean L2 정규화.
+- `position_heatmap[16][16]`: 그레이스케일 Sobel magnitude를 4×4
+  블록 평균으로 다운샘플링. 폴더 평균 → min-max 정규화.
+- `coherence`: 폴더 내 각 이미지의 weighted-cosine vs 폴더 평균
+  envelope (행 / 열 / 색 / 히트맵, 0.35/0.35/0.20/0.10 가중치).
+  단일 이미지 폴더는 1.0.
+- `confidence` = coherence × min(N / 10, 1.0).
+
+### 2) Motif memory 빌더 (`sss_train_motif_memory.py`)
+
+각 labelled 이미지를 256×256로 정규화 후 32×32 그리드로 스캔한다.
+각 grid 셀 중심에서 64×64 패치를 뽑아 primitive와 동일한 envelope
+파이프라인을 돌린 뒤 등록된 모든 motif에 대해 다중 특징 가중
+코사인을 계산한다:
+
+    final_sim = 0.35 × row_sim + 0.35 × col_sim
+              + 0.20 × color_sim + 0.10 × heatmap_sim
+
+매칭 임계값(기본 0.85, `--threshold`)을 넘으면 그 motif가 그 grid
+셀에서 "활성화"된다. 같은 이미지에서 활성화된 motif 쌍의 중심점
+간 정규화 변위 `(dx, dy) ∈ [-1, 1]`로 relation_type 분류:
+
+- `|dy| > 2|dx|, dy < 0` → ABOVE  (dst는 src 위에)
+- `|dy| > 2|dx|, dy > 0` → BELOW  (dst는 src 아래에)
+- `|dx| > 2|dy|, dx < 0` → LEFT
+- `|dx| > 2|dy|, dx > 0` → RIGHT
+- `dx² + dy² < 0.05` → NEAR
+- 그 외 → AROUND
+
+각 이미지에서 motif 쌍은 **centroid 단위로 한 번만** 카운트된다
+(그리드 셀별 카운트는 활성화 수에 따라 weight를 1.0 이상으로
+부풀려서 spec의 weight ∈ [0,1] 범위와 충돌). weight =
+co-occurrence_count / total_image_count, weight < 0.3 (기본
+`--weight-floor`) relation은 폐기.
+
+position_heatmap은 motif가 fire한 grid 셀 카운트를 32×32에 누적 후
+2×2 평균 → 16×16. primitive 단계의 Sobel-edge heatmap을
+*labelled-scan 기반 활성화 heatmap*으로 갱신한다. **활성화가 한 번도
+없었던 motif는 primitive heatmap을 유지** (전체 0 heatmap을 덮어쓰지
+않도록).
+
+identity는 각 labelled 이미지마다 한 개씩 만들어진다. 라벨은
+optional `<filename><TAB><label>` TSV에서 가져오거나, 부재 시
+파일명 stem이 사용된다.
+
+### 3) `.sfb` compositor (`sss_build_feature_bank.py`)
+
+`primitive_motifs.npz` + (옵션) `motif_memory.npz`를 Phase 2의
+`SSSFeatureBank.save()`로 직렬화한다. memory가 주어지면
+relations / identities / 갱신된 heatmap을 채우고, 없으면 primitive
+만으로 빈 relations / identities로 빌드한다 (예: 학습 초기 단계).
+
+### Phase 3 회귀 테스트
+
+- `tools/test_train_primitive.py`:
+  * 4가지 합성 motif (horizontal_stripes, vertical_stripes,
+    noise_texture, circular_pattern) × 30장씩 → motif당 coherence
+    > 0.85.
+  * Pairwise weighted similarity matrix에서 diag mean = 1.000,
+    off-diag mean = 0.353, off-diag max = 0.598.
+  * Disjoint half-vs-half similarity > 0.85 (matcher 임계값).
+  * **단일 row_freq 코사인은 worst-case off-diag 0.995** (false
+    positive); 다중 특징 가중은 worst-case 0.598 → weighted-vs-row
+    분리 격차 +0.397.
+  * DC 제거 검증: 상수 이미지의 raw envelope bin 0 == 0.
+
+- `tools/test_train_motif_memory.py`:
+  * 256×256 합성 이미지 20장에 두 가지 motif 쌍 배치
+    (horizontal/circular, circular/noise).
+  * (horizontal, circular, BELOW) + (circular, noise, BELOW)
+    relation 추출 확인, weight ≥ 0.45 (max 가능 0.5 — 두 scene
+    type 각 10장씩), dx ≈ 0, dy ≈ +0.5..+0.6.
+  * 대응되는 ABOVE inverse relation도 함께 존재.
+  * 활성화된 motif는 `position_heatmap_update`에 non-zero 행 기록.
+  * 모든 identity는 ≥ 2개의 motif_ids를 가진다.
+
+- `tools/test_build_feature_bank.py`:
+  * primitive → memory → .sfb 빌드 end-to-end.
+  * 저장된 .sfb를 다시 로드해 motif/relation/identity 개수와
+    weighted similarity 행렬 재현 확인.
+  * 두 번 save 시 byte-identical (Phase 2 round-trip 보장).
+  * **빈 dataset** (motif_count = 0)도 정상 빌드: 40 B 헤더만
+    적힌 .sfb가 만들어지고 다시 로드된다.
+
+---
+
 ## `.sfb` Feature Bank (Phase 2 산출물)
 
 `ce_core/sss_feature_bank.{h,c}` + `tools/sss_feature_bank.py` 추가로

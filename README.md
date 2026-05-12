@@ -44,7 +44,16 @@ produced by the scripts in this repo on the bundled `data/sanrio`
         │                                    │
    ai_save *.spai                       ce_storage_save *.ces
                                              │
-                                       motif aggregation (Phase 3)
+                                       Phase 3 motif training pipeline:
+                                       ┌─────────────────────────────────────────┐
+                                       │ dataset/primitive/<label>/*.{png,ppm}   │
+                                       │         ↓ sss_train_primitive            │
+                                       │ primitive_motifs.npz                     │
+                                       │         ↓ sss_train_motif_memory         │
+                                       │           (+ dataset/labeled/*.{png,ppm})│
+                                       │ motif_memory.npz                         │
+                                       │         ↓ sss_build_feature_bank         │
+                                       └─────────────────────────────────────────┘
                                              │
                                        feature_bank.sfb
                                        (motif dictionary —
@@ -56,11 +65,42 @@ produced by the scripts in this repo on the bundled `data/sanrio`
                                        new signal per seed)
 ```
 
-The `.sfb` node is a **feature dictionary, not an image-restore
-model**. Generation reads motif envelopes and synthesises fresh
-signals — no row or pixel of a training image is ever directly
-invoked. See ["Feature bank — `.sfb` format"](#feature-bank---sfb-format-phase-2)
-below.
+The `.sfb` node is **a feature dictionary, not an image-restore
+model**. Phase 3 (`scripts/sss_train_primitive.py` →
+`sss_train_motif_memory.py` → `sss_build_feature_bank.py`) fills the
+container; the storage discipline is the same as Phase 2 — every
+motif stores only an amplitude envelope shape, never a row, pixel,
+or phase.
+
+### `dataset/primitive/` folder layout
+
+One subfolder per motif label; every `.png` / `.ppm` inside that
+folder is a training sample for that motif. The Phase 3 primitive
+trainer averages every sample's spectral envelope into a single
+motif record.
+
+```
+dataset/primitive/
+├── horizontal_stripes/
+│   ├── sample_001.png
+│   ├── sample_002.png
+│   └── ...
+├── vertical_stripes/
+│   ├── sample_001.png
+│   └── ...
+├── noise_texture/
+│   └── ...
+└── circular_pattern/
+    └── ...
+```
+
+Labels become the motif's `label` field on disk (UTF-8, 32 byte hard
+cap, codepoint-aware truncation). Per-folder coherence is reported
+at train time so noisy folders are visible — `coherence < 0.5`
+typically means the folder mixes too many distinct textures.
+
+See ["Feature bank — `.sfb` format"](#feature-bank---sfb-format-phase-2)
+below for the full byte map.
 
 ---
 
