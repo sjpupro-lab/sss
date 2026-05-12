@@ -13,9 +13,9 @@ Reads a labels.tsv in either of two formats (auto-detected per row):
         filename<TAB>"red circle smile"
         → splits the description on whitespace; for every (image,
           word) pair we emit one COLOR / SHAPE / FACE cell carrying
-          *that image's* amplitudes and phase. The fingerprint is
-          computed from the bare word (so multiple images of "red"
-          all share the same fp), but the cell labels are suffixed
+          *that image's* amplitudes. The fingerprint is computed
+          from the bare word (so multiple images of "red" all share
+          the same fp), but the cell labels are suffixed
           (`red_0`, `red_1`, …) so they don't collide on disk.
           The C generator picks among same-fp cells via a seed-
           based tie-break (see find_cells_per_token).
@@ -24,12 +24,15 @@ Both formats can coexist in one labels.tsv. FFT separates COLOR vs
 FACE by frequency band, so describing an image as "red circle" lets
 "red" land in the colour band while "circle" lands in shape.
 
-Phases are stored *as written* — for legacy averaged labels we keep
-the first image's phase (averaging phases across images destroys
-structure); for per-image cells we keep that image's actual phase,
-which is the whole point of dropping the average.
+Phase data is NOT written (Phase 1 amp-only radio tuning, see
+`ce_core/sss_rowvae.c`). The on-disk `phase_len` field stays in the
+v9 schema for backward compatibility — we just emit 0 floats — so
+existing v9 readers still parse the file. The generator overlays a
+per-seed random phase at noise-init time, which is the dominant
+source of per-seed output diversity now that the trained-side phase
+is gone.
 
-Outputs a v8 .sss binary that the C runtime (sss_io.c) can load.
+Outputs a v9 .sss binary that the C runtime (sss_io.c) can load.
 The file format and the fingerprint() function below MUST stay in
 lock-step with ce_core/sss_rowvae.{h,c}.
 """
@@ -113,23 +116,28 @@ def load_image(path: Path, size: int) -> np.ndarray:
     return np.asarray(img, dtype=np.float32) / 255.0
 
 
-def row_fft(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Per-row real FFT. img: (H, W, 3) → amp/phase (H, NF, 3)."""
+def row_fft(img: np.ndarray) -> np.ndarray:
+    """Per-row real FFT amplitude. img: (H, W, 3) → amp (H, NF, 3).
+
+    Phase is intentionally not returned (Phase 1 amp-only). The
+    generator regenerates phase as a per-seed random uniform at
+    noise-init time; storing the training-side phase would only
+    inflate the model without changing generated output."""
     spec = np.fft.rfft(img, axis=1)
-    return np.abs(spec).astype(np.float32), np.angle(spec).astype(np.float32)
+    return np.abs(spec).astype(np.float32)
 
 
-def col_fft(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Per-column real FFT of grayscale. img: (H, W, 3) → amp/phase (W, NF)."""
+def col_fft(img: np.ndarray) -> np.ndarray:
+    """Per-column real FFT amplitude of grayscale.
+    img: (H, W, 3) → amp (W, NF). See row_fft re: phase omission."""
     gray = img.mean(axis=2)
     spec = np.fft.rfft(gray, axis=0)        # (NF, W)
     spec = spec.T                            # (W, NF)
-    return np.abs(spec).astype(np.float32), np.angle(spec).astype(np.float32)
+    return np.abs(spec).astype(np.float32)
 
 
 def write_cell(f, ctype: int, label: str, fp: np.ndarray,
-               amp: np.ndarray, phase: np.ndarray,
-               ce_key: bytes) -> None:
+               amp: np.ndarray, ce_key: bytes) -> None:
     label_b = label.encode("utf-8")
     if len(ce_key) != 64:
         raise ValueError(f"ce_key must be 64 bytes, got {len(ce_key)}")
@@ -141,9 +149,10 @@ def write_cell(f, ctype: int, label: str, fp: np.ndarray,
     amp_flat = amp.astype(np.float32).ravel()
     f.write(struct.pack("<I", amp_flat.size))
     f.write(amp_flat.tobytes())
-    phase_flat = phase.astype(np.float32).ravel()
-    f.write(struct.pack("<I", phase_flat.size))
-    f.write(phase_flat.tobytes())
+    # Phase 1 amp-only: emit phase_len = 0 (no phase floats follow).
+    # Readers still parse the u32 — the layout is intentionally a
+    # backward-compatible subset of v9.
+    f.write(struct.pack("<I", 0))
 
 
 def main() -> int:
@@ -165,19 +174,17 @@ def main() -> int:
     NF_HIGH = NF - NF_LOW
 
     # ── Legacy (4-column) accumulators: average amps across images
-    #    per label, keep the first image's phase as the reference.
+    #    per label. Phase used to be kept as a per-label reference,
+    #    but Phase 1 dropped it (see write_cell docstring).
     color_amp = defaultdict(list)
-    color_phase_ref: dict[str, np.ndarray] = {}
     shape_amp = defaultdict(list)
-    shape_phase_ref: dict[str, np.ndarray] = {}
     face_amp = defaultdict(list)
-    face_phase_ref: dict[str, np.ndarray] = {}
 
     # ── Free-form (2-column) per-(image, word) cells. One entry per
     #    cell that will be written as-is, no averaging. Tuple shape:
-    #    (ctype, label, fp, ce_key, amp, phase).
+    #    (ctype, label, fp, ce_key, amp).
     individual_cells: list[tuple[
-        int, str, np.ndarray, bytes, np.ndarray, np.ndarray]] = []
+        int, str, np.ndarray, bytes, np.ndarray]] = []
     word_counts: dict[str, int] = defaultdict(int)
 
     root = Path(args.root)
@@ -209,16 +216,13 @@ def main() -> int:
                 continue
 
             img = load_image(ipath, args.size)
-            y_amp, y_phase = row_fft(img)        # (H, NF, 3)
-            x_amp, x_phase = col_fft(img)        # (W, NF)
+            y_amp = row_fft(img)        # (H, NF, 3)
+            x_amp = col_fft(img)        # (W, NF)
 
             if mode == "legacy":
                 color_amp[c_lbl].append(y_amp[:, :NF_LOW, :])
-                color_phase_ref.setdefault(c_lbl, y_phase[:, :NF_LOW, :].copy())
                 face_amp[f_lbl].append(y_amp[:, NF_LOW:, :])
-                face_phase_ref.setdefault(f_lbl, y_phase[:, NF_LOW:, :].copy())
                 shape_amp[s_lbl].append(x_amp)
-                shape_phase_ref.setdefault(s_lbl, x_phase.copy())
             else:
                 # Free-form: every word becomes its own per-image cell.
                 # FFT bands separate COLOR (low Y) from FACE (high Y),
@@ -237,16 +241,13 @@ def main() -> int:
                     key = ce_key_bytes(word)
                     individual_cells.append((
                         CE_COLOR, label, fp, key,
-                        y_amp[:, :NF_LOW, :].copy(),
-                        y_phase[:, :NF_LOW, :].copy()))
+                        y_amp[:, :NF_LOW, :].copy()))
                     individual_cells.append((
                         CE_FACE, label, fp, key,
-                        y_amp[:, NF_LOW:, :].copy(),
-                        y_phase[:, NF_LOW:, :].copy()))
+                        y_amp[:, NF_LOW:, :].copy()))
                     individual_cells.append((
                         CE_SHAPE, label, fp, key,
-                        x_amp.copy(),
-                        x_phase.copy()))
+                        x_amp.copy()))
 
             n_images += 1
 
@@ -258,20 +259,21 @@ def main() -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     cells: list[tuple[
-        int, str, np.ndarray, bytes, np.ndarray, np.ndarray]] = []
-    # Legacy mode: averaged amps + first-image phase per label.
+        int, str, np.ndarray, bytes, np.ndarray]] = []
+    # Legacy mode: averaged amps per label (phase is no longer kept;
+    # see write_cell docstring).
     for label, stack in color_amp.items():
         amp = np.mean(np.stack(stack, axis=0), axis=0)
         cells.append((CE_COLOR, label, fingerprint(label),
-                      ce_key_bytes(label), amp, color_phase_ref[label]))
+                      ce_key_bytes(label), amp))
     for label, stack in shape_amp.items():
         amp = np.mean(np.stack(stack, axis=0), axis=0)
         cells.append((CE_SHAPE, label, fingerprint(label),
-                      ce_key_bytes(label), amp, shape_phase_ref[label]))
+                      ce_key_bytes(label), amp))
     for label, stack in face_amp.items():
         amp = np.mean(np.stack(stack, axis=0), axis=0)
         cells.append((CE_FACE, label, fingerprint(label),
-                      ce_key_bytes(label), amp, face_phase_ref[label]))
+                      ce_key_bytes(label), amp))
     # Free-form mode: per-(image, word) cells written as-is.
     cells.extend(individual_cells)
 
@@ -280,8 +282,8 @@ def main() -> int:
                             SSS_MAGIC, SSS_VERSION,
                             H, W, NF, NF_LOW,
                             len(cells)))
-        for ctype, label, fp_vec, ce_key, amp, phase in cells:
-            write_cell(f, ctype, label, fp_vec, amp, phase, ce_key)
+        for ctype, label, fp_vec, ce_key, amp in cells:
+            write_cell(f, ctype, label, fp_vec, amp, ce_key)
 
     bytes_written = out_path.stat().st_size
     print(f"wrote {out_path}  ({bytes_written} bytes, {len(cells)} cells "

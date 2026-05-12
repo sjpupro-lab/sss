@@ -18,6 +18,16 @@ then::
 
     python3 tools/sss_unified.py            # quick demo run
     python3 tools/test_sss_unified.py       # smoke test
+
+SSS .sss format compat (Phase 1):
+    * Reader still accepts SSS_VERSION 9 files that ship a non-empty
+      `phase` field per cell — the bytes are loaded but immediately
+      dropped (see CEMemory.add and `_block_from_amp_phase`). The
+      C-side `sss_io.c` does the same; the field is treated as
+      reserved padding pending Phase 2's .sfb format.
+    * Writer paths (`scripts/sss_train.py`, `ingest_labeled_image`)
+      no longer emit phase data. New files are byte-compatible with
+      v9 readers because `phase_len = 0` is a legal v9 value.
 """
 from __future__ import annotations
 
@@ -551,7 +561,13 @@ class CEMemory(_BridgedCEMemory):
         sees the canny + color bytes via the bridge):
             amp      — list of per-(row, channel) rfft amplitudes
                        (length = block_height * 3, each entry shape (NF,))
-            phase    — same shape as amp; per-(row, channel) phases
+            phase    — DEPRECATED in Phase 1 amp-only radio tuning.
+                       The signature is retained for backward compat
+                       with older callers that still pass `phase=...`;
+                       any non-None value triggers a DeprecationWarning
+                       and is silently dropped. Phase is regenerated at
+                       generate-time as a per-seed random uniform
+                       [-π, π) noise init (see ce_core/sss_rowvae.c).
             fp       — 256-bin sss-fingerprint of the label text (or None)
             subbands — dict {"LL", "LH", "HL", "HH"} of (bh/2, W/2, 3)
                        float32 arrays from
@@ -559,6 +575,13 @@ class CEMemory(_BridgedCEMemory):
                        restore pipeline (tools.sss_restore_infer) for
                        row/column cross-attention scoring.
         """
+        if phase is not None:
+            import warnings
+            warnings.warn(
+                "CEMemory.add(phase=...) is deprecated and ignored: "
+                "Phase 1 switched to amp-only radio tuning. The phase "
+                "argument will be removed in a future release.",
+                DeprecationWarning, stacklevel=2)
         bridge_block = self._slot_for_block.get(block, "bot")
         cid = super().add_cell(bridge_block, canny, None, color_avg,
                                quality=float(quality), source=source)
@@ -588,7 +611,10 @@ class CEMemory(_BridgedCEMemory):
             "gen": self.generation,
             "uses": 0,
             "amp": amp,
-            "phase": phase,
+            # phase intentionally absent — see add(phase=...) deprecation
+            # note above. Reconstruction paths must tolerate cells with
+            # amp but no phase (use zero or per-seed random phase).
+            "phase": None,
             "fp": fp,
             "subbands": subbands,
         }
@@ -843,15 +869,21 @@ class SculptGenerator:
 
     def _block_from_amp_phase(self, cells, bh):
         """Row-partition multiple cells' (row × channel × NF) rfft
-        spectrograms back into a (bh, W, 3) float32 block.
+        amplitudes back into a (bh, W, 3) float32 block.
 
-        Each cell's `amp` / `phase` are contiguous float32 ndarrays of
-        shape `(cell_bh, 3, NF)` (see tools/sss_ingest._block_fft).
-        Each output row picks the cell that owns its region; rows of a
-        cell trained at a different block height map by nearest-
-        neighbour. Returns None if no cell carries spectrograms."""
-        with_spec = [c for c in cells
-                     if c.get("amp") is not None and c.get("phase") is not None]
+        Each cell's `amp` is a contiguous float32 ndarray of shape
+        `(cell_bh, 3, NF)` (see tools/sss_ingest._block_fft). Each output
+        row picks the cell that owns its region; rows of a cell trained
+        at a different block height map by nearest-neighbour.
+
+        Phase 1 amp-only behaviour: cells no longer store phase, so the
+        reconstruction uses zero phase (DC-aligned cosine basis). The
+        result is structurally faithful to the training amp envelope
+        but lacks per-image phase texture — diversity comes from the
+        C-side `sss_generate` random-phase init at generate time, not
+        from this Python fallback. Returns None if no cell carries
+        amplitudes."""
+        with_spec = [c for c in cells if c.get("amp") is not None]
         if not with_spec:
             return None
         block = np.zeros((bh, W, 3), np.float32)
@@ -862,13 +894,25 @@ class SculptGenerator:
                 region = n_cells - 1
             cell = with_spec[region]
             amps = np.asarray(cell["amp"])
-            phases = np.asarray(cell["phase"])
-            if amps.ndim != 3 or phases.shape != amps.shape:
+            if amps.ndim != 3:
                 continue
             cell_bh = amps.shape[0]
             sr = min(int(r * cell_bh / max(1, bh)), cell_bh - 1)
+            # phase may exist on legacy in-memory cells but is treated
+            # as absent on the storage layer (see add(phase=...) note).
+            phases = cell.get("phase")
+            phases = np.asarray(phases) if (phases is not None
+                                            and np.asarray(phases).shape == amps.shape) else None
             for c in range(3):
-                spec = amps[sr, c] * np.exp(1j * phases[sr, c])
+                if phases is not None:
+                    spec = amps[sr, c] * np.exp(1j * phases[sr, c])
+                else:
+                    # Zero-phase reconstruction (amp-only). The C
+                    # generator overlays a per-seed random phase in
+                    # `sss_generate`; the Python fallback intentionally
+                    # stays deterministic so repeat ingest+recall is
+                    # reproducible.
+                    spec = amps[sr, c].astype(np.complex64)
                 row_recon = np.fft.irfft(spec, n=W)
                 block[r, :, c] = np.clip(row_recon * 255.0, 0, 255)
         return block

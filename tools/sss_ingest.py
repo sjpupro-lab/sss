@@ -194,10 +194,15 @@ def _ingest_image_array(img: np.ndarray, memory, *, tags, source) -> dict:
     return {"cells_added": cells_added, "blocks": per_block}
 
 
-def _block_fft(block: np.ndarray) -> tuple:
-    """Per-row, per-channel rfft of a (bh, W, 3) uint8 block normalised
-    into [0, 1]. Returns two contiguous float32 ndarrays of shape
-    `(bh, 3, NF)` for amp and phase. NF = W // 2 + 1.
+def _block_fft(block: np.ndarray) -> np.ndarray:
+    """Per-row, per-channel rfft amplitude of a (bh, W, 3) uint8 block
+    normalised into [0, 1]. Returns a single contiguous float32 ndarray
+    of shape `(bh, 3, NF)`. NF = W // 2 + 1.
+
+    Phase is NOT stored (Phase 1 amp-only radio tuning, see SPEC.md).
+    The C generator builds row phase from a per-seed random uniform
+    [-π, π) at noise-init time, so the trained-side phase would be
+    overwritten anyway — keeping it on disk only inflates the model.
 
     The compact ndarray representation avoids the Python list +
     per-row ndarray-object overhead the earlier list-of-arrays form
@@ -207,9 +212,7 @@ def _block_fft(block: np.ndarray) -> tuple:
     spec = np.fft.rfft(block_f, axis=1)
     # Reorder to (bh, 3, NF) so reconstruction can index `[row, ch]`.
     spec = np.transpose(spec, (0, 2, 1))
-    amp = np.ascontiguousarray(np.abs(spec).astype(np.float32))
-    phase = np.ascontiguousarray(np.angle(spec).astype(np.float32))
-    return amp, phase
+    return np.ascontiguousarray(np.abs(spec).astype(np.float32))
 
 
 def _block_subband_25x4(block: np.ndarray) -> dict:
@@ -292,9 +295,13 @@ def ingest_labeled_image(filepath, memory, label_text: str,
         canny  — Sobel edge map
         color  — mean BGR
         amp    — per-row, per-channel rfft amplitudes
-        phase  — per-row, per-channel rfft phases
         tags   — every word in the label (lowercased, len > 1)
         fp     — 256-bin fingerprint of the bare label text
+
+    Phase is NOT stored on the cell — the generator uses a per-seed
+    random phase at radio-tuning init, with at most a weak low-band
+    relaxation. See ce_core/sss_rowvae.c (Stage 2) and SPEC.md for the
+    Phase 1 amp-only design.
     """
     if not label_text or not label_text.strip():
         return {"error": "라벨이 필요합니다"}
@@ -321,14 +328,14 @@ def ingest_labeled_image(filepath, memory, label_text: str,
         gray = _to_gray(block)
         canny = _sobel_edges(gray, 80)
         color = np.mean(block, axis=(0, 1))
-        amps, phases = _block_fft(block)
+        amps = _block_fft(block)
         # Per-block 25%×4 subband decomposition. Lives alongside the
-        # FFT amp/phase pair on the same memory cell so the restore
-        # path can score row + column attention against LL/LH/HL/HH
-        # without re-decomposing every retrieval.
+        # FFT amplitude on the same memory cell so the restore path can
+        # score row + column attention against LL/LH/HL/HH without
+        # re-decomposing every retrieval.
         subbands = _block_subband_25x4(block)
         memory.add(bname, canny, color, 0.5, list(tags), src,
-                   amp=amps, phase=phases, fp=fp, subbands=subbands)
+                   amp=amps, fp=fp, subbands=subbands)
         per_block[bname] = per_block.get(bname, 0) + 1
         cells_added += 1
 
