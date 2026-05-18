@@ -20,8 +20,10 @@
 - `tools/sss_ingest.py` — 25%×4 Haar subband + canny + color + amp +
   phase + fp 셀 5종을 ROW_BLOCK 단위로 저장
 - `tools/sss_unified.CEMemory` — `subbands` kwarg 포함 셀 저장/검색
-- `tools/sss_restore_infer.py` / `tools/sss_restore.py` — PR #38
-  cross-attention 기반 row-level restore
+- `tools/sss_restore_infer.py` — PR #39 cross-attention 기반 row-level
+  restore (25%×4 subband 활용)
+- `tools/sss_restore.py` — PR #38 row+column FFT 기반 이미지 복원/
+  향상 엔진
 - `scripts/sss_train.py` — `.sss` 모델 학습 (낮은 freq + 위상 포함)
 - `tools/sss_gen.c` → `build/sss_gen` — sculpt 후보 경쟁 + 후처리
 
